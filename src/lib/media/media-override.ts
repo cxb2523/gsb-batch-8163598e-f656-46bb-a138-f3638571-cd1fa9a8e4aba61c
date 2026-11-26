@@ -249,7 +249,8 @@ export default class MediaOverride {
                 this.audioManager.muteForTransition()
 
                 // Start from a bare chain. disconnect() drops the lofi rack with the
-                // rest, so it goes straight back in while its effects are on.
+                // rest, so put it back while its effects are on (the rack re-reads
+                // the latest settings and the chain state itself).
                 this.audioManager.disconnect()
                 this.lofi.reconnect()
 
@@ -295,6 +296,11 @@ export default class MediaOverride {
         if (!this.audioManager || !this.audioManager.isReady || !this.lofi) return
         if (this._disabled) return
 
+        // Record the newest settings immediately, before waiting on the queue:
+        // a build already in flight must wire according to these, not the ones
+        // that started it, and a queued older update must not override them.
+        const version = this.lofi.noteSettings(settings)
+
         await this.runExclusive(async () => {
             try {
                 await this.audioManager.ensureAudioChainReady()
@@ -309,9 +315,14 @@ export default class MediaOverride {
                     this.audioManager.bypass()
                     return
                 }
-                this.audioManager.muteForTransition()
-                this.lofi.apply(settings)
-                this.audioManager.unmuteAfterTransition()
+                // Only mute when this update will actually rewire the chain. A
+                // build that resolved after the user switched every effect off
+                // (or while the master toggle was bypassed) settles without one.
+                const rewire =
+                    this.lofi.wantsChain !== this.audioManager.hasEffect('lofi')
+                if (rewire) this.audioManager.muteForTransition()
+                this.lofi.apply(settings, version)
+                if (rewire) this.audioManager.unmuteAfterTransition()
             } catch (error) {
                 console.error('Error updating lofi effects:', error)
                 this.audioManager.unmuteAfterTransition()
@@ -325,13 +336,23 @@ export default class MediaOverride {
      */
     tweakLofi(settings: EffectSettings): void {
         if (!this.audioManager || !this.audioManager.isReady || !this.lofi) return
-        if (this._disabled) return
+        if (this._disabled || this.audioManager.isBypassed) return
         if (!this.lofi.tweak(settings)) void this.updateLofi(settings)
     }
 
     /** Pause and play, for the rack's crackle loop. */
     setPlaying(playing: boolean): void {
         this.lofi?.setPlaying(playing)
+    }
+
+    /**
+     * The master toggle is going off: the graph is bypassed and messages are
+     * dropped while it stays off, so pin the rack's idea of settings here. On
+     * rearm the chain must match the settings the user last chose, not stale
+     * ones from before the toggle.
+     */
+    noteLofiSettings(settings: EffectSettings): void {
+        this.lofi?.noteSettings(settings)
     }
 
     private runExclusive(task: () => Promise<void>): Promise<void> {
@@ -418,6 +439,9 @@ export default class MediaOverride {
         this.overrideMediaProperty('playbackRate', this.handlePlaybackRateSetting)
         this.overrideMediaProperty('preservesPitch', this.handlePreservesPitchSetting)
         this.audioManager.restoreChain()
+        // restoreChain() rebuilt from source → soundTouch → gain; effects are added
+        // back on top by the normal dispatch, the rack included, if still wanted.
+        this.lofi.reconnect()
 
         // Resume the pre-disable speed/pitch (the soundTouch worklet still holds its
         // pitch settings; this re-applies the element tempo the override drives).

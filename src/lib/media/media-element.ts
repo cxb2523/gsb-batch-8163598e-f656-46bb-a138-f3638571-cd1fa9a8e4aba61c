@@ -109,8 +109,12 @@ export default class MediaElement {
 
                 // While disabled, ignore every audio update (effects/playback/volume/
                 // ms/seek) so nothing rebuilds the bypassed graph or buffers a stale
-                // override for the next play.
-                if (this._disabled) return
+                // override for the next play. The lofi settings are the one exception:
+                // rearm() must put the chain back matching what the user last chose.
+                if (this._disabled) {
+                    if (type === 'FROM_LOFI_LISTENER') this.mediaOverride?.noteLofiSettings(data)
+                    return
+                }
 
                 if (!this.mediaOverride) {
                     if (type === 'FROM_VOLUME_LISTENER') {

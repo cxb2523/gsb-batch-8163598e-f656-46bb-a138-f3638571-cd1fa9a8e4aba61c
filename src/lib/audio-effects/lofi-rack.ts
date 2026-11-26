@@ -218,13 +218,22 @@ export class LofiRack {
  * Owner of the rack on the Chorus side, in the mould of Reverb / Equalizer /
  * MSProcessor: builds it lazily on the manager's AudioContext and keeps it in
  * the chain only while a lofi effect is on, so idle listening costs nothing.
+ *
+ * Building is asynchronous and can lose several races: the user may switch
+ * every effect off, bypass the extension, or rebuild the whole audio chain
+ * before the worklets finish loading. So wiring is never decided from the
+ * settings that started a build: `noteSettings`/`apply`/`tweak` each record the
+ * newest settings, and a build that finishes uses those plus the manager's live
+ * bypass state and actual chain membership. Whether the rack is in the chain is
+ * always read back from the manager, never assumed.
  */
 export default class Lofi {
     private _audioManager: AudioManager
     private rack: LofiRack | null = null
     private settings: EffectSettings = DEFAULT_EFFECT_SETTINGS
-    private connected = false
     private playing = true
+    /** Bumped on every incoming settings message; see noteSettings/apply. */
+    private settingsVersion = 0
 
     constructor(audioManager: AudioManager) {
         this._audioManager = audioManager
@@ -237,56 +246,60 @@ export default class Lofi {
     /**
      * Build the rack if these settings will need it: five worklet modules and
      * the crackle sample, which takes a moment on a fresh page. Nothing in the
-     * chain changes, so this runs with the music still audible; `apply` then
-     * does only the wiring, which is what the caller mutes for.
+     * chain changes, so this runs with the music still audible; the following
+     * `apply` is what the caller mutes for and where the wiring is decided.
+     *
+     * The settings argument only decides whether a build is worth starting; an
+     * overtaken build is harmless because `apply` re-reads the newest settings.
      */
     async prepare(settings: EffectSettings): Promise<void> {
-        if (hasLofiEffects(normalizeEffectSettings(settings))) await this.ensureRack()
+        if (!hasLofiEffects(normalizeEffectSettings(settings))) return
+        await this.ensureRack()
     }
 
-    apply(settings: EffectSettings): void {
+    /**
+     * Record the newest settings without touching the chain, returning the
+     * version that `apply` must present to be considered current. The media
+     * layer calls this as soon as a message arrives, so a queued update whose
+     * build finishes late cannot wire according to settings that have already
+     * been superseded.
+     */
+    noteSettings(settings: EffectSettings): number {
         this.settings = normalizeEffectSettings(settings)
+        return ++this.settingsVersion
+    }
 
-        if (!this.active) {
-            this.rack?.setEffects(this.settings)
-            if (this.connected) {
-                this.connected = false
-                this._audioManager.removeEffect('lofi')
-            }
-            return
-        }
-
-        // Not built: prepare() was skipped or failed (and said so).
-        if (!this.rack?.initialized) return
-        this.rack.setEffects(this.settings)
-        if (!this.connected) {
-            this.connected = true
-            this._audioManager.connectLofi(this.rack)
-        }
+    /**
+     * Bring the rack in or out of the chain to match the newest settings. The
+     * `settings` of a stale queued update are not written back (a newer message
+     * has superseded them), but the chain is still reconciled: a build that just
+     * finished must end up matching whatever the newest settings ask for, even
+     * when the task that built it was overtaken while loading.
+     */
+    apply(settings: EffectSettings, version: number = this.settingsVersion): void {
+        if (version === this.settingsVersion) this.settings = normalizeEffectSettings(settings)
+        this.sync()
     }
 
     /**
      * A slider mid-drag: new intensities for effects that are already on, set
      * straight on the live rack with no mute and no chain rebuild. False when
      * the change needs the full path (an effect switched, a new reverb space,
-     * or a rack that is still being built).
+     * or a rack that is not in the chain).
      */
     tweak(settings: EffectSettings): boolean {
         const next = normalizeEffectSettings(settings)
-        if (!this.rack?.initialized || !this.connected || !sameLofiShape(this.settings, next))
-            return false
+        if (!this.rack?.initialized || !this.isWired()) return false
+        if (!sameLofiShape(this.settings, next)) return false
         this.settings = next
+        this.settingsVersion++
         this.rack.setEffects(next)
         return true
     }
 
     /** audioManager.disconnect() drops every effect; put the rack back if it should be on. */
     reconnect(): void {
-        this.connected = false
-        if (this.rack?.initialized && this.active) {
-            this.connected = true
-            this._audioManager.connectLofi(this.rack)
-        }
+        this.sync()
     }
 
     setPlaying(playing: boolean): void {
@@ -294,30 +307,81 @@ export default class Lofi {
         this.rack?.setSourceActive(playing)
     }
 
+    /** True when the rack's effects are on, the master toggle is not bypassing, and it is built. */
+    get wantsChain(): boolean {
+        return Boolean(this.rack?.initialized) && this.active && !this._audioManager.isBypassed
+    }
+
+    /**
+     * The one place that decides membership: latest settings, live bypass flag,
+     * and what the manager actually holds. Idempotent in both directions.
+     */
+    private sync(): void {
+        const rack = this.rack
+        if (!rack?.initialized) return
+
+        const wanted = hasLofiEffects(this.settings) && !this._audioManager.isBypassed
+
+        if (!wanted) {
+            rack.setEffects(this.settings)
+            if (this.isWired()) this._audioManager.removeEffect('lofi')
+            return
+        }
+
+        rack.setEffects(this.settings)
+        // Only connect when the chain really lacks the rack: a rebuild may have
+        // put it back already, and connecting again would rewire needlessly.
+        if (this.isWired()) return
+        this._audioManager.connectLofi(rack)
+    }
+
+    /** True when the manager's live chain holds the rack. */
+    private isWired(): boolean {
+        return this._audioManager.hasEffect('lofi')
+    }
+
     private async ensureRack(): Promise<LofiRack | null> {
         const ctx = this._audioManager.audioContext
         if (!ctx) return null
 
-        if (!this.rack) {
-            const workletsUrl = sessionStorage.getItem('chorus:worklets_path')
-            const soundsUrl = sessionStorage.getItem('chorus:sounds_path')
-            if (!workletsUrl) {
-                console.error('Lofi: worklets path not found in session storage')
-                return null
-            }
-            this.rack = new LofiRack(ctx, {
-                workletsUrl,
-                sampleUrl: soundsUrl ? `${soundsUrl}vinyl-crackle.mp3` : undefined
-            })
-            this.rack.setSourceActive(this.playing)
-        }
+        const rack = this.rack ?? this.createRack(ctx)
+        if (!rack) return null
 
         try {
-            await this.rack.init()
+            await rack.init()
         } catch (error) {
             console.error('Lofi: failed to build the effect rack', error)
+            // A half-built rack is useless; drop it so the next attempt starts
+            // clean instead of being stuck in a permanent failure.
+            if (this.rack === rack) this.discardRack()
             return null
         }
-        return this.rack
+        return this.rack === rack ? rack : null
+    }
+
+    private createRack(ctx: AudioContext): LofiRack | null {
+        const workletsUrl = sessionStorage.getItem('chorus:worklets_path')
+        const soundsUrl = sessionStorage.getItem('chorus:sounds_path')
+        if (!workletsUrl) {
+            console.error('Lofi: worklets path not found in session storage')
+            return null
+        }
+        const rack = new LofiRack(ctx, {
+            workletsUrl,
+            sampleUrl: soundsUrl ? `${soundsUrl}vinyl-crackle.mp3` : undefined
+        })
+        rack.setSourceActive(this.playing)
+        this.rack = rack
+        return rack
+    }
+
+    private discardRack(): void {
+        if (this.isWired()) this._audioManager.removeEffect('lofi')
+        try {
+            this.rack?.destroy()
+        } catch {
+            // best effort
+        }
+        this.rack = null
     }
 }

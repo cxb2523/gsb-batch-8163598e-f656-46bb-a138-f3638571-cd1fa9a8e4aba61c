@@ -22,6 +22,9 @@ export default class AudioManager {
 
     private _setupPromise?: Promise<void>
     private _isInitialized: boolean = false
+    // Master-off state: the graph plays the element straight through. Owners of
+    // effects that finish loading late ask this before wiring themselves back in.
+    private _bypassed: boolean = false
 
     private _element: HTMLMediaElement | MediaStream
     private _source?: MediaStreamAudioSourceNode | MediaElementAudioSourceNode
@@ -514,8 +517,22 @@ export default class AudioManager {
     connectLofi(rack: { input: AudioNode; output: AudioNode }) {
         if (!this.isConnectable) return
 
+        // While the master off toggle owns the graph, a late-building rack must
+        // not wire itself back in: bypass() already dropped every effect.
+        if (this._bypassed) return
+
         this._activeEffects.lofi = rack
         this.rebuildEffectChain()
+    }
+
+    /** Whether the master off toggle is holding the graph in passthrough. */
+    get isBypassed(): boolean {
+        return this._bypassed
+    }
+
+    /** Whether an effect is registered in the live chain right now. */
+    hasEffect(effectType: 'lofi' | 'equalizer' | 'msProcessor' | 'reverb'): boolean {
+        return Boolean(this._activeEffects[effectType])
     }
 
     private cleanupEffectChain() {
@@ -648,6 +665,9 @@ export default class AudioManager {
     disconnect() {
         if (!this.isConnectable) return
 
+        // Back on the normal, effect-capable chain.
+        this._bypassed = false
+
         // CRITICAL: First cleanup the effect chain while we still have references to the effect nodes
         // This ensures all effect nodes are properly disconnected before we clear the references
         this.cleanupEffectChain()
@@ -684,6 +704,7 @@ export default class AudioManager {
         if (!this.source || !this.destination || !this._gainNode) return
 
         try {
+            this._bypassed = true
             this.cleanupEffectChain()
             this._activeEffects = {}
             // Passthrough WITH the gain node retained (source → gain → destination):
@@ -708,6 +729,7 @@ export default class AudioManager {
         try {
             // Clear the bypass wiring (source → gain → destination) before rebuilding,
             // otherwise the gain node would feed both destination and soundTouch.
+            this._bypassed = false
             this.cleanupEffectChain()
             this._activeEffects = {}
             this.source.connect(this._soundTouchNode!)
@@ -732,6 +754,8 @@ export default class AudioManager {
 
     cleanup() {
         try {
+            // A fresh chain is built next; it is never born bypassed.
+            this._bypassed = false
             this.stopSilenceSkip()
             this._analyser = undefined
             if (this._source) {
