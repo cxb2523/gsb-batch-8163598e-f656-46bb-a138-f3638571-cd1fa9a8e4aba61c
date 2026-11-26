@@ -25,7 +25,9 @@ straight to `data/pool/*.json` on the local filesystem, so it cannot run on a se
 host, and curation state is committed to git like source. Sound is browser audio, so a
 first click is required before anything plays (autoplay policy).
 
-Other commands: `npm run build`, `npm run lint`.
+Other commands: `npm run build`, `npm run lint`, `npm test`. The tests run the real
+TypeScript sources under Node's built-in runner (a tiny `test/hooks.mjs` resolver plus a
+fake `AudioContext`); they need no browser and no audio device.
 
 ## How it works, in one paragraph
 

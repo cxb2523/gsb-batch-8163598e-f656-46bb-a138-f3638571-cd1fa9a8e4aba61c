@@ -9,12 +9,39 @@ import type { DelayEffect, ReverbEffect } from "./patch";
 export interface EffectNode {
   input: AudioNode;
   output: AudioNode;
+  // Fades the wet/tail path out over `fade` seconds, leaving the dry path connected so a
+  // stop's envelope fade can still be heard. A delay's feedback loop is faded too, so it
+  // cannot keep recirculating after the source is gone.
+  mute(fade: number): void;
+  // Disconnects every node the effect owns.
+  dispose(): void;
+}
+
+function fadeToSilence(param: AudioParam, at: number, fade: number): void {
+  if (typeof param.cancelAndHoldAtTime === "function") {
+    param.cancelAndHoldAtTime(at);
+  } else {
+    param.cancelScheduledValues(at);
+    param.setValueAtTime(param.value, at);
+  }
+  param.setTargetAtTime(0, at, Math.max(fade / 3, 0.001));
+}
+
+function disconnectAll(nodes: AudioNode[]): void {
+  for (const n of nodes) {
+    try {
+      n.disconnect();
+    } catch {}
+  }
 }
 
 function withMix(
   ctx: BaseAudioContext,
   mix: number,
-  create: (wet: GainNode, wetOut: GainNode) => void,
+  create: (
+    wet: GainNode,
+    wetOut: GainNode,
+  ) => { nodes: AudioNode[]; mute: (fade: number) => void },
 ): EffectNode {
   const input = ctx.createGain();
   const output = ctx.createGain();
@@ -31,9 +58,20 @@ function withMix(
   const wetOut = ctx.createGain();
   wetOut.connect(output);
 
-  create(wet, wetOut);
+  const extra = create(wet, wetOut);
+  const nodes = [input, output, dry, wet, wetOut, ...extra.nodes];
 
-  return { input, output };
+  return {
+    input,
+    output,
+    mute(fade) {
+      fadeToSilence(wet.gain, ctx.currentTime, fade);
+      extra.mute(fade);
+    },
+    dispose() {
+      disconnectAll(nodes);
+    },
+  };
 }
 
 /*
@@ -63,7 +101,20 @@ export function createShimmer(ctx: BaseAudioContext, opts: DelayEffect): EffectN
   feedbackFilter.connect(wetGain);
   wetGain.connect(output);
 
-  return { input, output };
+  return {
+    input,
+    output,
+    mute(fade) {
+      // Break the loop's return path on the same curve as its output: cutting the node
+      // outright would snap, and leaving it would let the echo recirculate for its full
+      // tail after the sound was stopped.
+      fadeToSilence(feedbackGain.gain, ctx.currentTime, fade);
+      fadeToSilence(wetGain.gain, ctx.currentTime, fade);
+    },
+    dispose() {
+      disconnectAll([input, output, delay, feedbackFilter, feedbackGain, wetGain]);
+    },
+  };
 }
 
 const INAUDIBLE_GAIN = 0.001;
@@ -110,14 +161,23 @@ export function createReverb(ctx: BaseAudioContext, opts: ReverbEffect): EffectN
     const convolver = ctx.createConvolver();
     convolver.buffer = buffer;
 
+    const nodes: AudioNode[] = [convolver];
     if (preDelay > 0) {
       const preDelayNode = ctx.createDelay(Math.max(preDelay + 0.01, 1));
       preDelayNode.delayTime.value = preDelay;
       wet.connect(preDelayNode);
       preDelayNode.connect(convolver);
+      nodes.push(preDelayNode);
     } else {
       wet.connect(convolver);
     }
     convolver.connect(wetOut);
+
+    return {
+      nodes,
+      mute(fade) {
+        fadeToSilence(wetOut.gain, ctx.currentTime, fade);
+      },
+    };
   });
 }

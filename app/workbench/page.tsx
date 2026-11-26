@@ -84,7 +84,7 @@ import {
 import { discovery } from "@/lib/audio/wild";
 import { DEFAULT_LOUDNESS, loudnessVolume, type LoudnessConfig } from "@/lib/audio/loudness";
 import { measurePatch, type LoudnessMeasure } from "@/lib/audio/offline";
-import { patchDuration, playPatch } from "@/lib/audio/synth";
+import { patchDuration, playPatch, type PlayHandle } from "@/lib/audio/synth";
 import { SoundPreview } from "@/components/SoundPreview";
 import { Toaster, toast } from "sonner";
 
@@ -329,11 +329,22 @@ const BATCH_PRIMARY_BTN =
   "shrink-0 rounded-md bg-black px-3 py-1.5 font-bold text-white transition-opacity hover:opacity-80 dark:bg-white dark:text-black";
 const BATCH_SECONDARY_BTN =
   "shrink-0 rounded-md border border-neutral-300 px-3 py-1.5 font-medium text-neutral-600 transition-colors hover:border-neutral-500 hover:bg-neutral-500/10 dark:border-neutral-700 dark:text-neutral-300";
-function playGuarded(key: string, patch: Patch, volume?: number) {
+function playGuarded(
+  key: string,
+  patch: Patch,
+  volume?: number,
+  opts?: { solo?: boolean },
+): PlayHandle | undefined {
   const now = Date.now();
-  if (now < (busyUntil.get(key) ?? 0)) return;
-  busyUntil.set(key, now + Math.min(patchDuration(patch), 3) * 1000);
-  void playPatch(patch, volume !== undefined ? { volume } : undefined);
+  if (!opts?.solo) {
+    if (now < (busyUntil.get(key) ?? 0)) return undefined;
+    busyUntil.set(key, now + Math.min(patchDuration(patch), 3) * 1000);
+  } else {
+    // A preview session cuts the previous sound itself, so the same-key busy window would
+    // only swallow the retrigger the user just asked for.
+    busyUntil.delete(key);
+  }
+  return playPatch(patch, volume !== undefined ? { volume } : undefined);
 }
 
 // Fresh (generated) patches get measured once and cached by object identity; library
@@ -528,22 +539,29 @@ function WorkbenchInner() {
   // measure still in flight when a newer play starts is stale and drops itself instead of
   // landing late on top of the sound actually asked for.
   const playSeq = useRef(0);
-  const playLev = (key: string, patch: Patch, opts?: { id?: string; cat?: Category | null }) => {
+  const playLev = (
+    key: string,
+    patch: Patch,
+    opts?: { id?: string; cat?: Category | null; solo?: boolean },
+  ): PlayHandle | undefined | Promise<PlayHandle | undefined> => {
     const token = ++playSeq.current;
     const level = (m: { winDb: number; peakDb: number }) =>
-      playGuarded(key, patch, loudnessVolume(loudnessCfg, m, opts?.cat ?? null));
+      playGuarded(key, patch, loudnessVolume(loudnessCfg, m, opts?.cat ?? null), {
+        solo: opts?.solo,
+      });
     const known = (opts?.id ? loudMeasures.current[opts.id] : undefined) ?? freshMeasureCache.get(patch);
     if (known) {
-      level(known);
-      return;
+      return level(known);
     }
-    void measurePatch(patch)
+    return measurePatch(patch)
       .then((m) => {
         freshMeasureCache.set(patch, m);
-        if (token === playSeq.current) level(m);
+        if (token === playSeq.current) return level(m);
+        return undefined;
       })
       .catch(() => {
-        if (token === playSeq.current) playGuarded(key, patch);
+        if (token === playSeq.current) return playGuarded(key, patch, undefined, { solo: opts?.solo });
+        return undefined;
       });
   };
   const [limits, setLimits] = useState<Partial<Limits>>({});
@@ -2407,8 +2425,10 @@ function WorkbenchInner() {
             )}
             {selected && !deletedSet.has(selected.id) && (
               <SoundPreview
-                onTrigger={() => playLev("preview", selected.patch, { id: selected.id })}
-                onTriggerReverse={() => playLev("preview:inv", invertPatch(selected.patch), { id: selected.id })}
+                onTrigger={() => playLev("preview", selected.patch, { id: selected.id, solo: true })}
+                onTriggerReverse={() =>
+                  playLev("preview:inv", invertPatch(selected.patch), { id: selected.id, solo: true })
+                }
               />
             )}
           </aside>
@@ -3531,7 +3551,7 @@ function WorkbenchInner() {
               {draft && (
                 <SoundPreview
                   category={genCategory}
-                  onTrigger={() => playLev("preview", draft, { cat: genCategory })}
+                  onTrigger={() => playLev("preview", draft, { cat: genCategory, solo: true })}
                 />
               )}
               {note && <p className="mt-1 text-neutral-500">{note}</p>}

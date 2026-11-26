@@ -6,12 +6,21 @@
  * Copyright (c) 2026 Raphael Salaja. MIT License. Full text: THIRD-PARTY-NOTICES.md.
  */
 
-import { ensureReady, getContext, getDestination } from "./context";
-import { createReverb, createShimmer, shimmerTail } from "./effects";
-import type { Envelope, Filter, NoiseColor, NoiseSource, OscillatorSource, Patch, Source } from "./patch";
+import { getContext, getDestination } from "./context";
+import { createReverb, createShimmer, shimmerTail, type EffectNode } from "./effects";
+import type {
+  Envelope,
+  Filter,
+  NoiseColor,
+  NoiseSource,
+  OscillatorSource,
+  Patch,
+  Source,
+} from "./patch";
 import { layersOf } from "./patch";
 
 const SILENCE = 0.0001;
+const MIN_TIME_CONSTANT = 0.001;
 
 function generateWhiteNoise(data: Float32Array) {
   for (let i = 0; i < data.length; i++) {
@@ -53,17 +62,28 @@ function createNoiseBuffer(ctx: BaseAudioContext, color: NoiseColor, duration: n
   return buffer;
 }
 
+interface BuiltSource {
+  /** The node the layer's signal flows out of. */
+  node: AudioScheduledSourceNode;
+  /** Every scheduled node that must be stopped and torn down, modulators included. */
+  sources: AudioScheduledSourceNode[];
+  /** Every node that belongs to this source's own subgraph. */
+  nodes: AudioNode[];
+  /** The oscillator's detune, when the source has one. */
+  detuneParam?: AudioParam;
+}
+
 function buildNoiseSource(
   ctx: BaseAudioContext,
   src: NoiseSource,
   t: number,
   duration: number,
-): AudioScheduledSourceNode {
+): BuiltSource {
   const node = ctx.createBufferSource();
   node.buffer = createNoiseBuffer(ctx, src.color ?? "white", duration + 0.1);
   node.start(t);
   node.stop(t + duration + 0.1);
-  return node;
+  return { node, sources: [node], nodes: [node] };
 }
 
 export interface PlayOptions {
@@ -74,6 +94,8 @@ export interface PlayOptions {
 
 export interface PlayHandle {
   stop(releaseTime?: number): void;
+  /** True once stop() has been called or the sound has played out. */
+  readonly ended: boolean;
   duration: number;
 }
 
@@ -82,7 +104,7 @@ function buildSource(
   src: Source,
   t: number,
   duration: number,
-): AudioScheduledSourceNode {
+): BuiltSource {
   return src.type === "noise"
     ? buildNoiseSource(ctx, src, t, duration)
     : buildOscillatorSource(ctx, src, t, duration);
@@ -93,7 +115,7 @@ function buildOscillatorSource(
   src: OscillatorSource,
   t: number,
   duration: number,
-): OscillatorNode {
+): BuiltSource {
   const osc = ctx.createOscillator();
   osc.type = src.type;
 
@@ -114,6 +136,9 @@ function buildOscillatorSource(
   osc.start(t);
   osc.stop(t + duration + 0.1);
 
+  const sources: AudioScheduledSourceNode[] = [osc];
+  const nodes: AudioNode[] = [osc];
+
   if (src.fm) {
     const carrierFreq =
       typeof src.frequency === "number" ? src.frequency : src.frequency.start;
@@ -129,9 +154,12 @@ function buildOscillatorSource(
     modGain.connect(osc.frequency);
     fmMod.start(t);
     fmMod.stop(t + duration + 0.1);
+
+    sources.push(fmMod);
+    nodes.push(fmMod, modGain);
   }
 
-  return osc;
+  return { node: osc, sources, nodes, detuneParam: osc.detune };
 }
 
 function buildEnvelope(
@@ -242,8 +270,37 @@ export function renderPatch(
   const detuneJitter = jitter?.detune ? (Math.random() * 2 - 1) * jitter.detune : 0;
   const volumeJitter = jitter?.volume ? 1 + (Math.random() * 2 - 1) * jitter.volume : 1;
 
-  const allSourceNodes: AudioScheduledSourceNode[] = [];
-  const allEnvNodes: GainNode[] = [];
+  const duration = patchDuration(patch);
+  const envelopes: GainNode[] = [];
+  const scheduled: { node: AudioScheduledSourceNode; start: number }[] = [];
+  const layerNodes: AudioNode[] = [];
+  const effectNodes: EffectNode[] = [];
+
+  let ended = false;
+  let stopping = false;
+  let lastNaturalTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Detaching the whole chain is what makes stop final. Fading the envelope alone leaves
+  // the filter and the effect loop live, and a delay's feedback path keeps re-triggering
+  // itself after the source is gone.
+  const disconnectLayerNodes = () => {
+    for (const n of layerNodes) {
+      try {
+        n.disconnect();
+      } catch {}
+    }
+  };
+  const disposeEffects = () => {
+    for (const fx of effectNodes) {
+      try {
+        fx.dispose();
+      } catch {}
+    }
+  };
+  const teardown = () => {
+    disconnectLayerNodes();
+    disposeEffects();
+  };
 
   for (const layer of layersOf(patch)) {
     const layerStart = t0 + (layer.delay ?? 0);
@@ -255,14 +312,14 @@ export function renderPatch(
       baseGain,
       layerStart,
     );
-    allEnvNodes.push(envNode);
+    envelopes.push(envNode);
 
-    const srcNode = buildSource(ctx, layer.source, layerStart, envDuration);
-    if (srcNode instanceof OscillatorNode && (opts?.detune || detuneJitter !== 0)) {
-      srcNode.detune.value += (opts?.detune ?? 0) + detuneJitter;
+    const built = buildSource(ctx, layer.source, layerStart, envDuration);
+    if (built.detuneParam && (opts?.detune || detuneJitter !== 0)) {
+      built.detuneParam.value += (opts?.detune ?? 0) + detuneJitter;
     }
 
-    let tail: AudioNode = srcNode;
+    let tail: AudioNode = built.node;
     const filterNodes: BiquadFilterNode[] = [];
     const filters = layer.filter
       ? Array.isArray(layer.filter)
@@ -289,42 +346,101 @@ export function renderPatch(
       if (!fx) continue;
       cursor.connect(fx.input);
       cursor = fx.output;
+      effectNodes.push(fx);
     }
     cursor.connect(dest);
 
-    allSourceNodes.push(srcNode);
-    const nodesToDisconnect: AudioNode[] = [srcNode, envNode, ...filterNodes];
-    srcNode.onended = () => {
-      for (const n of nodesToDisconnect) {
-        try {
-          n.disconnect();
-        } catch {}
-      }
-    };
+    layerNodes.push(...built.nodes, envNode, ...filterNodes);
+    for (const node of built.sources) {
+      scheduled.push({ node, start: layerStart });
+    }
+  }
+
+  const isOffline = typeof (ctx as OfflineAudioContext).startRendering === "function";
+
+  let pendingEnds = scheduled.length;
+  if (pendingEnds === 0) ended = true;
+  const onSourceEnded = () => {
+    pendingEnds -= 1;
+    if (pendingEnds > 0 || stopping) return;
+    ended = true;
+    // The source is finished; the effect tail is not, so only detach the dry chain here.
+    disconnectLayerNodes();
+    // Release the effect nodes once the tail has rung out. Scheduled from `onended` rather
+    // than from render time: if the context was suspended when this was built, wall-clock
+    // time would run ahead of the audio clock and cut the tail short.
+    if (isOffline || typeof setTimeout !== "function" || effectNodes.length === 0) return;
+    const remaining = Math.max(0, t0 + duration - ctx.currentTime);
+    lastNaturalTimer = setTimeout(() => {
+      lastNaturalTimer = null;
+      disposeEffects();
+    }, remaining * 1000 + 50);
+  };
+  for (const { node } of scheduled) {
+    node.onended = onSourceEnded;
   }
 
   return {
-    duration: patchDuration(patch),
+    duration,
+    get ended() {
+      return ended;
+    },
     stop(releaseTime?: number) {
-      const now = ctx.currentTime;
-      const fade = releaseTime ?? 0.015;
-      for (const env of allEnvNodes) {
-        env.gain.cancelScheduledValues(now);
-        env.gain.setValueAtTime(env.gain.value, now);
-        env.gain.setTargetAtTime(SILENCE, now, fade / 3);
+      if (stopping) return;
+      stopping = true;
+      ended = true;
+      if (lastNaturalTimer !== null) {
+        clearTimeout(lastNaturalTimer);
+        lastNaturalTimer = null;
       }
-      for (const src of allSourceNodes) {
+
+      const now = ctx.currentTime;
+      const fade = Math.max(releaseTime ?? 0.015, 0);
+
+      for (const env of envelopes) {
+        const gain = env.gain;
+        if (typeof gain.cancelAndHoldAtTime === "function") {
+          gain.cancelAndHoldAtTime(now);
+        } else {
+          gain.cancelScheduledValues(now);
+          gain.setValueAtTime(gain.value, now);
+        }
+        gain.setTargetAtTime(SILENCE, now, Math.max(fade / 3, MIN_TIME_CONSTANT));
+      }
+
+      // Cut the wet path now so a reverb or delay tail cannot outlive the source, but
+      // keep the dry path until the fade has played out. Tearing the chain down at `now`
+      // would turn the fade into a click.
+      for (const fx of effectNodes) {
         try {
-          src.stop(now + fade + 0.05);
+          fx.mute(fade);
         } catch {}
       }
+
+      const stopAt = now + fade + 0.05;
+      for (const { node, start } of scheduled) {
+        try {
+          // A layer still waiting on its delay must never be heard: stopping AT its start
+          // time gives it zero duration, whereas stopping later would let it play after
+          // the preview was already dismissed.
+          node.stop(start > now ? start : stopAt);
+        } catch {}
+      }
+
+      if (fade <= 0 || typeof setTimeout !== "function") {
+        teardown();
+        return;
+      }
+      // Disconnect a little after the sources actually stopped, so the graph is not pulled
+      // out from under the last sample of the fade.
+      setTimeout(() => teardown(), (fade + 0.1) * 1000);
     },
   };
 }
 
-export async function playPatch(patch: Patch, opts?: PlayOptions): Promise<PlayHandle> {
-  // Render inside the gesture when the context is already running; awaiting resume() first
-  // would push the start past the tap on iOS.
-  const ctx = getContext().state === "running" ? getContext() : await ensureReady();
-  return renderPatch(ctx, patch, opts, undefined, getDestination());
+export function playPatch(patch: Patch, opts?: PlayOptions): PlayHandle {
+  // Build the graph inside the gesture. getContext() already asks a suspended context to
+  // resume without awaiting it, so awaiting resume() here would only push the start past
+  // the tap; the scheduled nodes simply begin when the context starts running.
+  return renderPatch(getContext(), patch, opts, undefined, getDestination());
 }

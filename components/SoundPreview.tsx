@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { PreviewSession, type PreviewStart } from "@/lib/audio/preview-session";
 
 // Trigger the current sound from real UI controls to feel it in context.
 // onTrigger plays the currently selected/generated patch (guarded upstream).
@@ -52,19 +53,35 @@ function visibleFor(category?: string | null): Set<string> {
   return new Set(DEMOS);
 }
 
+// A quick fade is what keeps a retrigger from reading as two sounds at once, while staying
+// short enough that the tap still feels immediate.
+const SESSION_FADE = 0.05;
+
 export function SoundPreview({
   onTrigger,
   onTriggerReverse,
   category,
 }: {
-  onTrigger: () => void;
-  onTriggerReverse?: () => void;
+  onTrigger: PreviewStart;
+  onTriggerReverse?: PreviewStart;
   category?: string | null;
 }) {
   const [on, setOn] = useState(false);
+  const [session] = useState(() => new PreviewSession());
 
   const show = visibleFor(category);
-  const fire = () => onTrigger();
+  const visibleKey = [...show].sort().join("|");
+
+  // A category switch changes which demos exist, so the sound that was auditioned is no
+  // longer "this preview"; stop it (and drop any start still in flight) before it can be
+  // heard against the new category's controls. The same cleanup covers unmount, which is
+  // what keeps a closed inspector from leaving a sound playing.
+  useEffect(() => {
+    return () => session.stop(SESSION_FADE);
+  }, [session, visibleKey]);
+
+  const play = (start: PreviewStart) => session.play(start, SESSION_FADE);
+  const fire = () => play(onTrigger);
   const feedback = (fb: Feedback) => {
     fire();
     fb.toast();
@@ -90,7 +107,7 @@ export function SoundPreview({
               aria-checked={on}
               onClick={() => {
                 // off-toggle plays the reversed patch (when provided) to audition it as a door
-                if (on && onTriggerReverse) onTriggerReverse();
+                if (on && onTriggerReverse) play(onTriggerReverse);
                 else fire();
                 setOn((v) => !v);
               }}

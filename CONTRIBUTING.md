@@ -100,7 +100,7 @@ every pass and is identical-only: when unsure whether two sounds are the same, k
 
 ## Code pull requests
 
-- `npm run lint` and a clean `npx tsc --noEmit` before opening.
+- `npm test`, `npm run lint` and a clean `npx tsc --noEmit` before opening.
 - Conventional Commits: `feat:`, `fix:`, `chore:`, `refactor:`, `style:`, `docs:`, `perf:`.
 - Comments: near-zero. Say what the code cannot say itself, and nothing else. No change
   history in comments; git has it.
