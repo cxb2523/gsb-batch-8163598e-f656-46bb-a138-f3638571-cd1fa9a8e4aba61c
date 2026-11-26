@@ -113,6 +113,30 @@ const ctx2 = document.querySelector('#canvas2').getContext('2d');
 seq.execute(ctx2);
 ```
 
+Execution always wraps the replay in a single `save()`/`restore()` pair. If
+an instruction throws partway through, any `save()` calls made by the
+sequence itself are unwound first so that the final `restore()` still pairs
+with the initial `save()`, and a `CanvasSequenceError` is thrown. Already
+executed instructions are not rolled back (the canvas does not support it),
+but the error reports exactly where the failure occurred and preserves the
+original error:
+
+```javascript
+const { CanvasSequenceError } = require('canvas-sequencer');
+
+try {
+  seq.execute(ctx);
+} catch (error) {
+  if (error instanceof CanvasSequenceError) {
+    error.index;        // zero-based index of the failed instruction
+    error.inst;         // name of the failed instruction, e.g. 'arc'
+    error.type;         // 'method' or 'property'
+    error.cause;        // the original error thrown by the context
+    error.restoreError; // set only if cleanup itself also failed
+  }
+}
+```
+
 ## CanvasBlueprint API
 
 Also accessible through this library are sequence 'blueprints'. These allow you

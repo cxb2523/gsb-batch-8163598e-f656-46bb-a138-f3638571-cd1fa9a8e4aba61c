@@ -10,6 +10,54 @@ export interface SerializedCanvasSequence {
   sequence: SerializedCanvasAtom[];
 }
 
+/**
+ * Details used to construct a {@link CanvasSequenceError}.
+ */
+export interface CanvasSequenceErrorOptions {
+  /** Zero-based index of the instruction that failed within the sequence. */
+  index: number;
+  /** Name of the canvas context instruction that failed. */
+  inst: string;
+  /** Kind of the failing instruction. */
+  type: CanvasAtomType;
+  /** The original error thrown while replaying the instruction. */
+  cause: Error;
+  /**
+   * The error raised by `context.restore()` while unwinding the saved
+   * state, if cleanup itself failed. The original execution error remains
+   * the primary error.
+   */
+  restoreError?: Error;
+}
+
+/**
+ * Thrown by {@link CanvasSequence.execute} when an instruction cannot be
+ * replayed. The canvas state saved before replay is always restored before
+ * this error is thrown. The original error is available via the standard
+ * `cause` property.
+ */
+export class CanvasSequenceError extends Error {
+  constructor(options: CanvasSequenceErrorOptions);
+
+  /** Zero-based index of the instruction that failed within the sequence. */
+  index: number;
+
+  /** Name of the canvas context instruction that failed. */
+  inst: string;
+
+  /** Kind of the failing instruction ('method' or 'property'). */
+  type: CanvasAtomType;
+
+  /** The original error thrown while replaying the failing instruction. */
+  cause: Error;
+
+  /**
+   * Error raised while restoring the saved state during cleanup, if any.
+   * The original execution error remains available through `cause`.
+   */
+  restoreError?: Error;
+}
+
 type ContextMethod<T> = T extends (...args: infer Args) => any ? (...args: Args) => void : never;
 
 export interface CanvasSequenceMethods {
@@ -82,6 +130,14 @@ export interface CanvasSequenceProperties {
 
 export class CanvasSequence {
   constructor(data?: SerializedCanvasSequence | null);
+  /**
+   * Replays the sequence on the given context. The context state is saved
+   * before replay and restored afterwards, also when an instruction fails.
+   *
+   * @throws {CanvasSequenceError} If an instruction fails during replay; the
+   * error carries the failing instruction's index, name, and type, and keeps
+   * the original error as its `cause`.
+   */
   execute(context: CanvasRenderingContext2D): void;
   toJSON(): SerializedCanvasSequence;
 }

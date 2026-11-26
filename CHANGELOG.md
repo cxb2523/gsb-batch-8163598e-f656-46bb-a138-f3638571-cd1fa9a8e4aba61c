@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `CanvasSequenceError`, thrown by `CanvasSequence.execute` when an
+  instruction fails during replay. It carries the failing instruction's
+  zero-based `index`, its `inst` name and `type`, keeps the original error
+  as its `cause`, and exposes any cleanup failure separately as
+  `restoreError`.
+
+### Fixed
+- `CanvasSequence.execute` now restores the saved canvas state even when an
+  instruction throws, and unwinds any `save()` calls made inside the
+  sequence so the outer `restore()` always pairs with the initial `save()`.
+  Previously a mid-sequence error skipped `restore()` entirely and left the
+  context state permanently polluted.
 
 ## [3.2.0] - 2026-11-22
 ### Added
