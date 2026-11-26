@@ -43,6 +43,7 @@ let graph: AudioGraph | null = null
 let volume = 0.55
 let idleTimer = 0
 let quietAt = 0
+const active = new Set<() => void>()
 
 function suspendWhenQuiet(context: AudioContext, length: number): void {
   quietAt = Math.max(quietAt, context.currentTime + length)
@@ -56,6 +57,25 @@ function suspendWhenQuiet(context: AudioContext, length: number): void {
 export function setVolume(next: number): void {
   volume = Math.max(0, Math.min(1, next))
   if (graph) graph.master.gain.value = volume
+}
+
+export function suspend(): void {
+  if (graph && graph.context.state === "running") graph.context.suspend()
+}
+
+export function resume(): void {
+  if (graph && graph.context.state === "suspended") graph.context.resume()
+}
+
+export function silence(): void {
+  for (const stop of [...active]) stop()
+  if (graph) {
+    window.clearTimeout(idleTimer)
+    const context = graph.context
+    idleTimer = window.setTimeout(() => {
+      if (context.state === "running") context.suspend()
+    }, STOP_DISCONNECT_MS)
+  }
 }
 
 export function play(name: SoundName, options: SoundOptions = {}): () => void {
@@ -74,13 +94,19 @@ export function play(name: SoundName, options: SoundOptions = {}): () => void {
     panner.pan.value = amount(options.pan, -1, 1, 0)
     bus.connect(panner).connect(master)
   } else bus.connect(master)
+  let released = false
   const release = () => {
+    if (released) return
+    released = true
+    active.delete(stop)
     bus.disconnect()
     panner?.disconnect()
   }
   let stopped = false
+  let started = false
   const start = () => {
     if (stopped) return
+    started = true
     const pitch = (1 + (Math.random() - 0.5) * PITCH_SPREAD) * sizePitch(options.size)
     const length = recipe({ context, bus, noise, startAt: context.currentTime + START_OFFSET_SECONDS }, { pitch, still: prefersStillness(), options })
     window.setTimeout(release, (length + BUS_RELEASE_SECONDS) * 1000)
@@ -88,10 +114,16 @@ export function play(name: SoundName, options: SoundOptions = {}): () => void {
   }
   if (context.state === "running") start()
   else context.resume().then(start, () => {})
-  return () => {
+  const stop = () => {
     if (stopped) return
     stopped = true
+    if (!started) {
+      release()
+      return
+    }
     bus.gain.setTargetAtTime(0, context.currentTime, STOP_FADE_SECONDS)
     window.setTimeout(release, STOP_DISCONNECT_MS)
   }
+  active.add(stop)
+  return stop
 }

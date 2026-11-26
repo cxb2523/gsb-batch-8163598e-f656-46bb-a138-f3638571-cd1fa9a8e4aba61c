@@ -1,7 +1,7 @@
 import { check, DEV } from "../development-checks"
 import { hasUserActivation, isBrowser } from "../environment"
 import type { SoundConfig, SoundName, SoundOptions } from "../schema"
-import { applySoundConfig, isSoundEnabled, soundVolume } from "./sound-store"
+import { applySoundConfig, isSoundEnabled, soundPreference, soundVolume } from "./sound-store"
 
 export type { SoundConfig, SoundName, SoundOptions }
 
@@ -23,10 +23,24 @@ function loadEngine(): Promise<SoundEngine> {
   return loading
 }
 
+const withEngine = (run: (loaded: SoundEngine) => void): void => {
+  engine?.then(run, noop)
+}
+
+if (isBrowser()) {
+  soundPreference.subscribe(() => {
+    if (!isSoundEnabled()) withEngine((loaded) => loaded.silence())
+  })
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") withEngine((loaded) => loaded.suspend())
+    else if (isSoundEnabled()) withEngine((loaded) => loaded.resume())
+  })
+}
+
 export function configureSound(next: SoundConfig): void {
   if (DEV) check("soundConfig", next, "configureSound() was given settings it cannot use")
   applySoundConfig(next)
-  engine?.then((loaded) => loaded.setVolume(soundVolume()), noop)
+  withEngine((loaded) => loaded.setVolume(soundVolume()))
 }
 
 export function primeSound(): void {
@@ -40,7 +54,9 @@ export function playSound(name: SoundName, options?: SoundOptions): () => void {
   let stopped = false
   let stop = noop
   loadEngine().then((loaded) => {
-    if (!stopped) stop = loaded.play(name, options)
+    if (stopped) return
+    if (!isSoundEnabled()) return
+    stop = loaded.play(name, options)
   }, noop)
   return () => {
     stopped = true
