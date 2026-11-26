@@ -10,7 +10,11 @@ import * as S from './shaders.js';
 const { gsap, ScrollTrigger, Lenis } = window;
 gsap.registerPlugin(ScrollTrigger);
 
-const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reducedMQ = matchMedia('(prefers-reduced-motion: reduce)');
+let reduced = reducedMQ.matches;
+// Pick up emulation changes made after load (test runners may emulate late).
+reducedMQ.addEventListener?.('change', (e) => { reduced = e.matches; });
+const prefersReduced = () => reducedMQ.matches;
 const isTouch = matchMedia('(pointer: coarse)').matches;
 const lowPower = isTouch || navigator.hardwareConcurrency <= 4;
 const N = KEYFRAMES.length;
@@ -267,7 +271,7 @@ sections.forEach((sec, i) => {
   b.className = 'rail__item'; b.type = 'button';
   b.innerHTML = `<span class="rail__label">${String(i).padStart(2, '0')} ${sec.dataset.name}</span><span class="rail__bar"></span>`;
   b.setAttribute('aria-label', `Go to ${sec.dataset.name}`);
-  b.addEventListener('click', () => lenis.scrollTo(sec, { duration: 2.4, easing: (t) => 1 - Math.pow(1 - t, 4) }));
+  b.addEventListener('click', () => goToChapter(i));
   rail.append(b);
 });
 const railItems = [...rail.children];
@@ -276,7 +280,7 @@ const railItems = [...rail.children];
 const lenis = new Lenis({ lerp: reduced ? 1 : 0.075, smoothWheel: !reduced, wheelMultiplier: 0.9, touchMultiplier: 1.4 });
 lenis.on('scroll', ScrollTrigger.update);
 lenis.stop();
-document.querySelector('[data-home]').addEventListener('click', () => lenis.scrollTo(0, { duration: 4.5, easing: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - Math.pow(-2 * t + 2, 4) / 2) }));
+document.querySelector('[data-home]').addEventListener('click', () => goToChapter(0, { duration: 4.5, easing: (t) => (t < 0.5 ? 8 * t ** 4 : 1 - Math.pow(-2 * t + 2, 4) / 2) }));
 
 /* ---------------- pointer + cursor ---------------- */
 const pointer = { x: 0, y: 0, sx: 0, sy: 0 };
@@ -312,6 +316,150 @@ function setActive(i) {
   railItems.forEach((b, j) => b.classList.toggle('is-active', j === i));
   hud.ch.textContent = `${String(i).padStart(2, '0')} / ${String(N - 1).padStart(2, '0')}`;
 }
+const chapterOf = (x) => THREE.MathUtils.clamp(Math.round(x), 0, N - 1);
+
+/* ---------------- unified voyage controller ----------------
+ * `voyage.value` is the single "voyage progress" source of truth, expressed in
+ * chapter units (0..N-1). The camera curves, HUD distance/velocity, chapter
+ * label and rail active item are ALL derived from it. Wheel/scroll and the
+ * rail/deep-link controller only propose targets; the frame loop converges
+ * `value` onto the current target. That keeps camera + HUD + rail in lock-step
+ * through jumps, deep links and resizes.
+ */
+const JUMP_SECONDS = 2.4;
+const JUMP_EASE = (t) => 1 - Math.pow(1 - t, 4);
+
+const voyage = { value: 0, goal: 0, navChapter: null, navStart: 0, navDurMs: JUMP_SECONDS * 1000 };
+// Chapter a programmatic jump / deep link should stay anchored to. Re-asserted
+// across resizes until the visitor takes over with an input device.
+let anchorChapter = null;
+let chapterTops = [];
+
+function measureChapters() {
+  chapterTops = sections.map((sec) => sec.getBoundingClientRect().top + window.scrollY);
+}
+
+// Real scroll offset -> chapter coordinate that is exactly the integer index at
+// each section top. Piecewise-linear so variable-height / reflowed chapters and
+// post-resize limits still map to the correct chapter (no pull-back).
+function rawChapterFromScroll() {
+  if (chapterTops.length !== N) measureChapters();
+  const y = lenis ? lenis.animatedScroll : window.scrollY;
+  const tops = chapterTops;
+  if (!tops.length) return 0;
+  if (y <= tops[0]) return 0;
+  if (y >= tops[N - 1]) return N - 1;
+  for (let i = 0; i < N - 1; i++) {
+    if (y >= tops[i] && y <= tops[i + 1]) {
+      const span = tops[i + 1] - tops[i];
+      return i + (span > 0 ? (y - tops[i]) / span : 0);
+    }
+  }
+  return N - 1;
+}
+
+// Dwell/easing shape of the path, in chapter units (same curve as before).
+function shapedChapter(f) {
+  const x = THREE.MathUtils.clamp(f, 0, N - 1);
+  const i = Math.min(Math.floor(x), N - 2);
+  const e = smoother(THREE.MathUtils.clamp((x - i - 0.18) / 0.64, 0, 1));
+  return i + e;
+}
+
+// Visitor input cancels any controlled anchor so normal scrolling takes over.
+function releaseAnchor() { anchorChapter = null; voyage.navChapter = null; }
+addEventListener('wheel', releaseAnchor, { passive: true });
+addEventListener('touchstart', releaseAnchor, { passive: true });
+addEventListener('keydown', (e) => {
+  if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) releaseAnchor();
+});
+
+function goToChapter(input, opts = {}) {
+  let ch = Number(input);
+  ch = Number.isInteger(ch) ? THREE.MathUtils.clamp(ch, 0, N - 1) : 0;
+  const duration = opts.duration ?? JUMP_SECONDS;
+  const instant = opts.immediate === true || prefersReduced();
+  if (instant || typeof lenis === 'undefined' || !lenis) {
+    voyage.navChapter = null;
+    anchorChapter = ch;
+    measureChapters();
+    if (lenis) lenis.scrollTo(sections[ch], { immediate: true, force: true });
+    voyage.value = ch; voyage.goal = ch;
+    prevKm = distAt(ch); velKmS = 0;
+    setActive(ch);
+    return;
+  }
+  anchorChapter = null;
+  voyage.navChapter = ch;
+  voyage.navStart = performance.now();
+  voyage.navDurMs = duration * 1000;
+  lenis.scrollTo(sections[ch], { duration, easing: opts.easing ?? JUMP_EASE, force: true });
+}
+
+// Strict ?at=N: only canonical integers within 0..N-1 apply. A present but
+// non-integer / out-of-range value falls back to chapter 0 without throwing.
+// Absent `at` returns null so the ordinary top-of-page entry is unchanged.
+function readDeepChapter() {
+  const raw = new URLSearchParams(location.search).get('at');
+  if (raw === null) return null; // no deep link: ordinary top-of-page entry
+  const s = raw.trim();
+  if (s === '') return 0;
+  const n = Number(s);
+  // Out-of-range, NaN and non-integer values all fall back to chapter 0.
+  if (!Number.isInteger(n) || n < 0 || n > N - 1) return 0;
+  return n;
+}
+
+// Re-assert a deep-link / settled anchor after late layout shifts (web fonts),
+// but never after the visitor has taken over scrolling.
+function reassertAnchor() {
+  if (anchorChapter == null || voyage.navChapter != null) return;
+  const ch = anchorChapter;
+  measureChapters();
+  if (lenis) { lenis.resize(); lenis.scrollTo(sections[ch], { immediate: true, force: true }); }
+  voyage.value = ch; voyage.goal = ch;
+  prevKm = distAt(ch); velKmS = 0;
+  setActive(ch);
+}
+addEventListener('load', () => { measureChapters(); requestAnimationFrame(reassertAnchor); });
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { measureChapters(); reassertAnchor(); }).catch(() => {});
+
+// Optional inspection / manual-drive hook. All readouts are live views of the
+// single voyage progress; harmless to normal interaction.
+window.__ODYSSEY__ = {
+  get progress() { return voyage.value; },
+  get goal() { return voyage.goal; },
+  get chapter() { return chapterOf(voyage.value); },
+  get active() { return activeIdx; },
+  get navigatingTo() { return voyage.navChapter; },
+  snapshot: () => ({
+    p: +voyage.value.toFixed(4), goal: +voyage.goal.toFixed(4),
+    ch: chapterOf(voyage.value), active: activeIdx,
+    nav: voyage.navChapter, anchor: anchorChapter,
+    km: distAt(THREE.MathUtils.clamp(voyage.value, 0, N - 1)),
+    y: Math.round(window.scrollY),
+    cam: [+camera.position.x.toFixed(3), +camera.position.y.toFixed(3), +camera.position.z.toFixed(3)],
+  }),
+  curvePoint: (ch) => { const v = posCurve.getPoint(THREE.MathUtils.clamp(ch, 0, N - 1) / (N - 1)); return [v.x, v.y, v.z]; },
+  go: (n, o) => goToChapter(n, o),
+};
+window.__odyssey = window.__ODYSSEY__;
+
+// Prime the initial chapter from ?at=N immediately at module evaluation, so the
+// HUD/rail/scroll are correct even before the cinematic preloader finishes.
+// Boot re-asserts this after ScrollTrigger/Lenis refresh.
+const initialDeep = readDeepChapter();
+const initialCh = initialDeep ?? 0;
+voyage.value = initialCh; voyage.goal = initialCh;
+if (initialDeep !== null) anchorChapter = initialCh;
+setActive(initialCh);
+hud.dist.textContent = fmtDist(distAt(initialCh));
+hud.vel.textContent = '0 km/s';
+if (initialCh > 0) {
+  measureChapters();
+  lenis.resize();
+  lenis.scrollTo(sections[initialCh], { immediate: true, force: true });
+}
 
 /* ---------------- chapter reveals ---------------- */
 function countUp(el) {
@@ -333,27 +481,51 @@ function setupReveals() {
 }
 
 /* ---------------- frame loop ---------------- */
-let camT = 0, velS = 0, travel = 0, last = performance.now(), prevKm = 0, velKmS = 0;
+let velS = 0, travel = 0, last = performance.now(), prevKm = 0, velKmS = 0;
 let frameAvg = 16, frames = 0;
 const smoother = (x) => x * x * x * (x * (x * 6 - 15) + 10);
 const tmpPos = new THREE.Vector3(), tmpLook = new THREE.Vector3();
 const bm = new THREE.Matrix4(), bq = new THREE.Quaternion(), bs = new THREE.Vector3();
-
-function targetT() {
-  const prog = lenis.limit > 0 ? THREE.MathUtils.clamp(lenis.animatedScroll / lenis.limit, 0, 1) : 0;
-  const f = prog * (N - 1);
-  const i = Math.min(Math.floor(f), N - 2);
-  const e = smoother(THREE.MathUtils.clamp((f - i - 0.18) / 0.64, 0, 1));
-  return { t: (i + e) / (N - 1), f };
-}
 
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   uTime.value = (now - clockStart) / 1000;
 
-  const { t, f } = targetT();
-  camT += (t - camT) * Math.min(1, dt * (reduced ? 20 : 5));
+  // A native scrollbar / keyboard scroll that starts during a programmatic
+  // jump means the visitor is taking over — drop the controlled target.
+  if (voyage.navChapter != null && lenis.isScrolling === 'native') voyage.navChapter = null;
+
+  // The single voyage progress: propose a target from real scroll, then let
+  // the rendered value converge on it. Everything below reads `voyage.value`.
+  const f = rawChapterFromScroll();
+  const goal = shapedChapter(f);
+  voyage.goal = goal;
+  const lenisIdle = !lenis.isSmooth && Math.abs(lenis.velocity || 0) < 0.02;
+  if (prefersReduced()) {
+    voyage.value = goal; // reduced motion: follow instantly, no smoothing lag
+  } else {
+    // Smooth camera trail while scrolling; converge quickly once scroll stops
+    // so HUD/rail settle on canonical chapter values without a long tail.
+    const rate = lenisIdle ? 13 : 5;
+    voyage.value += (goal - voyage.value) * (1 - Math.exp(-rate * dt));
+  }
+
+  if (voyage.navChapter != null) {
+    // Controlled jump: once Lenis finishes, correct scroll to the exact
+    // section and pin progress on the chapter so all readouts converge.
+    const ch = voyage.navChapter;
+    if (lenisIdle) {
+      lenis.scrollTo(sections[ch], { immediate: true, force: true });
+      voyage.value = ch; voyage.goal = ch;
+      voyage.navChapter = null; anchorChapter = ch;
+    }
+  } else if (lenisIdle && Math.abs(goal - voyage.value) < 0.01) {
+    voyage.value = goal; // snap ordinary rests onto canonical chapter values
+  }
+  const atRest = voyage.navChapter == null && lenisIdle && Math.abs(voyage.goal - voyage.value) < 0.002;
+  const camT = THREE.MathUtils.clamp(voyage.value / (N - 1), 0, 1);
+
   const vel = reduced ? 0 : Math.min(Math.abs(lenis.velocity) / 45, 1);
   velS += (vel - velS) * Math.min(1, dt * 4);
 
@@ -395,7 +567,7 @@ function frame(now) {
   streakU.uStretch.value = velS * 22;
   streakU.uOpacity.value = Math.pow(velS, 1.4) * 1.6;
 
-  const x = camT * (N - 1);
+  const x = THREE.MathUtils.clamp(voyage.value, 0, N - 1);
   const u = bh.uniforms;
   u.uTime.value = uTime.value;
   u.uOn.value = THREE.MathUtils.smoothstep(x, 5.05, 5.6);
@@ -407,10 +579,13 @@ function frame(now) {
 
   composer.render();
 
-  // HUD
-  setActive(Math.round(f));
+  // HUD: chapter label, rail active item, distance and velocity all read the
+  // same unified progress `x`, so they cannot disagree with the camera.
+  setActive(chapterOf(x));
   const km = distAt(x);
-  velKmS += ((Math.abs(km - prevKm) / Math.max(dt, 1e-3)) - velKmS) * Math.min(1, dt * 3);
+  const instKmS = Math.abs(km - prevKm) / Math.max(dt, 1e-3);
+  if (atRest) velKmS = 0;
+  else velKmS += (instKmS - velKmS) * Math.min(1, dt * 3);
   prevKm = km;
   hud.dist.textContent = fmtDist(km);
   hud.vel.textContent = velKmS < 1 ? '0 km/s' : velKmS < C ? `${compact.format(velKmS)} km/s` : `Warp ${Math.log10(velKmS / C).toFixed(1)}`;
@@ -436,7 +611,30 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
   buildCurves();
+  // `voyage.value` is a scalar chapter coordinate, so it stays valid on the
+  // rebuilt curves — the camera keeps flying on the new path instead of being
+  // left at an old-curve position. Refresh scroll geometry, then re-target any
+  // controlled jump / deep-link anchor to the chapter's NEW pixel offset.
+  lenis.resize();
   ScrollTrigger.refresh();
+  measureChapters();
+  if (voyage.navChapter != null) {
+    const ch = voyage.navChapter;
+    if (prefersReduced()) {
+      lenis.scrollTo(sections[ch], { immediate: true, force: true });
+      voyage.value = ch; voyage.goal = ch;
+    } else {
+      // Continue the same jump on the new layout rather than restarting it:
+      // re-target the section's new pixel offset with the remaining time.
+      const remainSec = Math.max(0.12, (voyage.navDurMs - (performance.now() - voyage.navStart)) / 1000);
+      lenis.scrollTo(sections[ch], { duration: remainSec, easing: JUMP_EASE, force: true });
+    }
+  } else if (anchorChapter != null) {
+    const ch = anchorChapter;
+    lenis.scrollTo(sections[ch], { immediate: true, force: true });
+    voyage.value = ch; voyage.goal = ch;
+    prevKm = distAt(ch); velKmS = 0;
+  }
 });
 
 async function boot() {
@@ -463,9 +661,13 @@ async function boot() {
     .fromTo('.hud', { opacity: 0 }, { opacity: 1, duration: 1.2, stagger: 0.1 }, '-=1.4')
     .add(() => {
       lenis.start(); setupReveals(); document.body.classList.add('is-ready');
-      // deep link: ?at=4 starts at chapter 4
-      const at = new URLSearchParams(location.search).get('at');
-      if (at !== null && sections[+at]) { lenis.scrollTo(sections[+at], { immediate: true, force: true }); camT = +at / (N - 1); }
+      // Deep link ?at=N enters through the exact same controlled path as a
+      // rail click. Validate strictly and sync scroll + voyage together.
+      lenis.resize();
+      ScrollTrigger.refresh();
+      measureChapters();
+      const deep = readDeepChapter();
+      if (deep !== null) goToChapter(deep, { immediate: true });
     }, '-=1.6');
 }
 boot();
