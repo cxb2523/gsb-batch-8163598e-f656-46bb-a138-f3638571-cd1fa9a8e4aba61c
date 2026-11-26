@@ -1,0 +1,1618 @@
+# Changelog
+
+## 0.42.3
+
+**A large threaded cart starts in the browser.** A 1 GB threaded .wasc failed to start in CartHostWeb with
+"DataCloneError: Failed to execute 'postMessage' on 'Worker': Data cannot be cloned, out of memory" from the cart's
+first `pthread_create`. Each cart thread was posted the whole archive's ArrayBuffer so it could read assets, and
+postMessage copies an ArrayBuffer: every thread got its own copy of the cart. Threads now get the archive as a Blob,
+which postMessage passes as a handle without copying, and read only the entries they ask for (FileReaderSync on a
+slice). A cart loaded from bytes gets one Blob made from them on its first thread, shared by every thread.
+
+**CartHostWeb reads a .wasc from a Blob, entry by entry.** `load()` takes a `Blob`, such as a `File` from a file
+picker or a drop, and a .wasc URL is now fetched as a Blob instead of into an ArrayBuffer. A .wasc larger than
+`streamAbove` (a new load option, default 128 MiB) is never read whole: the host reads the archive's end, its central
+directory, the manifest and the wasm, and reads each asset from the Blob when the cart asks for it, suspending the
+cart on the read with JSPI as a cart directory does (drive it with `await host.runFrame(pads)`). Prefetched entries
+are read the same way, off the main thread. A smaller Blob, or any Blob in a browser without JSPI, is read into
+memory whole and runs as before. On a synthetic 1 GB threaded cart in Chromium the page's memory grew by about
+25 MB from a picked File (it could not start before), and a thread and the main thread each read an entry from the
+far end of the file.
+
+**A lazy cart may read assets from wc_get_info.** CartHostWeb called `wc_get_info` and `wc_set_seed` directly, so
+a cart read on demand (a cart directory, or now a large .wasc) whose engine opens files that early (cartwheel applies
+its project there) failed with "SuspendError: trying to suspend without WebAssembly.promising". Both now go through
+the same entry wrapper as `wc_init`. A 206 MB cartwheel cart runs streamed on WebGPU and on GL.
+
+**Node: a cart thread reads the right bytes of an asset.** CartHost's thread worker read an asset from an offset the
+host never set, so every asset a cart thread loaded from a .wasc came back as the archive's first bytes. It now reads
+the entry's local header for the data offset, as the main thread does. A cart loaded from bytes shares one
+SharedArrayBuffer copy of the archive with its threads instead of one copy per thread.
+
+`test/fixtures/bigcart` is a threaded cart whose thread reads the archive's last entry while the main thread plays a
+song from near the end; its build script writes a 1 GB archive without holding it in memory. No ABI or SPEC change;
+the test cart carries 0.42.3.
+
+## 0.42.2
+
+**Leaving a WebGPU cart no longer throws.** A page that destroyed a WebGPU host (CartHostWeb) while GPU work was
+still pending, such as a mapAsync or an error scope, got "TypeError: Cannot read properties of null (reading
+'buffer')" as an unhandled rejection. Destroying the device settles those operations, and the WebGPU glue then ran
+their callbacks against a cart whose memory the host had already dropped: the callback allocated its message through
+the cart allocator, which read the null memory. Once destroy() runs, the glue now drops every async callback
+(mapAsync, onSubmittedWorkDone, popErrorScope, the async pipeline creations, getCompilationInfo,
+requestAdapter/requestDevice, device loss) before it reaches the cart (scripts/wgpu/glue-closed.mjs, applied when the
+glue is generated). The Node host had the same path: there the cart's callback still ran after destroy(). A
+`readGpuFrame()` in flight at destroy() now resolves to null instead of rejecting with an AbortError. While a host
+is alive nothing changes, and callback errors are reported as before. `test/wgpu-destroy.test.js` destroys both
+hosts with a mapAsync, an error scope and a frame read pending. No ABI or SPEC change; the test cart carries 0.42.2.
+
+## 0.42.1
+
+**The terminal player renders through upstream chafa-wasm.** The dependency is now `chafa-wasm` (hectorm/chafa-wasm,
+LGPL-3.0) instead of a fork. It exports the same chafa functions, so every `--symbols`, `--colors`, `--fg-only`,
+`--dither` and `--contrast` mode, `matrix`'s custom glyphs included, renders as in 0.42.0. 0.42.0 was never
+published, so this release carries its entry below. The terminal tests always run on the low-power WebGPU adapter and
+check that they did, so a plain `npm test` never renders on the GPU that drives the display. No ABI or SPEC change;
+the test cart carries 0.42.1.
+
+## 0.42.0
+
+**The terminal player shows WebGPU carts.** `--term` drew a WebGPU or dual (GL and WebGPU) cart as one row of
+garbled colours over black. Its interactive loop drew `runFrame()`'s 2D framebuffer, and a WebGPU cart has none: its
+`fb_ptr` is 0, so the player showed the first bytes of the cart's memory. Only the headless `--frames`/`--shot` path
+read the GPU frame back. The terminal now reads every frame the same way for every cart: a WebGPU cart's texture
+(asynchronously, between frames), a GL cart's framebuffer, or a 2D cart's framebuffer. Drawing runs on its own timer,
+decoupled from the cart's 60 Hz logic, and skips a tick while a readback or render is still in flight.
+`test/term.test.js` runs the real CLI in a pseudo-terminal and compares the frame it draws with the cart's `--shot`
+for a WebGPU, a GL and a 2D cart; the readback 0.41 used is the control and fails the WebGPU comparison.
+
+**Terminal rendering through chafa, with retroemu's options.** Frames are turned into text by chafa
+(`@monteslu/chafa-wasm`, LGPL-3.0, loaded at run time) in a worker thread. The options have the same names and values
+as retroemu's terminal player: `--symbols` (`ascii`, `block`, `half`, `ascii+block`, `solid`, `stipple`, `quad`,
+`sextant`, `octant`, `braille`, `matrix`), `--colors` (`true`, `256`, `16`, `2`), `--fg-only`, `--dither`,
+`--contrast`, `--term-fps` (`--fps` stays as the same option) and `--frame-skip`. The half-block renderer the player
+had is `--symbols halfblock`: exact pixel colours, no chafa, the fastest mode. The frame now fits the terminal in both
+directions instead of being capped at 160 columns.
+
+**The default is ASCII in foreground colour on a black background.** It reads in any terminal and font (no block,
+sextant or braille glyphs needed) and keeps the terminal's colour theme out of the picture. With `--fg-only`, a flat
+cell, which chafa draws as a space or a glyph in two equal colours, is filled from a density ramp by its brightness
+(other symbol sets get their full-cell glyph), an edge cell is inked in the brighter of its two colours, and ASCII ink
+is lifted toward full brightness, so filled shapes and dark scenes stay visible; the frame's darkest tones stay black.
+Without this a solid shape came out as an empty outline. `--help` and the README describe every option.
+`test/term.test.js` checks each symbol set's glyphs and picture, each colour mode's escapes with and without
+`--fg-only` and `--dither`, `--contrast`, and that a dim scene stays readable on black, each with a control that must
+fail. No ABI or SPEC change; the test cart carries 0.42.0.
+
+## 0.41.3
+
+**A GLSL ES 1.00 fragment shader with no `precision` statement compiles.** The GL host upgrades `#version 100` shaders
+to `300 es` and declares `gl_FragColor` as an `out vec4 FragColor`. ES 1.00 allows a fragment shader with no default
+precision when every float carries its own qualifier, but ES 3.00 needs one on the output too, so a bare `out vec4
+FragColor;` failed to compile and the cart got no program. miniquad (macroquad) writes its shaders exactly this way.
+The output is now declared `out mediump vec4 FragColor;` (the precision `gl_FragColor` had) when the shader has no
+precision statement. `test/shader-v100-precision.test.js` compiles both forms against real GL, with a broken shader
+as the control (0.41.2 fails it). No ABI or SPEC change; the test cart carries 0.41.3.
+
+## 0.41.2
+
+**A cart directory answers an asset named with the asset prefix, as a `.wasc` does.** Both archive loaders index every
+entry twice, as `main.py` and as `assets/main.py`, so a cart that asks for the prefixed name works packed. The node and
+web hosts' directory mode only answered the bare name, so the same cart failed when run unpacked: wasmcart-pygame's
+importer asks for `assets/main.py`, and an unzipped pygame cart stopped with `No module named 'main'`. A directory now
+takes the path as given and, when no such file exists, the path without the prefix. The web host, which cannot test a
+path without fetching it, uses the manifest's `files` list when there is one and otherwise drops the prefix.
+`test/asset-prefix.test.js` checks that a directory answers exactly what its packed copy answers (0.41.1 fails it), and
+`test/browser.test.mjs` checks the web host. No ABI or SPEC change; the test cart carries 0.41.2.
+
+## 0.41.1
+
+**The first release since 0.37.0.** 0.38.0 through 0.41.0 were tagged but never published to npm, so this one carries
+everything in their entries below (carts' own art and `title`, git versions for packed carts, `--version-from`,
+`wasmcart art`). 0.41.0 was never published because its pre-publish GPU-memory test depended on the GPU: it compared the
+second half's peak with the first half's high-water mark, and a GPU whose driver pools finished growing after the
+half-way frame failed it though nothing leaked.
+
+**The GPU-memory test checks a growth rate.** `test/wgpu-claim.test.js` now fits a least-squares slope of GPU memory
+against frame over the last 40% of the run and fails above 0.1 MiB per frame (a leak is about 1.3, a late pool step of
+70 MiB about 0.03), plus a loose bound on the final level. The maths is in `test/helpers/gpu-growth.js`, with
+must-fail controls on synthetic series in `test/gpu-growth.test.js` (a flat series and a late pool step pass, a leak
+fails, and the old rule is shown to reject the pool step). The test asks the host for the low-power adapter, so it never
+runs on a display GPU.
+
+**Docs.** README's version section says the last tag is the nearest behind the commit, not the highest;
+`docs/webgpu.md` no longer pins an old caret range. No host, ABI or SPEC change; the test cart carries 0.41.1.
+
+## 0.41.0
+
+**A cart can carry its display name.** The manifest's new optional `title` is the game's name as people read it
+("Tux Racer"), for a launcher's list, a frontend's game name and a window title; `name` stays the short id, and a host
+without a `title` falls back to it. It is a presentation hint like `description`, never gating, and is not `art.title`
+(the title-screen picture). `wasmcart-pack --title <text>` writes it and warns above 64 characters.
+
+**`wasmcart art` copies a cart's launcher art out for a frontend.** `--esde <dir>` writes ES-DE's media folders
+(`covers`, `screenshots`, `titlescreens`, `marquees`, `fanart`, named by the cart's file name), `--libretro <dir>` the
+libretro thumbnail folders (`Named_Boxarts`, `Named_Snaps`, `Named_Titles`; PNG art only, JPEG art is named and
+skipped; `--name-by title` names them by the cart's title), and `--out <dir>` every art file plus an `art.json` that
+`wasmcart-pack --art` packs back. It takes carts, cart folders or a folder of carts, reads only the manifest and the
+art, keeps existing files unless `--force`, and prints one line per cart with its title. A cart without art is not an
+error. The test cart carries 0.41.0.
+
+## 0.40.0
+
+**`wasmcart-pack --version-from <dir>`** reads the cart's git version from that directory's checkout and no other. A
+language SDK packs its own runtime wasm with a staging copy of the game, so without it the version came from the SDK's
+checkout instead of the game's. Outside git it gives the default (`0.1.0`), never another checkout's version;
+`--version` still wins over it. The test cart carries 0.40.0.
+
+## 0.39.1
+
+**A dev build counts from the nearest version tag, not the highest.** A fork keeps its upstream's tags beside its own,
+so a port tagged `v0.1.0` that still carries upstream's `v2.1.20221123` packed its dev builds as
+`2.1.20221123-dev.g<commit>`. The packer now takes the nearest `v<semver>` tag behind the commit (`git describe`),
+skipping `v` tags that are not semver. Tag builds are unchanged. The test cart carries 0.39.1.
+
+## 0.39.0
+
+**Every packed cart carries its real version.** `wasmcart-pack` without `--version` used to write `1.0.0` into every
+manifest; it now takes the version from the git checkout the cart is packed from, by the same rule as cartwheel's build:
+at a clean `v<semver>` tag the tag (`v1.4.2` gives `1.4.2`), anywhere else `<last tag>-dev.g<commit>`, and
+`0.0.0-dev.g<commit>` before the first tag, so a dev build is never taken for a release. Outside git it is a `--source`
+manifest's own version, else `0.1.0`. The README's "The version" section has the table, and what a CI checkout needs
+(`fetch-depth: 0`).
+
+**`--version` wins in `--source` mode too.** `--source` copied the tree's manifest verbatim, version included, and
+ignored `--version`, so a tree that committed `"version": "1.0.0"` packed as `1.0.0` whatever was asked. The explicit
+flag now wins, and without it the git version replaces the tree's placeholder.
+
+**A version that is not semver stops the pack** (`1.0`, `v1.0.0`, `1.0.0-01`), from `--version` or from a `--source`
+manifest, instead of reaching launchers that compare versions as semver.
+
+`resolveCartVersion`, `gitVersion` and `semverProblem` are exported (Node entry) for build tools that want the same rule.
+The test cart carries the package's version (0.39.0), and `examples/webgpu-hello` its checkout's; their code is
+unchanged.
+
+## 0.38.0
+
+**Carts can carry their own art.** Three new optional manifest fields, for launchers: `description`, `author` and `art`,
+the cart's pictures (an icon, box art, key art with no text, a transparent logo, the title screen and labelled
+screenshots), PNG or JPEG files the archive carries under `art/`. A launcher can show them without running the cart, and
+none of them changes how the cart runs: a host never refuses or alters a cart over its art. `wasmcart-pack --art <dir>`
+packs them (files named for their key, or an `art.json` naming them and labelling screenshots), with `--description` and
+`--author`; it stops on a file that is not a PNG or JPEG and warns about a picture of the wrong shape. SPEC.md,
+"Manifest", defines the fields; [docs/art.md](docs/art.md) has the shapes, sizes and the mapping onto libretro's and
+ES-DE's art folders. `src/cartArt.js` holds the checks for hosts.
+
+**Hosts ignore manifest fields they do not know.** The SPEC now requires it of every field (it said so only for
+`controls` tokens), so a cart with a field from a later revision runs on an older host as if the field were absent. Every
+host already behaved this way; nothing changes for an existing cart.
+
+## 0.37.0
+
+**WebGPU carts get a core device where the GPU has one.** `CartHost` and `CartHostWeb` now ask for a core adapter and fall
+back to compatibility mode, as wasmcart-native and romdev already do, so a cart gets the same feature level on every host.
+On a core device an HDR scene can multisample and a depth texture can be read directly. No import, export or struct changed:
+a cart reads the level with `wgpuDeviceHasFeature(device, WGPUFeatureName_CoreFeaturesAndLimits)`, and compatibility mode is
+still the floor every cart that does not request core must run on. A core device does not enforce that floor, so test a cart
+with `WASMCART_WGPU_FEATURE_LEVEL=compatibility` (new, Node hosts) or `adapterOptions: { featureLevel: 'compatibility' }`,
+where Dawn does. SPEC.md, "Feature level", says all of this.
+
+**Docs.** The README's ABI references, manifest example and minimal cart said v3, which every host refuses; they say v4 now. The
+README and `docs/webgpu.md` no longer say the libretro core lacks WebGPU: its Linux builds have it.
+
+## 0.36.2
+
+**Integer textures upload the right number of bytes.** `glTexImage2D` and `glTexSubImage2D` counted `GL_RED_INTEGER`,
+`GL_RG_INTEGER` and `GL_RGB_INTEGER` as four channels, so a single-channel `R32UI` texture (cartwheel's light grid)
+read four times its size from the cart's memory. Usually that was unrelated heap data; when the texture sat near the end
+of memory it threw `RangeError: Invalid typed array length` and the cart stopped. Each integer format now has its own
+channel count.
+
+## 0.36.1
+
+**The windowed player's controllers, three fixes found with the test cart.**
+- Guide was mapped to SELECT, so on an X360 pad the Guide button lit Select. It is now `WC_BTN_GUIDE`.
+- L3 and R3 (the stick clicks) and the four paddles never reached a cart. They do now.
+- A released trigger read half pressed. @kmamal/sdl 0.11 maps a trigger a second time against its raw axis's starting
+  value, so an X360 pad's triggers rest at 0.5. Each trigger now travels from its rest (the lowest value it reads) to full,
+  and a pad whose triggers rest at 0 is unchanged.
+
+The native player (wasmcart-native) reads SDL directly and had none of these. MISC1 and the touchpad click still never come
+from the windowed player: @kmamal/sdl does not report them.
+
+## 0.36.0
+
+**The test cart: `wasmcart test`.** A cart for checking a host by eye, in `testcart/` (C source, build script and the
+`.wasc`, shipped in the package). Four pads drawn with every button lit while held (Guide, Misc, the paddles and the
+touchpad click included), sticks, triggers, raw values, the pad name, the device the host reports and the host's names for
+the face buttons; every pointer slot as a numbered circle with a trail, the pointer event counts and the wheel; the
+keyboard. Sound: A, B, X and Y each play their own note in a waveform that names the pad, holding L plays them on the left
+channel only and R on the right only, and the triggers bend the pitch. Saves: each start checks its 32 KB save byte for
+byte and says FRESH, OK (with the start count and how far the last session's save got), TRUNCATED or CORRUPT, and
+SELECT+START held for 3 seconds clears it. L3 and R3 run the rumble motors. Every panel is also a debug field, so a host's
+tests can drive it (test/testcart.test.js does). Its save goes under `$XDG_DATA_HOME/wasmcart/saves/`, not into the
+installed package. No ABI change.
+
+## 0.35.1
+
+**Runtime code generation: one module may be as large as the whole linked total.** The per-module minimum every host accepts
+(`wc_jit_config` key 3) goes from 4 MiB to 256 MiB, the same as the total linked at once (key 4). The 4 MiB figure was a default
+carried over from the first runtime-JIT engines, which link modules of a few kilobytes; nothing depended on it, and engines allow far
+more (V8 and JavaScriptCore: 1 GiB per module). A cart that links a module between 4 MiB and 256 MiB (a static recompiler's guest
+code) is no longer refused. Additive: a cart that worked before is untouched; the total, function and in-flight limits are unchanged.
+SPEC.md, "Runtime code generation", Limits.
+
+## 0.35.0
+
+**Asset prefetch.** An ADDITIVE ABI change (ABI 4, as hardware_threads was):
+a cart built before it is untouched, byte for byte, and a cart that never
+calls the new imports sees no change.
+
+A cart streaming a world bigger than memory must never block a frame on a
+download, and on a web host a cart directory's assets are downloads: the
+asset ABI is synchronous, so a read of a cell that has not arrived suspends
+the cart (JSPI), which hides the wait from the cart's code but not from the
+frame. A cart cannot start a fetch by itself. SPEC.md, "Asset prefetch".
+
+- `int32_t wc_asset_prefetch(const char* path, uint32_t path_len, int32_t priority)`
+  starts fetching the whole asset at `path` into the host's own memory and
+  returns its state; called again with the same path it starts nothing and
+  is the poll. `0` PENDING, `1` READY (the next `wc_load_asset` of that path
+  is a copy: no disk, no network, no suspension, already decompressed),
+  `-1` MISSING (exactly when `wc_asset_size` says `-1`), `-2` FAILED (sticky
+  until cancelled), `-3` REFUSED (too many pending, cache full, or a cart
+  thread: ask again later). `priority` orders the start of pending fetches,
+  higher first; a repeat call raises, never lowers.
+- `void wc_asset_prefetch_cancel(const char* path, uint32_t path_len)` drops
+  one. A whole read (`wc_load_asset` returning the asset's full size) ends a
+  prefetch too, so a cart that reads what it asked for never cleans up and
+  the host's cache is bounded by what the cart has not read yet.
+- Detection is a host-info flag, `WC_HOST_FLAG_ASSET_PREFETCH` (`0x04`),
+  written before `wc_init`; a cart reads it once and calls the imports only
+  with it set. A host built before them stubs the imports, and the stubs'
+  values disagree between hosts, so the flag is normative. No manifest field.
+- Limits every host meets: 64 prefetches pending or ready at once, one asset
+  of the maximum size held; both hosts allow 256 entries and 512 MiB.
+- Node host (`CartHost`): the entry's bytes with `fs.read` and a deflated
+  one through `zlib.inflateRaw`, a dev directory's file with `readFile`, all
+  on libuv's threadpool; the state flips on the event loop, between frames.
+- Web host (`CartHostWeb`): a priority fetch queue (six in flight) in front
+  of the directory fetch, with an `AbortController` for cancel and the cart's
+  priority as the browser's fetch priority hint; a `.wasc` entry inflates off
+  the main thread with `DecompressionStream('deflate-raw')`. A lazy read of a
+  path whose fetch is in flight now waits on that fetch instead of starting a
+  second one.
+- Cart threads answer `-3`: the imports are main-thread state, and a thread's
+  `wc_load_asset` reads the archive as before.
+- `include/wasmcart.h`: the two imports, `WC_PREFETCH_*`, the flag, and
+  `WC_ASSET_PREFETCH(s, prio)` / `WC_ASSET_PREFETCH_CANCEL(s)`; the non-wasm
+  inlines answer READY and do nothing. `src/abi.js` and both entry points
+  export `HOST_FLAG_ASSET_PREFETCH` and `PREFETCH_*`.
+- `load(cart, { assetPrefetch: false })` leaves the imports and the flag out,
+  which is what a host built before them looks like to a cart: the way to
+  test a cart's fallback.
+- Tests: `test/fixtures/prefetch.c` (8 MiB deflated asset, a stored one, a
+  missing one) on the Node host in all three source modes and on the web host
+  under Node and in a real browser over HTTP with JSPI, each with a control
+  on the old-host path that must fail the READY predicate and still read.
+
+## 0.34.5
+
+- Fix both analog sticks in the windowed player: map SDL's `leftStickX/Y` and `rightStickX/Y` axis names to the cartridge pad fields, including input-device activity events. Controller regression tests now use SDL's documented names.
+- Keep the WebGPU thread-leak check working on macOS as well as Linux, so the full npm publish preflight runs on both.
+
+## 0.34.4
+
+**A destroyed WebGPU cart is freed.** No change to the ABI or to what a cart
+sees.
+
+- Every WebGPU cart a Node host destroyed stayed in memory with its GPU
+  instance, device, every object it made and four Dawn threads, about 240 MB a
+  load on a server that loads carts over and over (romdev's grew to 19 GB).
+  Native code held the session three ways: native-dawn's `wasmImports` kept
+  strong references to the glue functions it falls back to, Dawn kept the
+  device's error handler (the glue's), and object wrappers Dawn keeps were keys
+  of release-tracker entries that reached the glue's Module.
+  - The fallbacks are trampolines into a table `destroy()` empties, so this
+    works with native-dawn 0.1.5; `destroy()` also calls `dispose()` where
+    native-dawn has it.
+  - `destroy()` clears each device's error handler and leaves a no-op in its
+    place for the one the glue sets when `device.lost` settles.
+  - The release tracker has `dispose()`, which lets go of every object and of
+    the glue.
+- `test/wgpu.test.js`: four load/destroy cycles of `wgpucart.wasc` are all
+  collected and leave no Dawn threads (0 of 4 collected before).
+- native-dawn ^0.1.6, whose `wasmImports` no longer holds a program alive
+  through its glue and has `dispose()`.
+- Measured: 60 load/destroy cycles of `wgpucart.wasc` in one process hold RSS
+  at about 160 MB with a steady thread count; 0.34.3 grows about 33 MB and two
+  threads a cycle.
+
+## 0.34.3
+
+**Four controllers in the windowed player.** No change to the ABI or to what a
+cart sees.
+
+- `wasmcart-play --window` opens up to four game controllers, each its own pad
+  (pad N is player N + 1). It opened one controller and reported pad 0 only,
+  so a second, third or fourth controller never reached a cart.
+  - A controller takes the first free slot when it appears and keeps it until
+    it goes away; one going away leaves the others in their slots.
+  - A pad's buttons and sticks are read from its controller every frame, so a
+    button already held when the controller is opened counts.
+  - Rumble goes to the controller in that pad's slot.
+  - @kmamal/sdl 0.11 reuses device objects by list position and its
+    deviceRemove event can name another controller than the one that went;
+    the slots keep their own copy of each device's id and go by what is
+    still plugged in.
+- `src/padSlots.js` holds the mapping; `test/pad-slots.test.js` covers it.
+
+## 0.34.2
+
+**Node host CPU per WebGPU frame, and window pacing.** No change to the ABI or
+to what a cart sees.
+
+- A WebGPU cart's hottest imports call Dawn directly. These are the render
+  and compute pass's state, draws and dispatches, and
+  `wgpuQueueWriteBuffer`, served by native-dawn's `wasmImports` (new in
+  native-dawn 0.1.5, now a direct dependency).
+  - Rider makes about 2,350 such calls a frame. Through the glue and Dawn's
+    Node binding each cost about 1.6 us.
+  - Its `runFrame` went from 4.50 ms to 2.14 ms on average (p95 7.54 to 3.16
+    ms) on a Ryzen AI 9 HX 370 with an RX 7600.
+  - A call naming an object the table does not have, or memory outside the
+    cart's, goes to the glue's function, so results are unchanged. Only a GPU
+    `CartHost` makes from webgpu-node gets them; an embedder's own `gpu` does
+    not.
+- `wasmcart-play --window` opens a WebGPU cart's window on Wayland when the
+  session has Wayland, even if Xwayland is running. Under Xwayland, Vulkan
+  presentation paced Rider at 1 to 24 fps with 100 ms stalls. The same session
+  gave a steady rate on a Wayland window. GL carts keep SDL's default, X11.
+  `SDL_VIDEODRIVER` still overrides both.
+- The window loop no longer stops stepping while the audio queue is more than
+  250 ms ahead. Each such stop held the next frame back, and the loading burst
+  left the queue 150 to 200 ms deep for the whole run, close enough to the
+  limit that any hitch stopped it again.
+  - Audio more than 80 ms behind is now dropped, a frame's worth at a time.
+    `--stats` counts the dropped samples.
+  - The loop never runs faster than the display refreshes, including when a
+    compositor stops pacing the window (a locked screen, a minimized window).
+
+## 0.34.1
+
+- Reverts 0.34.0's direct presentation (`presentWgpuTo` configuring a window
+  the cart's size as the cart's own canvas). On a real window (Vulkan on
+  Wayland, AMD RADV) it lost the device in `GatherSurfaceInfo`, or submitted
+  a destroyed surface texture every frame, so `npx wasmcart` could not run a
+  WebGPU cart in a window. Windows get the frame by the blit again, as in
+  0.33.0.
+
+## 0.34.0
+
+**WebGPU and GL host CPU**, and compiled code the browser keeps. No change to
+the ABI or to what a cart sees.
+
+- WebGPU imports: each glue function behind a wrapper of its own arity (a
+  rest-args wrapper allocated an array per call), and no per-call
+  bookkeeping. The release tracker (src/wgpu/release.js) follows only the
+  calls that make holders (texture views, bind groups, render bundles), the
+  surface texture and command encoder / buffer lifetimes, and destroys a
+  released texture or buffer nothing holds at the end of the frame, after its
+  last submit (the session's new `endFrame()`, which `CartHost` and
+  `CartHostWeb` call when `wc_render` returns). It used to walk an object
+  graph on every call: about 14% of a WebGPU cart's main-thread CPU.
+- The glue passes dynamic bind-group offsets to `setBindGroup` as a reused
+  array. Given `(HEAPU32, start, count)`, Dawn's Node binding tried the
+  sequence overload first, built the failure's error strings and converted
+  again: about 14% more. (scripts/wgpu/glue-offsets.mjs)
+- The host-owned cart canvas reuses its textures from a ring of three
+  (webgpu-node 2746769) instead of destroying and allocating a full-size one
+  every frame; `drawTo()` keeps its bind group per texture. `presentWgpuTo()`
+  into a window exactly the cart's size has the cart draw straight into the
+  window's texture from the next frame on (`wasmcart-play`'s window); any
+  other size is letterboxed with the copy.
+- `createWgpuSession` takes `onObject(handle, object)` and
+  `onRelease(handle, object)`: every WebGPU object the cart gets a handle to,
+  for an embedder that serves some of the cart's imports natively
+  (wasmcart-native calls Dawn's C API for a pass's draws).
+- GL imports reuse their views of cart memory, made again only when it grows,
+  and small scratch arrays, instead of a new typed array on every call.
+- A cart thread that traps, or whose worker fails or exits without returning,
+  stops the cart: the next `runFrame()` throws an error naming the thread. It
+  was logged, and the cart's pool ran a worker short.
+- `CartHostWeb` compiles a cart's wasm with `WebAssembly.compileStreaming`
+  when it comes from a URL (a `.wasm` URL, a cart directory, or the new load
+  option `wasm`: a URL, or a fetch the page already started, in place of the
+  `.wasc`'s entry), so the browser keeps the compiled code for the next load.
+
+## 0.33.0
+
+**The host's hardware thread count** (SPEC.md, "wc_host_info_t"). Additive:
+a cart built before it is untouched, byte for byte.
+
+- `wc_host_info_t` gains `hardware_threads` at byte offset 20: the hardware
+  threads (logical CPUs) the host machine offers, 0 when the host cannot tell.
+  A threaded cart sizes its thread pool from it instead of guessing. `CartHost`
+  writes `os.availableParallelism()`, `CartHostWeb` `navigator.hardwareConcurrency`.
+- A cart declares the 24-byte struct with the new flag `WC_FLAG_HOST_THREADS`
+  (`FLAG_HOST_THREADS`, `1 << 7`), and only then does a host write offset 20:
+  in an older cart the four bytes after its 20-byte struct are its own memory.
+  `wc_cart.h`'s `WC_FILL_INFO` sets the flag. On a host that predates the field
+  such a cart reads 0.
+- SPEC.md documents `wc_host_info_t` field by field (it had only the flags), and
+  says to ignore offset 8: it is reserved, but wasmcart-native has written a
+  frame rate there.
+
+## 0.32.0
+
+**WebGPU**, an optional second GPU tier (SPEC.md, "WebGPU";
+docs/webgpu.md). Additive: no struct, flag or import an existing cart uses
+changes, and GL stays the tier every host must run.
+
+- A cart that imports WebGPU functions (Emscripten + Dawn's emdawnwebgpu
+  port, frozen at release v20261002.154047) runs on WebGPU in `CartHost`
+  (through webgpu-node, a new dependency alongside webgl-node) and `CartHostWeb`
+  (through the browser's `navigator.gpu`). The host owns the device
+  (`emscripten_webgpu_get_device()`), the cart renders into the `"#canvas"`
+  surface, and the host reads frames back (`readGpuFrame()`) or draws them
+  into a window (`presentWgpuTo()`).
+- Carts run at WebGPU's compatibility feature level unless they request core.
+- On a two-GPU machine the embedder picks the GPU (`adapterOptions.powerPreference`,
+  or `WASMCART_WGPU_POWER` for every load), and `getGpuAdapterInfo()` says
+  which one a cart got.
+- wasi-sdk carts (threads included) target the same tier through `wgpu-wasi/`:
+  compile emdawnwebgpu's C++ half into the cart with a CMake function, and it
+  imports exactly what an Emscripten cart does. No host change.
+  `wasmcart_wgpu_wasi_library()` compiles that support once for a build of many
+  carts, and `wgpu-wasi/imports.txt` lists every import the kit allows, for
+  auditing carts linked with `--allow-undefined`.
+- A cart importing both `gl` and WebGPU gets WebGPU where the host has it and
+  GL where it does not, told by `WC_HOST_FLAG_GPU_WGPU` (0x02) in host-info
+  flags; the API the host did not select throws if called.
+- Refused at load, with the reason: a WebGPU-only cart on a host without
+  WebGPU, `gpu_api` 2 with no WebGPU imports, any `gpu_api` above 2 (every
+  value above 0 used to mean GL), and a WebGPU function the host's glue does
+  not provide.
+- `examples/webgpu-hello`, a minimal textured-triangle cart, and
+  docs/webgpu.md walking through it (every C block on that page is quoted from
+  it, and a test keeps it so). The page also covers the frame loop's yield,
+  GPU memory, resize, errors and device loss, limits, per-host status and
+  performance.
+- Tested on the Node host (a discrete AMD GPU, and lavapipe as in CI), in
+  Chromium, and in Firefox on Linux with `dom.webgpu.enabled` set (off by
+  default there). Safari is untested.
+- Embedders driving `runFrame()` themselves must yield a task between frames
+  (not only `await`): async results and the release of GPU objects depend on it.
+- A texture or buffer the cart released is destroyed once nothing live uses
+  it (a view, bind group, render bundle or unsubmitted command buffer still
+  holding it keeps it), so GPU memory stays flat in browsers too; Chromium
+  otherwise grew without bound (7 GB by frame 3000 of a create-and-release
+  test cart).
+- Losing the host's GPU device stops the cart instead of presenting black
+  frames: `host.gpuLost` becomes `{ reason, message }`, the load option
+  `onGpuLost` is called once, and `runFrame()` no longer calls `wc_render`.
+  `wasmcart-play` prints the reason and exits 4. No ABI change.
+
+**Cart memory the host writes** (SPEC.md, "Cart memory the host writes").
+Every byte a host places in a cart at an address it picks (glGetString,
+glGetStringi and glMapBufferRange results, WebGPU adapter info, mapped ranges
+and callback strings, text and peer payloads) now comes from the cart's own
+allocator, through two optional cart exports, `wc_alloc(size, align)` and
+`wc_free(ptr)`.
+
+- `wasmcart.h` defines and exports both (weak, over `aligned_alloc`/`free`)
+  for Emscripten and wasi-sdk; `wgpu-wasi/` exports them for wasi-sdk WebGPU
+  carts; `rust/wasmcart-alloc` is a crate that exports them for Rust carts.
+- Optional: a cart that never reaches one of those paths needs neither. One
+  that does, without an allocator, gets a clear error at that call naming the
+  fix. Hosts never refuse to load a cart for lacking one.
+- Every pointer the cart returns is checked (non-zero, aligned, inside its
+  memory) before the host writes through it.
+- Removed: the fallback that wrote into the top of linear memory when a cart
+  had no allocator. It wrote over the cart's live heap or statics.
+- The WebGPU glue no longer calls into the cart's `malloc`, `memalign` or
+  Emscripten stack helpers; `wgpu-wasi/exports.txt` lists `wc_alloc`/`wc_free`
+  instead, and `emwgpu_wasi.c` no longer defines `memalign` or the stack
+  helpers.
+- Only `wc_alloc`/`wc_free` are used: a cart's exported `malloc` is not an
+  allocator to the host, so a cart linked with `-Wl,--export=malloc` (or an
+  Emscripten cart built against older headers) gets the error on those paths.
+
+**Cart directories on the web.** A cart can run on the web from an unpacked **cart directory**, starting
+before its assets are downloaded.
+
+- `CartHostWeb.load(url)` takes a cart directory URL (or a .wasc/.wasm URL,
+  fetched whole). With JSPI (Chrome/Edge 137+, Firefox 153+, Safari 27+) each
+  asset is fetched the first time the cart asks for it, and the cart is
+  suspended on that fetch, so `wc_load_asset` still returns bytes on the next
+  line and ported engines need no change. Only the entry wasm is downloaded
+  before the cart starts.
+- For such a cart `runFrame()` returns a promise (`await host.runFrame()`
+  works for every cart). Input and lifecycle callbacks are awaited one at a
+  time and never overlap a suspended frame.
+- New optional manifest field `files`: the asset list, used only to serve
+  `_filelist.txt` for a cart directory on the web (HTTP cannot list one).
+  `wasmcart index <dir>` writes it (`--check`, `--remove`), `wasmcart-pack
+  --files` records it in an archive, and the node host warns by name when a
+  directory's list is stale.
+- Without JSPI, a cart directory with `files` is prefetched whole and runs
+  synchronously; without `files` the load fails and says why.
+- The node host loads a cart directory with no `manifest.json`, as the spec
+  already allowed for a .wasc.
+
+**Runtime code generation** (SPEC.md, "Runtime code generation"). A cart that
+compiles code while it runs links the wasm it generates; the host's wasm engine
+is the JIT. Optional for carts, provided by every host.
+
+- New imports `wc_jit_link(bytes, len, *result)` (first slot, `-1` refused,
+  `-2` pending into `*result`, `-3` try later), `wc_jit_unlink(first_slot)`
+  and `wc_jit_config(key)` (keys 0-2 engine advice and the off switch, 3-6 the
+  limits, 7 the restore generation). Declared in `wasmcart.h`.
+- A generated module imports only from namespace `cart`, resolved to the
+  cart's own exports, so it has exactly the cart's authority.
+- Per instance: slots, limits and compiles belong to the instance that asked
+  (a worker thread has its own); a late result for a destroyed or replaced
+  cart is dropped.
+- Spec minimum limits: 4 MiB per module, 256 MiB and 65536 functions linked
+  at once, 32 compiles in flight.
+- Slots do not survive a save-state restore or rewind. `jitUnlinkAll()`
+  unlinks every slot, drops compiles in flight and changes `wc_jit_config(7)`
+  in one step; engines compare key 7 at frame entry and re-link when it
+  changed. Its value is a specified hash of the restored memory (FNV-1a 32 over
+  little-endian words, `restoreGeneration()`), the same on every host. Slots freed by a
+  restore are reused only after the cart has read key 7, so a stale slot number traps rather than reaching other code.
+- `jit: false` or `WASMCART_JIT=0` turns it off: carts get `-1`, and the user
+  gets one unmistakable notice (`onJitNotice`, stderr, the player's window
+  title, a banner in a page).
+- `createJitImports` is exported for hosts and harnesses that build their own
+  imports.
+
+
+**Input actions** (SPEC.md, "Input actions"), Steam Input style. Optional
+for carts, provided by every host; a cart that never calls them reads
+`wc_pad_t` as before.
+
+- A cart declares action sets (`wc_action_set_add`) and digital or analog
+  actions (`wc_action_add`), each with a default binding to a logical pad
+  input (`WC_IN_*`: the `WC_BTN_*` bit indexes, sticks, triggers, d-pad), and
+  picks a set per player (`wc_action_set_activate`).
+- It reads state per player (`wc_action_digital`, `wc_action_analog`); with no
+  remap that equals the default pad input, so every host behaves the same.
+- It asks what an action is on (`wc_action_origin`: a label into its own
+  buffer, `0` unbound, `-1` unknown; `wc_action_glyph`: a standard glyph id),
+  which device the player uses (`wc_input_device`), and re-reads when
+  `wc_input_revision` changes. No allocator: the cart owns every buffer.
+- `wasmcart.h`: `wc_action_set_new`, `wc_action_new`, `wc_action_label`.
+- Embedders: `setInputDescriber`, `setInputDevice`, `setActionBinding`,
+  `inputChanged`, `getActions()`. `npx wasmcart` labels its keyboard map
+  and the controller's family (Xbox, PlayStation, Nintendo); `CartHostWeb`
+  with no describer answers from the Gamepad API pad at the player's index.
+
+**`CartHostWeb` gains the debug ABI and `setFixedStep`**, as in `CartHost`: `FLAG_DEBUG`, `readDebugState`/`readDebugValue`/`writeDebugValue`, `wc_debug_mark` and `wc_log` captured for `drainDebugEvents`, and the fixed-step clock (shared code in `src/debugState.js`, bounds-checked against cart memory).
+
+**Migrating to 0.32:**
+
+- Carts that reach a path where the host writes into cart memory (GL
+  pointer-returning calls, WebGPU, text and peer payloads): rebuild against
+  0.32's `wasmcart.h` (or the wgpu-wasi CMake helper, or the `wasmcart-alloc`
+  Rust crate), or export `wc_alloc` and `wc_free` yourself. A vendored copy of
+  `wasmcart.h` must be updated (`scripts/sync-headers.sh`). Carts that never
+  reach those paths run unchanged.
+- Runtime code generation and input actions change nothing for existing
+  carts. Embedders that build their own import object add
+  `createJitImports(...).imports` and the action imports (`ActionTable`); an embedder that
+  restores save states calls `jitUnlinkAll()` after writing memory back.
+
+## 0.31.0
+
+**ABI v4.** Every analog axis is int16 (triggers were uint8) and
+`wc_pad_t.buttons` is a u32 carrying SDL2's full button set, which moved
+`connected` from byte 12 to 14 and made `wc_pad_t` 20 bytes. Carts built
+against v1-v3 are refused at load with a version error rather than read with
+the wrong offsets; rebuild against the v4 headers.
+
+- setjmp/longjmp works in the browser host.
+
+## 0.30.0
+
+The mouse and a reconnecting controller reach carts.
+
+- The windowed player delivers the mouse to carts that set `WC_FLAG_POINTER`.
+- A controller is opened when SDL reports it, so one plugged in (or back in)
+  after start works.
+- A test fails when the Node and browser hosts' public methods drift apart.
+
+## 0.29.0
+
+- The windowed player paces video on vsync, not on the audio queue, and
+  bounds its loop when vsync is missing.
+- `--stats` reports the measured frame rate and audio.
+
+## 0.28.0
+
+- The windowed player letterboxes 2D frames in drawable pixels, not window
+  points (HiDPI windows showed the picture in a corner).
+- webgl-node dependency updated.
+
+## 0.27.0
+
+GL carts that use uniform blocks draw, a GL cart's window is no longer
+black, and saves survive headless runs.
+
+- `glGetActiveUniformBlockiv` and `glGetActiveUniformsiv` are implemented.
+  Auto-stubbed to 0, the first reported a 2-byte uniform block for a 64-byte
+  mat4, so an engine sized its UBO from that and every vertex collapsed to a
+  point with no GL error. Generic to any cart using uniform blocks; found on
+  Defold carts. On a failed query both now leave the caller's buffer alone
+  instead of writing a plausible zero.
+- Auto-stubbed GL imports are named in one startup warning, for both the
+  `gl` module and the `env` spelling big engines use, so this bug class is
+  one line instead of an empty screen.
+- `wasmcart-play --window` presents the redirect FBO with
+  `presentToSurface()` (letterboxed, or stretched under `--stretch`). A
+  redirected GL cart drew nothing into the default framebuffer, so the window
+  was black while headless runs and romdev looked fine. Carts drawing straight
+  into the default framebuffer are unaffected.
+- Headless `wasmcart-play` (`--frames` without `--window`) now persists
+  the save block on exit like the interactive and windowed players.
+
+## 0.26.0
+
+`_filelist.txt` (how a cart enumerates its assets) is identical in every
+load mode. The dev-directory loader now builds it, where before a cart saw
+nothing under `npx wasmcart <dir>`, and the archive loaders no longer list
+every asset twice. A dev directory and the `.wasc` packed from it return
+byte-identical listings; lookups still accept both spellings.
+
+## 0.25.1
+
+Test harness only: the Playwright guards check for the browser binary
+rather than the package, so CI skips the browser tests cleanly when no
+browser is installed instead of failing.
+
+## 0.25.0
+
+`npx wasmcart` can now fetch and play `.wasc` carts directly from HTTP and
+HTTPS URLs. Downloads stream to temporary storage, work in windowed, terminal,
+and headless modes, follow redirects, and are removed when playback ends.
+Remote-cart saves use a stable URL-derived path in the user's data directory.
+
+## 0.24.0
+
+A cart teardown no longer corrupts another cart's GL context.
+
+`_releaseAll` claims GL currency so its deletes are well-defined, and
+left it claimed. GL currency is a PROCESS-WIDE singleton, so a cart
+tearing down in one session took it from every other one -- including a
+host whose context was bound to a live playtest window. That window
+presents on a 60fps timer which re-claims nothing, so from then on it
+blitted with the wrong context current, its FBO was not valid there, and
+it went BLACK at a healthy 60fps
+(`GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT`, 0x8cd7, attachment
+`GL_NONE`, `GL_INVALID_OPERATION`).
+
+The symptom is nasty to chase because every instrument said the game was
+fine: a CPU readback of that cart still showed a perfect picture, since
+it reads the cart's own FBO rather than what the window presents. Only an
+OS-level capture of the real window showed black.
+
+Three changes:
+
+- **Currency is recorded and restored.** A module-level `_currentGlCtx`
+  tracks who holds it; `makeCurrent` is wrapped so every claim is
+  recorded whoever makes it, and `_releaseAll` hands currency back to
+  whoever had it instead of keeping it. `noteGlCurrent()` is exported for
+  hosts that claim currency outside this module.
+- **Everything is unbound before it is deleted.** Deleting a still-bound
+  object leaves the binding point driver-defined, and on a shared context
+  that state outlives the cart. Per spec a deleted binding reverts to 0 --
+  but 0 here is REMAPPED to the redirect FBO, so that revert is not the
+  no-op it looks like. Dropping every binding first makes the sweep
+  order-independent.
+- **`CartHost.runFrame` records its per-frame claim**, so a teardown
+  elsewhere restores the right context rather than none.
+
+Requires webgl-node >= 1.5.1, which puts `makeCurrent` on the context
+object. Before that, `ctx.makeCurrent?.()` here was a silent no-op --
+makeCurrent lived only on the wrapper that callers throw away -- which is
+the other half of this bug and the half that actually made it fire.
+
+## 0.23.0
+
+A destroyed cart now deletes every GL object it created.
+
+The object tables in `webgl_imports.js` track every buffer, texture,
+framebuffer, renderbuffer, program, shader, VAO, sampler, query and sync
+the cart allocates — and nothing ever walked them at end of life. On an
+OWNED context that is invisible: destroying the context frees everything.
+On a BORROWED context it is a leak with no ceiling, because the shared
+context outlives every cart, and every cart that ever loaded left its full
+GL footprint (1080p render targets, bloom chains, atlases) alive in it
+forever.
+
+Measured on a romdev server driving formix gate suites through one shared
+offscreen context: VRAM climbed ~1 GB per burst of parallel runs until the
+8 GB card filled, after which allocations spilled into GTT — GPU-mapped
+SYSTEM RAM — and reached 26.69 GB of a 54 GB machine in ~90 minutes.
+Invisible in `ps`/`top` the whole time, because GTT is accounted to the
+GPU rather than the process. With the fix, the same bursts hold dead flat.
+
+`createWebGLImports` now exposes `_releaseAll()`, and `destroy()` (both
+hosts, Node and web) calls it: framebuffers and VAOs first — containers
+before the contents they reference — then programs, shaders, textures,
+buffers, renderbuffers, samplers, queries, syncs, the per-program uniform
+location maps, and the redirect FBO trio, which lives outside the tables
+and leaks separately if teardown only sweeps them. Safe to call twice;
+never throws; makes the context current first where the backend allows,
+because deletes on a non-current context are undefined.
+
+Deleting the redirect trio at teardown does not conflict with the Mali
+name-recycling warning in `_ensureRedirectFBO`: that warning is about
+re-creating MID-LIFE, while the cart still holds live names a recycled id
+could collide with. At teardown the cart's names die in the same pass.
+
+## 0.22.1
+
+Two GL import-layer fixes, both of the silent-wrong-picture kind: nothing
+throws, no cart can see them, and the only symptom is that the frame is wrong.
+
+**`glUniform1f` is routed to the setter WebGL2 will actually accept.** Desktop
+GL converts; WebGL2 enforces an exact type match and REJECTS the call with
+`GL_INVALID_OPERATION`, leaving the uniform at its previous value. A 3D cart
+set `uniform int point_simple_count` — its light count — through the float
+entry point every frame, so the count kept whatever it held and the scene was
+lit wrong. `glGetUniformLocation` now records each location's declared type and
+array size once (`getActiveUniform` is a driver round trip; setters run
+thousands of times a frame) and `glUniform1f` dispatches on it: int/bool →
+`uniform1i`, int vectors → `uniform{2,3,4}i` truncated, float vectors →
+`uniform{2,3,4}f` broadcast, a declared array → the `*v` form even for one
+element, and a plain float straight through.
+
+**The feedback loop the FBO redirect creates is broken before the draw.** The
+redirect makes "the screen" an ordinary 2D texture, which the cart cannot know.
+Against a real default framebuffer, returning to the screen can never loop —
+the screen is not sampleable. Here it can: a sampler still holding the target
+means the draw both reads and writes the same image, and WebGL2 rejects it and
+renders nothing. A match-three cart came out with a board and no jewels,
+because it bakes each sprite into its own canvas and its bind cache left a
+canvas texture on unit 0. Repaired at DRAW time, not at bind time — the cart
+binds its texture *after* returning to the screen, so a bind-time fix is undone
+immediately. Sampler units, the active unit and each FBO's `COLOR_ATTACHMENT0`
+are tracked rather than queried, and the active unit is restored exactly as the
+cart left it (engines cache it and skip binds they consider redundant).
+
+Both are tested at two layers, because the premises fail differently from the
+behaviour. The uniform premise is checked against real GL; the feedback-loop
+premise needs a **real browser** (Playwright) — native-gles/radeonsi accepts
+the looping draw and renders it, so a node-only suite would "prove" that fix
+unnecessary. Controls were run for both: reverting the router fails 7 of 10
+cases, removing the two guard calls fails 3 of 6.
+
+One caveat recorded for the next reader: the array branch of the uniform fix
+does not reproduce as a failure on native-gles. `glUniform1f` on `float[16]` is
+accepted there and the readback confirms it writes, even at `size=16`. It is
+kept because the browser's WebGL2 is the strict validator this exists for.
+
+## 0.22.0
+
+**The scroll wheel reaches carts.** Every device wasmcart runs on has a
+gamepad, a touchscreen, or a mouse -- so a game needing one continuous axis
+(zoom, throttle, scrub) needs three bindings to be universally playable:
+a stick, a pinch, and a wheel. The first two were already possible. The
+third had nowhere to go: `wc_pointer_t` carries {x, y, buttons, active} and
+nothing else, so hosts dropped every wheel event on the floor.
+
+This is an ADDITIVE ABI change (v3.1). Existing carts are unaffected --
+`wheel_ptr` is a new `wc_info_t` field older carts leave as whatever was at
+index 17, which hosts range-check and ignore. Rebuilding an existing cart
+against the new headers gets it for free, since `WC_CART_BUFFERS` and
+`WC_FILL_INFO` declare and wire the buffer.
+
+- `wc_wheel_t {int32 dx, dy}`, reached through `wc_info_t.wheel_ptr`, gated
+  by the existing `WC_FLAG_POINTER`. A wheel is a DELTA, not a position, so
+  it is its own struct rather than an eleventh pointer slot -- it has no
+  coordinates, no press and no identity to track across frames.
+- **Units: 1/120 of a notch**, the `WHEEL_DELTA` convention. One click of a
+  detented wheel is 120; trackpads and free-spin wheels report the fraction
+  they actually moved, so precision scrolling is not rounded to a click.
+  `dy` is positive UP.
+- **Host accumulates, writes before `wc_render`, zeroes after.** The cart
+  only reads, and what it reads is that frame's delta -- frame-rate
+  independent, which matters because one trackpad flick is dozens of
+  events. Nothing for the cart to clear, and no way to miss an event by
+  reading late.
+- **Zero is the normal state on most hardware,** and that is the point: a
+  phone with no mouse never writes here, exactly as a desktop never fills
+  touch slots 1-9. The field always exists and hardware that cannot produce
+  it leaves it alone, so carts read it unconditionally instead of asking
+  whether a wheel exists.
+- Reference hosts (`CartHost`, `CartHostWeb`) gain `wheel(dx, dy)` for
+  embedders to feed from `wheel` / `SDL_MOUSEWHEEL` / Android
+  `ACTION_SCROLL`. Hosts must NOT synthesize it from touch: pinch is
+  derived by the CART from two pointer slots, which is also the settled
+  answer in SDL (SDL3 removed `SDL_MULTIGESTURE` for the same reason).
+- `docs/input.md` gains the pattern other carts kept re-deriving: the
+  three-binding coverage rule above, how to compute an anchored pinch from
+  two slots (including the shift-the-camera step everyone forgets, which is
+  why zooming a pinched corner looks wrong on the first try), and the
+  gesture-priority rule that a second contact CANCELS an irreversible
+  one-finger drag rather than completing it.
+
+## 0.19.0
+
+A cart's engine can now be built and run NATIVELY, off wasm, without
+forking it: `WC_NATIVE_HOST`.
+
+Some engines are C that happens to be compiled to wasm. Built with an
+ordinary toolchain and linked against a host in the same address space,
+such an engine needs no wasm runtime at all -- which matters where one is
+expensive to ship. The reference case: an Android game APK drops from
+about 64 MB to 6 MB, since the JS engine was nearly all of the difference,
+and runs at a locked 60 fps for roughly 40% less CPU.
+
+This is a build target, not an ABI change. The wasm output is
+byte-identical, the exports and struct layouts are unchanged, and a cart
+cannot tell the difference.
+
+- `wc_cart.h`: `wc_debug_mark` gains an extern branch for a native host
+  (the plain non-wasm branch is a no-op stub -- right for a cart built
+  without a host, silently wrong for a host that must supply it), and the
+  debug descriptor gains a native form holding real pointers.
+  `(uint32_t)(uintptr_t)&x` is neither lossless nor a compile-time
+  constant on a 64-bit target.
+- `SPEC.md` documents the target, the parts of the ABI a native host
+  cannot use (`wc_info_t`'s region pointers and the debug descriptor both
+  encode 32-bit offsets into linear memory), and what it costs: native
+  engine code carries the process's authority, so this is for first-party
+  carts you ship yourself, not for running untrusted ones.
+
+## 0.17.0
+
+Carts are seeded with entropy on every normal load; determinism stays opt-in.
+
+Both reference hosts called `wc_set_seed` only in deterministic-replay mode
+(`CartHostWeb` never called it at all), so a normal power-on ran the
+compile-time seed: every boot dealt the same shuffle, spawned the same waves,
+rolled the same dice. `CartHost` now rolls a fresh random u32 per normal load
+and `CartHostWeb` seeds from `crypto.getRandomValues` per page load.
+`load(cart, { deterministic: { seed } })` pins the seed and the virtual clock
+exactly as before, so replays, goldens, and regression loops are untouched. A
+new test loads the RNG-noise fixture three times normally and requires the
+frames to diverge; with the seeding reverted it fails.
+
+Carts need no change: export `wc_set_seed` (the `wc_cart.h` macro provides
+it) and draw randomness from `wc_rand()`. A cart that repeats itself
+identically on every power-on is running on a pre-0.17.0 host.
+
+New advisory manifest field `controls`: the subset of the standard pad the
+game actually reads (`["dpad","a","b","start"]` and the like). Presentation
+hint only, in the same doctrine class as `width`/`height` — a host drawing
+on-screen touch controls shows just what the game needs, every other host
+ignores it, and unknown tokens must be ignored. The full X360-style
+`wc_pad_t` is always delivered regardless. `wasmcart-pack --controls
+dpad,a,b,start` writes it (repeatable or comma-separated; unknown tokens
+warn but still pack, since hosts tolerate them by spec).
+
+Mixer fix in the vendored `wc_pcm_mixer.h`: the playback position was 16.16
+fixed-point in a u32 — 65536 source frames of headroom, 1.37 seconds at
+48kHz — so any longer sample silently wrapped to zero mid-play and started
+over, heard as music restarting rather than reported as an error. The
+position is now 48.16 in a u64; per-channel step stays 16.16. Vendored
+copies in the ports are resynced (`scripts/sync-headers.sh --write`).
+
+Both hosts seed at the same point now: BEFORE `_initialize` as well as
+`wc_init`. `CartHostWeb` used to run static constructors first, so a browser
+cart doing RNG work in a constructor got the compile-time seed while the same
+cart on Node did not — the two reference hosts disagreed on the contract.
+
+The player grew `--width`/`--height` (an explicit window size; the code that
+honored them existed but no flag ever set them), and the front door's `-h`
+now lists the full flag set. `wasmcart/web` exports `FLAG_DEBUG`,
+`FLAG_DETERMINISTIC`, and `HOST_FLAG_DETERMINISTIC`, matching the Node entry
+point.
+
+A documentation sweep against the shipped code, the biggest since the
+`wc_peer_*` merge:
+
+- SPEC: `wc_info_t` now lists `gpu_api` (byte offset 64, in the ABI since
+  v3 but missing from the normative struct); the manifest example uses
+  `net.domains`; entropy-by-default seeding is normative; the manifest
+  `debug` field is marked REMOVED (nothing ever read it — `WC_FLAG_DEBUG`
+  is the gate, per the doctrine that a manifest field never gates a
+  capability the cart declares about itself); the Security Model reflects
+  the peer model's per-direction gating.
+- docs/input.md: the button-bit table was wrong for bits 6-15 (it had
+  pasted W3C indices into the wasmcart bit column — a cart following it
+  tested the wrong masks); pointer and keyboard sections now document the
+  slot contract (0 = mouse, 1-9 = touch fingers), `wc_pointer_t`, the
+  event callbacks, and that `WC_FLAG_KEYBOARD` stops keyboard-to-gamepad
+  mapping.
+- docs/networking.md: gating is per direction — dial-out needs the flag
+  plus `net.domains`; host-registered peers need the flag alone (the file
+  previously contradicted itself on this); `net.lan`/`net.serial` are
+  marked prospective, since no host reads them.
+- docs/gl-surface.md and bind_framebuffer.md: claims that described
+  native-host behavior as universal (VAO-0 redirect, buffer orphaning,
+  GLSL version passthrough) are scoped honestly; CartHostWeb's redirect-FBO
+  path is documented as current (the "no redirect needed" browser section
+  predated it); CartHost self-provisions its GL context via webgl-node.
+- docs/fetch.md carries a PROPOSAL banner — `wc_fetch_*` was never
+  implemented and the doc read like it shipped.
+- docs/porting.md: shared headers live in `include/` (the documented
+  `porting/include/` never existed), the SDL2 backend is the wasmcart-sdl2
+  package, and the checklist gains the Wasm-EH/SjLj build requirements.
+- README: the `--pointer --keyboard` pack example (a warning no-op since
+  the double-gate removal) is replaced with the real story, the full pack
+  and play flag sets are listed, and the small-cart 2x window default is
+  documented.
+
+No ABI change: version 3, its imports, and the `.wasc` format are untouched.
+
+## 0.16.3
+
+WebAssembly exception handling is now an explicit part of the wasmcart
+execution baseline. Carts may use the standardized Wasm EH instructions without
+adding an import, permission, or manifest field.
+
+This includes wasi-sdk's Wasm-native `setjmp`/`longjmp` implementation. The
+README documents the wasi-sdk 33 build requirements:
+`-mllvm -wasm-enable-sjlj` during compilation and `-lsetjmp` at link time.
+
+A real cart built against wasi-sdk's `libsetjmp` now runs in both the Node.js
+and Chromium conformance suites. It performs a `longjmp(..., 42)` during
+`wc_init`, then exposes the result for an exact assertion. This verifies the
+engine feature end to end instead of inferring support from API presence.
+
+This is additive for carts and does not change ABI version 3, its imports, or
+the `.wasc` format. It does strengthen the host execution baseline: a runtime
+without standardized Wasm EH is not fully conforming.
+
+## 0.16.2
+
+`destroy()` no longer closes peer transports the host does not own.
+
+Both reference hosts closed every entry in `_peers`, including channels the
+embedder supplied via `addPeer()`. The host never owned those. Closing them
+breaks any embedder that outlives one cart instance, and for a real
+`RTCDataChannel` it is unrecoverable -- a closed channel forces the peer
+connection to renegotiate.
+
+The motivating case is swapping carts on a live session: two players stay on one
+channel and cycle through games. The ABI deliberately puts connection lifecycle
+in the host and gives the cart only an id and bytes, so that should be free.
+Instead every swap cost a full WebRTC renegotiation -- signalling round trip, new
+ICE, seconds of dead air. It also bit plainer cases, like an embedder keeping a
+lobby socket across cart loads.
+
+Peers now record ownership when created. A socket the host dialled via
+`wc_peer_open` is still closed on teardown; a channel from `addPeer()` is
+forgotten without closing, and its `onmessage`/`onclose` are detached so a dead
+host stops queueing events into an object nobody reads.
+
+This is the same line the GL context already drew (`_ownedGl` vs `_callerGl`)
+five lines above the bug. Peers simply never got the same treatment.
+
+Not a spec change: SPEC.md already says the host owns connection lifecycle and
+the cart sees only an id and bytes. No cart needs rebuilding.
+
+Reported with a working reproduction, which is how it was confirmed before any
+code changed. `wasmcart-native` was checked and does not share the bug -- its
+`destroy()` frees only its own bookkeeping and never calls a transport's close.
+
+## 0.16.1
+
+Fixes silent cart-memory corruption when the host delivers a payload to a cart
+with no allocator.
+
+For carts exporting no `malloc`/`free`, the host staged inbound payloads (peer
+messages, text input) in **the top 64KB of existing linear memory**, assuming
+nothing lived there. For a cart linked at the wasm-ld default of 128KB that is
+false -- its statics run straight through that window. Reproduced: 9472 bytes of
+a cart's array sat inside the region, and a 2000-byte message overwrote them.
+`0xAB` became `0x58`, the ASCII `X` we sent.
+
+There was no trap and no error. The corruption surfaced later as something
+unrelated -- in the report that found this, a nonsense `cart requested
+6647407x32` resize warning pointing nowhere near the cause. It only triggers
+once networking or text input is used, so it presents as "my cart broke when I
+added multiplayer".
+
+The host now grows a dedicated scratch page onto the END of linear memory, past
+everything the cart owns, so staging cannot alias cart data. If the cart pinned
+its memory maximum and growth is impossible, the host falls back to the tail of
+existing memory **only after proving** it sits above the cart's declared
+high-water mark (framebuffer, save region, input/time/pointer/keys structs, plus
+a margin). Failing that it drops the payload and says why: a dropped message is
+recoverable, corrupted cart memory is not.
+
+Reported by the agent who wrote the `wc_peer_*` merge, who hit it in their own
+fixture, fixed the fixture, and left the host alone on the grounds that it
+affects every cart. That was the right call -- the hazard is general and the
+existing suite could not have caught it, because every fixture was large enough
+to escape.
+
+`smallmem.wasc` is a fixture built to fail: 128KB memory, pinned maximum,
+statics crossing the 64KB line, and a guard array that shows the overwrite.
+Three tests cover it, including a control proving delivery still works where it
+is safe.
+
+## 0.16.0
+
+Merges the WebSocket and data-channel families into one peer-connection family.
+
+BREAKING at the package level, but **ABI version stays 3**. A cart is a
+connection to a peer: open it, send bytes, receive bytes, learn when it opens or
+closes. `wc_ws_send` and `wc_dc_send` were the same function under two names,
+and the split forced a cart to care how a connection was established -- a cart
+written against a relay server could not run over a serial cable without a
+rewrite. Transport (WebSocket, WebRTC, TCP, MQTT, serial) is the host's business
+and stays opaque.
+
+- `wc_ws_*` and `wc_dc_*` are replaced by `wc_peer_*`.
+- `FLAG_NET_WS` / `FLAG_NET_DC` become `FLAG_NET_PEER`. Bit `1 << 2` is reserved
+  and unused, with a test asserting nothing reclaims it.
+- `net.domains` replaces `net.websocket` in the manifest. The old key is still
+  read, so existing manifests keep working.
+- Text frames are gone. They are meaningless on a serial cable, so framing
+  belongs to the cart; a server's text frame now arrives as its UTF-8 bytes
+  rather than being dropped.
+
+The ABI version is deliberately NOT bumped to 4. Nothing outside this org
+consumes wasmcart yet, so the only carts affected are ones we control, and a
+version bump exists to protect third parties who do not yet exist. Checked
+before deciding: no sibling project actually calls the old imports -- the hits
+across wasmcart-lua, -mruby, -jsgame, -native and the examples are all stale
+vendored copies of `wasmcart.h`, not live usage.
+
+Two defects found while wiring it up, both fixed:
+
+- `peer_name` could truncate the NUL terminator on a short buffer, handing the
+  cart an unterminated string. It now truncates the text and always terminates.
+- The dual gate SPEC.md describes was not enforced anywhere. `_peerOpen` now
+  requires both the cart's `WC_FLAG_NET_PEER` and a manifest net grant, and a
+  `net.lan` grant no longer opens a `wss://` address.
+
+`peernet.c` is a real cart importing the family and exporting the four
+callbacks, so the ABI is exercised end to end rather than mocked. 102/102.
+
+## 0.15.1
+
+Clamps `delta_ms`, which is the general fix for a problem 0.14.0 only solved
+halfway.
+
+`delta_ms` is `now - lastFrameTime`, so any stall inflates it and a cart
+integrating velocity by dt moves a stall's worth of distance in one step. 0.14.0
+addressed this by rebasing the clock on lifecycle resume -- but that only covers
+stalls the host *knows* about. A GC pause, a slow disk read, a debugger
+breakpoint or a throttled background tab produces exactly the same spike with no
+event to hang a fix on. Measured: a 30-second stall with no suspend involved
+still delivered a 30000ms delta.
+
+Hosts now clamp at 250ms (4fps), the same cap Unity and Unreal apply. `time_ms`
+absorbs the discarded time so the two clocks stay consistent -- otherwise a cart
+summing deltas and a cart reading `time_ms` drift apart by the length of every
+stall. Deterministic fixed steps are not clamped, since a harness setting a step
+is stating the delta it wants.
+
+The lifecycle rebase stays and is now correctly described as a refinement rather
+than the protection: with the clamp alone a suspend costs one clamped frame of
+phantom time, with the rebase it costs none. SPEC.md's claim that the rebase was
+required has been corrected accordingly.
+
+## 0.15.0
+
+Adds text input: characters, not scancodes.
+
+```c
+void wc_on_text(const char* utf8, uint32_t len);  // cart export, optional
+void wc_text_input_begin(void);                   // host imports
+void wc_text_input_end(void);
+uint32_t wc_text_input_active(void);
+```
+
+The keyboard ABI reports HID scancodes -- physical key positions, which are not
+characters. `Shift+2` is `@` on a US layout and something else on many others,
+and `e-acute` has no scancode at all, so a cart deriving characters from
+scancodes is reimplementing keyboard layouts badly. The host now delivers text
+the platform already composed: layout, shift, dead keys, compose sequences and
+IME commits all applied. Verified end to end with 2-, 3- and 4-byte sequences
+round-tripping intact.
+
+The pointer is valid only during the call and is not null-terminated, so a cart
+must copy and must honour `len` -- one call can carry several codepoints because
+an IME commits a whole word at once.
+
+Text is off until the cart calls `wc_text_input_begin()`, which means a host can
+forward platform text unconditionally and a cart that never asks is immune. Text
+queued but undelivered is discarded on `end()`, so what the player typed into one
+field cannot reappear as a ghost keystroke in the next one.
+
+`bin/play-window.js` suppresses its own key bindings while text input is active
+-- typing `q` into a name field previously quit the player, and `w` would also
+walk the player forward. It also releases keys held at the transition, since
+`keyDown` suppression would otherwise leave them stuck down for as long as the
+field is open.
+
+Editing keys stay on the keyboard ABI: backspace, arrows and enter are presses
+rather than characters, so a cart drawing its own field reads those through
+`wc_kb_on_down` and appends what arrives via `wc_on_text`.
+
+Also adds `test/fixtures/gltri.wasc`, a GL orientation probe, and three tests on
+it. The existing GL fixture only calls `glClearColor`, so every pixel is
+identical and a vertical flip or bad viewport is invisible; gltri draws
+asymmetric geometry so the pixels say which way is up. One of the three pins the
+letterbox path, which resizes by calling `gl.viewport` on the cart's own context.
+
+## 0.14.0
+
+Adds lifecycle events, and fixes the clock spike that made suspension unsafe.
+
+Four new optional cart exports: `wc_on_suspend`, `wc_on_resume`,
+`wc_on_focus_lost`, `wc_on_focus_gained`. No flag, no manifest entry -- export
+any subset and the host skips the rest.
+
+**Suspension is host-owned.** While suspended the host does not call
+`wc_render()` at all, so a cart exporting none of these is still correct: it is
+simply not running. You handle lifecycle to be polite (pause audio, drop a
+netplay connection, flush state), never to be correct. `runFrame()` replays the
+last frame while suspended rather than throwing, so a host whose loop keeps
+ticking stays correct without knowing about lifecycle.
+
+**Suspend and focus are separate on purpose.** Minimize or hide suspends the
+cart; alt-tab only moves focus and the cart keeps rendering. Conflating them
+means a game either cannot auto-pause on alt-tab, or wrongly freezes when it
+should still draw.
+
+**The clock is now rebased across a suspend.** `delta_ms` is the time since the
+last *rendered* frame, so without this the first resumed frame reported the
+entire gap -- a ten-minute background stint arrived as a 600000ms delta and
+teleported anything integrating velocity by dt straight through the world.
+Measured before the fix: exactly 600000. `time_ms` stays continuous for the
+same reason; it measures time the cart has been running.
+
+Ordering is guaranteed and balanced: suspend emits focus_lost then suspend,
+resume emits resume then focus_gained, so a cart is never left permanently
+unfocused after a round trip. Transitions are idempotent, since hosts get
+duplicate visibility events routinely.
+
+`CartHostWeb` gains `autoWireLifecycle()`, driving the pairs from
+`visibilitychange` and window focus/blur, and adopting the current state on
+attach so a cart loaded into an already-hidden tab starts suspended rather than
+running one stray frame. `bin/play-window.js` wires the SDL window events, and
+persists the save on suspend -- a backgrounded app can be killed by the OS
+without ever reaching a graceful quit, so that is often the last chance to write
+one.
+
+## 0.13.2
+
+CI and README only. No runtime changes -- the published code is identical to
+0.13.1.
+
+**CI could not run the GL tests.** Four of them failed on every runner with "a
+WebGL2 context could not be created", which also blocked the tag-gated publish
+job. The workflow described this as a "pure-JS package, no native build" -- true
+once, but stale since GL became a hard requirement of the ABI. `webgl-node`
+delegates to `native-gles`, which dlopens `libEGL.so.1` and `libGLESv2.so.2` and
+needs a DRI driver behind them; a bare runner has none. Mesa's swrast/llvmpipe
+supplies all three in software, so CI now installs `libegl1`, `libgles2` and
+`libgl1-mesa-dri` before `npm ci`.
+
+Skipping the GL tests in CI would have been the wrong fix: they assert that GL
+is unconditional and never stubbed, which is exactly the guarantee worth
+keeping covered.
+
+A context check now runs before `npm test`, mirroring `CartHost`'s own
+`createWebGL2Context(w, h)?.gl` call so it cannot pass while the host fails. A
+driver-less runner produces one clear error instead of four confusing test
+failures.
+
+**README** now lists the language SDKs the org actually ships (Lua, Python,
+Ruby, JavaScript, GDScript, Rust, Zig, C/C++), split by whether you compile.
+
+## 0.13.1
+
+Documents loop inversion for the people who need it. No code changes.
+
+0.13.0 implemented `wc_frame_yield` in the web host but only specified it in
+SPEC.md, which left two gaps for cart authors:
+
+- **`include/wasmcart.h` did not declare it.** A cart using loop inversion had
+  to hand-write the `import_module`/`import_name` attributes, which is exactly
+  the boilerplate the header exists to remove. Now declared, with the
+  `wc_yield_buffer` contract and a worked example in the comment.
+- **`docs/porting.md` did not mention it.** That is the one document a porter
+  reads, and inverting the main loop is usually the hardest part of a port. It
+  now has a section covering the asyncify build flags, the yield-buffer export,
+  and the two traps: sizing the unwind stack for the real call depth, and
+  keeping `ASYNCIFY_IMPORTS` narrow so instrumentation stays cheap.
+
+Also adds loop inversion to the README's ABI v3 feature list, where it was the
+only v3 feature missing.
+
+## 0.13.0
+
+Fixes loop-inverted carts hanging the browser, and makes silent import stubbing
+audible.
+
+`CartHostWeb` had none of the asyncify machinery behind `wc_frame_yield` -- the
+protocol ported engines use when they own their main loop (`wc_render()` never
+returns; it yields once per iteration and the host unwinds the whole engine
+stack out of it, rewinding to the same point next frame).
+
+The failure was not a load error, which is what made it invisible. The web
+host's auto-stub backfilled the missing import as `() => -1`, so the cart linked
+cleanly and then the yield did nothing: the engine's infinite main loop never
+unwound, and the **first `runFrame()` never returned**, hanging the tab. Carts
+affected are exactly the ported engines that need loop inversion.
+
+`CartHostWeb` now implements the full protocol -- unwind state, `wc_yield_buffer`
+resolution after `wc_init`, and rewind/suspend around `wc_render` -- matching
+`CartHost` behaviour for behaviour. The two hosts are now at complete import
+parity. `cartWorker.js` and `cartWorkerWeb.js` also declare `wc_frame_yield` (a
+no-op there, since only the main thread can unwind out of `wc_render`) because a
+threaded cart instantiates the same module in a worker, where a missing import
+IS a hard LinkError.
+
+The auto-stub that hid this now warns when it fires. It stays -- it keeps carts
+built against a newer ABI loadable -- but a silently stubbed import is a real
+incompatibility that surfaces later as inexplicable runtime behaviour, so it
+should never again be silent.
+
+## 0.12.2
+
+Documents rumble in `docs/input.md`, the dedicated input reference, which had no
+rumble section -- so the one place a cart author looks for input details did not
+mention it. No code changes.
+
+## 0.12.1
+
+Two correctness fixes: saves that only survived a graceful exit, and a resize
+path that reported pixels it did not return.
+
+**Save durability.** Saves were persisted only from the windowed player's
+`quit()` (window close, Esc/Q), so Ctrl-C -- an ordinary way to stop a game --
+discarded the player's progress. The terminal player was worse: it neither
+loaded nor saved, so progress was invisible there in both directions and playing
+in the terminal silently threw it away. Both players now load an existing save on
+start and persist on `SIGINT`, `SIGTERM`, and `uncaughtException` as well as
+normal exit. Path handling moved to `src/save.js` so the two players cannot
+disagree about where a cart's `.sav` lives.
+
+The all-zero check that guards the first write also had a data-loss bug: it
+treated "never saved" and "player cleared their data" as the same state, so
+clearing your data and quitting silently resurrected the old save. It is now a
+first-write guard only -- once a `.sav` exists, an all-zero region overwrites it.
+
+**Resize validation.** A cart can change resolution by writing `width`/`height`
+into its `wc_info_t`, and the host adopted whatever it found. Those fields live
+in cart memory, so they are untrusted: a cart poking 4096x4096 was *reported* as
+4096x4096 while `subarray()` silently clamped the framebuffer to the end of
+memory, returning 17,169,312 of the 67,108,864 bytes implied. Nothing threw --
+the host simply described a frame whose pixels did not exist, and any consumer
+indexing by the reported width read ~50MB past the real data.
+
+The host now verifies that `fb_ptr + w*h*4` fits in the cart's memory and keeps
+the previous resolution otherwise, so the reported size and the returned bytes
+agree by construction. The check computes in floats because `w*h*4` can exceed
+2^32 (65536x65536 is 17GB, which wraps to 0 in 32-bit math and would make an
+absurd request look tiny). Legitimate resizes are unaffected. Rejection warns
+once, not per frame.
+
+SPEC.md gains a normative "Resolution changes" section and a durability
+requirement under host-managed saving.
+
+## 0.12.0
+
+Adds rumble, and documents the security boundary that was already there.
+
+**Rumble.** Three new host imports: `wc_pad_has_rumble(pad)`,
+`wc_pad_rumble(pad, low, high, duration_ms)` and `wc_pad_rumble_stop(pad)`.
+Rumble runs the opposite way to the rest of input -- the cart drives it -- so it
+is an import rather than a field in `wc_pad_t`, and needs no flag or manifest
+entry. `low`/`high` map onto SDL's strong/weak motors and the W3C `dual-rumble`
+effect's `strongMagnitude`/`weakMagnitude`, so one call behaves identically in a
+native window and a browser.
+
+Capability is per-device rather than per-platform, so `wc_pad_has_rumble` is a
+real query: an Xbox 360 pad reports rumble but not trigger rumble. Magnitudes
+outside `0..1` clamp (NaN to 0) and duration caps at `WC_RUMBLE_MAX_MS` (5s)
+rather than being rejected, since a cart deriving intensity from game state
+overshoots at the edges and a dropped rumble is harder to diagnose than a
+saturated one. The cap also means a cart cannot pin the motors forever: the host
+stops them on its own timer, so a cart that crashes mid-effect still leaves the
+controller quiet.
+
+Hosts always provide the imports. With no device wired (headless runs, `--frames`
+captures, tests) they are silent no-ops and `wc_pad_has_rumble` returns 0, so a
+cart that rumbles is never a cart that fails to load. `bin/play-window.js` routes
+pad 0 to the SDL controller; `CartHostWeb` defaults to `navigator.getGamepads()`
+and both accept a `setRumbleHandler()` override.
+
+**Security model.** The existing section now enumerates the import table as the
+complete attack surface, and is explicit that the toolchain shims whose names
+imply capabilities are inert: `path_open` and `fd_prestat_*` are not provided at
+all (so a cart has no way to *name* a host file), `fd_read`/`fd_seek` return 0,
+`environ_*` return 0, `__syscall_getcwd` returns -1, and `proc_exit` is a no-op.
+Threads are documented as confined to the same import table as the main thread.
+Also states plainly what a malicious cart still *can* do -- burn CPU, exhaust its
+declared memory -- since the ABI does not bound either and hosts must.
+
+No breaking changes. Carts built against 0.11.0 are unaffected.
+
+## 0.11.0
+
+The manifest is now optional, and it no longer gates anything the cart
+declares about itself.
+
+Two rules, both now normative in SPEC.md:
+
+**A cart with no `manifest.json` loads and runs.** `entry` falls back to
+`cart.wasm` and every other field takes its default. Previously all three
+loader paths threw `.wasc archive missing manifest.json`, which made the
+smallest possible valid cart -- a single wasm file in a zip -- unloadable for
+no reason the format required.
+
+**A manifest field never gates a capability the cart declares itself.**
+Pointer and keyboard delivery were gated on `WC_FLAG_POINTER`/`WC_FLAG_KEYBOARD`
+*and* on `manifest.pointer`/`manifest.keyboard` -- eight sites across the two
+hosts. Since the flags are the cart's own statement of what it handles, the
+manifest field could never usefully agree and could only disagree, and when it
+did the failure was silent: a cart that set the flag but shipped a manifest
+without the field just stopped receiving input, with nothing logged. The flags
+are now the only gate. The `pointer` and `keyboard` manifest fields are
+removed, and `wasmcart pack --pointer` / `--keyboard` are accepted no-ops that
+warn.
+
+`net` is deliberately not covered by the second rule. An allowlist is a
+permission the cart cannot grant itself, so it stays manifest-only and fails
+closed: no manifest, or no `net` entry, means no network access.
+
+BREAKING: a cart relying on `manifest.pointer` / `manifest.keyboard` to *enable*
+input must set the corresponding `WC_FLAG_*` in `wc_info_t` instead. A cart that
+already sets the flags is unaffected, and gains input it may have been silently
+losing.
+
+## 0.10.2
+
+Passes a manifest's `width`/`height` through as the host's preferred
+resolution when the caller has no opinion of its own.
+
+`_writeHostInfo` only ever wrote `options.preferredWidth`, so a runtime that
+sizes itself from `preferred_width` never saw a cart's own declaration. Godot
+does exactly that -- it picks its viewport from the host preference -- so
+every Godot cart rendered at its built-in default no matter what the manifest
+said: a 1920x1080 game came out 640x480. An explicit `preferredWidth` from the
+caller still wins, since that is the host legitimately asking.
+
+## 0.10.1
+
+Fixes GL carts that declare a resolution the host had to guess at, and adds
+`--fullscreen` / `-f`.
+
+A GL cart's window has to be created *during* `load()`, because the GL context
+is a wasm import and must exist before instantiation — which is before
+`wc_get_info` can say how big the cart is. The window therefore opened at a
+guess and was never corrected, so a cart declaring 1280x720 got a 640x480
+window and rendered into a corner of it. The window now adopts the cart's real
+resolution once `wc_get_info` has answered (skipped when the caller passed an
+explicit `--width`/`--height`, since that is the host legitimately asking).
+
+The offscreen context that `CartHost` provisions for itself had the same
+guess, and it must match the cart in *both* directions: too small clips the
+frame, and too large is equally wrong, because a cart's own renderer sizes its
+viewport from the drawable rather than from `wc_gl_blit`'s
+`glViewport(0, 0, w, h)`. Measured against wasmcart-lua: given a 1920x1080
+drawable, a cart declaring 1280x720 painted all the way out to x=1918, y=1078,
+so a cart-sized readback cropped the frame. It now takes the manifest's
+`width`/`height`, then the caller's preference, then 720p as a blind default.
+
+`--fullscreen` fills the display. It needs no special handling beyond that:
+the frame is letterboxed into whatever the drawable turns out to be, so the
+cart's aspect ratio holds on a screen of any shape.
+
+Docs: "Resolution Negotiation" said the cart picks its resolution *during*
+`wc_init()`. The host actually reads it from `wc_get_info()`, which it calls
+**before** `wc_init()` — that inversion is exactly what makes this a hard
+problem for carts whose script chooses the resolution at init time, so the
+section now says so and points at the manifest as the way out. The manifest's
+`width`/`height` fields, added in 0.10.0, are documented for the first time.
+
+## 0.10.0
+
+Resizable windows with aspect-preserving letterboxing, and a GL context sized
+from the cart rather than from a guess.
+
+The window still opens at the size the cart declares, which stays the cart's
+call. What is new is that it can be resized from there: the frame scales up to
+the largest rect that fits and the leftover area is filled with black bars, so
+a cart's aspect ratio survives any window shape. A cart declaring 480x600 stays
+portrait in a wide window instead of stretching into one. This applies to both
+paths — 2D carts scale on blit via SDL's `dstRect`, GL carts get a viewport
+fitted inside the drawable with the surround cleared.
+
+Two new flags opt out: `--no-resize` pins the window to the cart's size, and
+`--stretch` fills the window and lets the frame distort.
+
+Also fixes a real rendering bug for GL carts that declare a resolution larger
+than the old fixed default. The GL window was hardcoded to 1280x720 and the
+self-provisioned context to 640x480, but `wc_gl_blit`'s viewport is the
+*context*, not the frame — so a cart declaring 1600x900 rendered into a corner
+of a too-small context. Both now size from the manifest's `width`/`height`.
+`wasmcart-pack` gained `--width`/`--height` to record them, since `wc_get_info`
+runs too late to size a window that must already exist.
+
+New: `fitRect()` in `src/letterbox.js`, covered by `test/letterbox.test.js`.
+
+Also fixes `--shot` for carts that import `gl` without rendering through it.
+An SDK that links a GL backend into every cart makes `usesGL` true even for a
+cart that only writes the CPU framebuffer, and the player was reading back the
+untouched context and writing a black PNG over a perfectly good frame. The GL
+readback is now used only when it actually captured something.
+
+## 0.9.1
+
+Adds `getGlContext()` — the live WebGL2 context a cart is rendering through,
+or null for a 2D cart — and switches `bin/wasmcart-play.js` to it.
+
+0.9.0 left the player reading the private `_ownedGl`, which is set only when
+the host creates a context for itself. A caller that supplies its own
+`glBackend` left it null, so GL readback silently disabled and the frame came
+back black. The CLI never hits that today (it passes nothing), but it was a
+trap in shipped code for anyone embedding the same pattern, and readback needs
+the context regardless of who made it.
+
+Ownership is unchanged: `destroy()` still releases only a context the host
+created, never the caller's.
+
+## 0.9.0
+
+**`CartHost` now supplies its own GL context**, matching what `CartHostWeb`
+started doing in 0.8.0. Loading a GL cart with no `glBackend` used to throw on
+Node; it now creates an offscreen context through `webgl-node` — already a
+regular dependency — and runs.
+
+```js
+const cart = new CartHost();
+await cart.load('gl_game.wasc', {});   // 0.8.0: threw. 0.9.0: works.
+```
+
+This finishes what 0.8.0 started. SPEC says *"a host SHOULD satisfy this itself
+rather than requiring its embedder to"*, and the browser host does; Node did
+not, so the same call succeeded in a browser and failed under Node. The 0.8.0
+parity test pinned the two hosts to the same **error**; they are now pinned to
+the same **behaviour**, which is the property that actually matters.
+
+`glBackend` keeps its 0.8.0 meaning: an **override** — "render into THIS
+context instead of one you make" — for drawing into an on-screen canvas or an
+SDL window. It is not the host's only source of GL, and most callers should
+pass nothing.
+
+Scope worth being precise about: **the CLI was never affected.** `npx wasmcart`
+plays GL carts on 0.8.0 and earlier because `bin/wasmcart-play.js` wired up its
+own context. What was broken is the **library** API for anyone embedding
+`CartHost` directly. That player no longer special-cases GL, since the host
+handles it.
+
+A context the host creates is owned by the host and released with
+`WEBGL_lose_context` on `destroy()`; a caller-supplied one is left alone. If GL
+genuinely cannot be obtained — no driver, a headless box with no EGL, an
+install where the native addon did not build — that is still a load error
+naming that cause, not a silent stub.
+
+`allowMissingGL` remains gone and is simply ignored if passed: the host
+provides a real context either way.
+
+45 tests pass (44 existing + context-ownership coverage).
+
+
+## 0.8.0
+
+**Breaking:** `allowMissingGL` is gone, and the browser host now guarantees a
+GL context instead of silently stubbing.
+
+0.7.0 made "GL cart, no context" a load error but left two holes. First, it
+shipped an `allowMissingGL` opt-out — which was wrong in principle: GL is part
+of the host contract, not a capability a host advertises. A cart author writes
+against the guarantee that any conformant host can run a cart importing `gl`;
+a per-host opt-out turns that guarantee into something you discover at runtime,
+as a black screen. Most carts never import `gl` and never cause a context to be
+created — that is what the lazy `glBackend` factory is for — but a host that
+cannot produce one when asked is not a wasmcart host.
+
+Second, and worse, `CartHostWeb` never got 0.7.0's change at all: it still
+silently stubbed. Since `web.js` is the `browser` export, the breaking change
+0.7.0 announced did not actually apply to most consumers. The web host had no
+test coverage for this, which is how it drifted; there is now a parity test.
+
+Both hosts now guarantee a real context, but they satisfy that differently —
+Node needs one supplied (`native-gles`), while the browser makes its own. See
+Added below.
+
+### Added
+
+- **`CartHostWeb` supplies its own WebGL2 context.** WebGL2 has shipped in
+  browsers for over a decade, so the web host satisfies the "hosts MUST be able
+  to supply a GL context" rule itself instead of pushing the requirement onto
+  the page: a GL cart loaded with no `glBackend` now gets an offscreen (or
+  detached-canvas) context automatically. Passing `glBackend` still wins and is
+  how you render into your own on-screen canvas — it is an override, not the
+  host's only source of GL. A context the host created is released on
+  `destroy()`; a caller-supplied one is left alone. If WebGL2 genuinely cannot
+  be created, that is an error naming *that* cause rather than blaming the
+  caller for not passing a backend.
+
+```js
+await cart.load('gl_game.wasc', {});
+// Error: this cart imports the `gl` module but no glBackend was provided.
+// (same in Node and in the browser; no flag re-enables stubbing)
+```
+
+If you were passing `allowMissingGL: true`, supply a real context instead. On
+Node that is `native-gles` (a regular dependency, not optional); in a browser
+it is `canvas.getContext('webgl2')`.
+
+SPEC.md now states the requirement normatively. It previously said only that
+"a factory that produces no context is a load error", which left the
+no-`glBackend`-at-all case unspecified — the exact gap a downstream host fell
+into.
+
+## 0.7.0
+
+**Breaking:** a GL cart loaded with no GL context is now a load **error**
+rather than a silent stub.
+
+`SPEC.md` already required this ("a factory that produces no context for a GL
+cart is a load error, never a silent stub"), and the factory path enforced it,
+but passing no `glBackend` at all did the opposite: it stubbed the `gl`
+imports so every call became a no-op returning 0. For a hybrid cart that also
+fills a 2D framebuffer this is survivable, which is why it went unnoticed. For
+a cart that *renders* through GL, `load()` reported success and the player got
+a black screen with no error anywhere — indistinguishable from a broken cart.
+
+```js
+await cart.load('gl_game.wasc', {});
+// 0.6.0: loads, renders nothing
+// 0.7.0: Error: this cart imports the `gl` module but no glBackend was provided.
+```
+
+If you were relying on the stub — a hybrid cart whose 2D output is enough —
+opt in explicitly:
+
+```js
+await cart.load('hybrid.wasc', { allowMissingGL: true });
+```
+
+`usesGL` still reports true under `allowMissingGL`, because the cart's own
+`gpu_api` declaration is authoritative and that is what launchers key "needs a
+GL window" off.
+
+### Added
+
+- **`wasmcart-pack --source <dir>`** packs a dev directory that already has
+  its own `manifest.json`, keeping that manifest verbatim. The flag form
+  generates a manifest and so cannot express a cart whose manifest already
+  says something specific (a custom `assets` root, a field with no flag). The
+  wasm is resolved through the manifest's own `entry`, every other file is
+  packed at its original path — the `assets` prefix refers to those paths — and
+  only `entry` is rewritten to the archive's `cart.wasm`.
+
+- **The terminal player renders GL carts.** `--term` previously refused them
+  with "the terminal player only renders 2D framebuffer carts". Rendering on
+  the GPU and displaying as ANSI are orthogonal; the player was simply loading
+  without a `glBackend` and bailing. It now supplies an offscreen WebGL2
+  context and reads the frame back, so `--term`, `--shot` and `--frames` all
+  work for GL carts, including over SSH.
+
+### Fixed
+
+- **A manifest `assets` root without a trailing slash now resolves.** The
+  field is joined as a *directory* in dev mode but stripped as a *path prefix*
+  from a packed `.wasc`, so `"assets": "app"` turned `app/main.lua` into
+  `/main.lua` and every lookup missed. A cart authored from a dev directory
+  therefore booted fine and failed the moment it was packed, reporting a
+  missing asset that is plainly in the archive. Both hosts now normalize it.
+
+## 0.6.0 and earlier
+
+Not tracked here; see the commit history.

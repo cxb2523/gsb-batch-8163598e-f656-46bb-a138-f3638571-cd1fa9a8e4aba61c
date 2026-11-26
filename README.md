@@ -1,0 +1,1004 @@
+# wasmcart
+
+**A virtual cartridge format for safe, portable games.** A wasmcart cart is a
+standalone WebAssembly module - a self-contained game that owns its own memory and
+talks to the outside world only through a tiny, well-defined contract: the host
+writes input + timing, calls `wc_render()` each frame, and reads back pixels and
+audio. No filesystem, no syscalls, no ambient authority. Just pixels, sound, input,
+and opt-in networking.
+
+Because a cart is only WebAssembly + a fixed ABI, **the same cart runs anywhere a
+conforming host exists** - Node.js, the browser, a libretro core in [RetroArch](https://www.retroarch.com), a
+native player, a terminal - on any OS and any hardware with enough power. Write the
+game once; it runs on all of them, sandboxed.
+
+This repository is the **specification** and its **reference implementations**.
+
+- 📄 **[SPEC.md](SPEC.md)** - the normative host↔cart contract (current ABI: v4)
+- 🧩 **[`src/abi.js`](src/abi.js)** - the machine-readable contract (constants, layouts)
+- 🖥️ **[`include/wasmcart.h`](include/wasmcart.h)** - the C ABI header (structs, flags, GL + host imports)
+- 🧰 **[`include/wc_cart.h`](include/wc_cart.h)** - cart boilerplate macros on top of it
+- 📚 **[`docs/`](docs/)** - per-subsystem guides (input, networking, GL, framebuffer, fetch, porting)
+- 🧭 **[docs/positioning.md](docs/positioning.md)** - ship the artifact you debugged: `.wasc` primary, native backends optional, observability by construction
+
+## Reference implementations
+
+Two reference hosts ship in this package - they define, by example, what a
+conforming host does. Both are pure JavaScript (MIT).
+
+| Import | Class | Runs on |
+|--------|-------|---------|
+| `wasmcart`       | `CartHost`    | Node.js (native GLES3 via a supplied WebGL2 context) |
+| `wasmcart/web`   | `CartHostWeb` | Browsers (WebGL2 from a `<canvas>`) |
+
+```js
+import { CartHost } from 'wasmcart';        // Node
+import { CartHostWeb } from 'wasmcart/web';  // browser
+```
+
+**Browser note:** `wasmcart/web` imports `fflate` by bare specifier, which a
+browser cannot resolve on its own. Bundle it, or supply an import map:
+
+```html
+<script type="importmap">
+{ "imports": { "fflate": "/node_modules/fflate/esm/browser.js" } }
+</script>
+```
+
+Loading `wasmcart/web` as a raw module without one fails with
+`Failed to resolve module specifier "fflate"`. Note the **browser** ESM build
+(`esm/browser.js`) -- `fflate`'s Node entry point pulls in `node:zlib`.
+
+Other hosts in the wasmcart org (own repos) run the *same* carts: a libretro core
+([`wasmcart-libretro`](https://github.com/wasmcart/wasmcart-libretro)), a native
+player ([`wasmcart-native`](https://github.com/wasmcart/wasmcart-native)), and the
+terminal emulator ([`retroemu`](https://github.com/monteslu/retroemu)). See
+**[The wasmcart org](#the-wasmcart-org)** below.
+
+## Installation
+
+```bash
+npm install wasmcart
+```
+
+## Play a cart
+
+```bash
+npx wasmcart game.wasc              # SDL window + audio + gamepad (the default)
+npx wasmcart https://example.com/games/game.wasc # fetch a remote cart and play it
+npx wasmcart game.wasc              # GL carts too - auto-detected, OpenGL window via webgl-node
+npx wasmcart my-cart-dir/           # dev mode: manifest.json + cart.wasm + assets, straight off disk
+npx wasmcart game.wasc --term       # terminal player: ASCII on black (2D, GL and WebGPU carts)
+npx wasmcart game.wasc --term --symbols sextant --colors 256    # chafa glyph and colour choices
+npx wasmcart game.wasc --frames 300 --shot out.png --wav out.wav   # headless: step, dump, exit
+npx wasmcart game.wasc --seed 7 --frames 60 --shot a.png           # deterministic replay run
+npx wasmcart game.wasc --no-resize  # pin the window to the cart's declared size
+npx wasmcart game.wasc --stretch    # fill the window, distorting the aspect ratio
+npx wasmcart pack --wasm cart.wasm -o game.wasc                    # packing, same front door
+npx wasmcart test                   # the test cart: pads, touch, keyboard, sound and saves
+```
+
+HTTP and HTTPS carts are streamed to a temporary file so packed assets remain
+lazy-loaded instead of occupying memory for the whole session. Redirects are
+followed. Save data for a remote cart is keyed by its URL and stored under
+`$XDG_DATA_HOME/wasmcart/saves` (or `~/.local/share/wasmcart/saves`).
+
+### The test cart
+
+`npx wasmcart test` plays [`testcart/testcart.wasc`](testcart/), a cart for
+checking a host's input, sound and saves by eye. The wasmcart libretro core runs
+the same cart when RetroArch starts it with no content.
+
+- **Pads:** four controller drawings, every button lit while held (Guide, Misc,
+  the four paddles and the touchpad click too), sticks, triggers and raw values,
+  the pad's name, the device the host reports, and the host's names for the face
+  buttons. L3 and R3 run the rumble motors.
+- **Touch and mouse:** every pointer slot as a numbered circle with a trail, the
+  pointer event counts, and the scroll wheel totals. **Keyboard:** keys held,
+  modifiers and the last keys pressed.
+- **Sound:** A, B, X and Y each play their own note, in a waveform that names the
+  pad (P1 sine, P2 square, P3 triangle, P4 saw). Holding L plays every note on the
+  left channel only and R on the right only; the triggers bend the pitch.
+- **Saves:** each start reads the 32 KB save back and checks every byte: FRESH, OK
+  (with the start count and how far the last session's save got), TRUNCATED or
+  CORRUPT. Holding SELECT+START for 3 seconds clears it, and the next start must
+  say FRESH. Its save lives in `$XDG_DATA_HOME/wasmcart/saves/testcart.sav`.
+
+Everything it shows is also a debug field (`--frames` lists them), so a host's
+tests can drive it too. Rebuild it with `node testcart/build.mjs`.
+
+### Window sizing
+
+The window opens at the size the **cart** declares — that is the cart's call,
+not the player's — and is **resizable** from there. As you resize, the frame is
+scaled up to the largest rect that still fits and **letterboxed**: black bars
+fill whatever is left over, so a cart's aspect ratio survives any window shape.
+A cart that declares 480x600 stays portrait in a wide window instead of being
+stretched into one.
+
+| flag | effect |
+| --- | --- |
+| *(default)* | window opens at the cart's size (2× when the cart is 400px tall or less), resizable, letterboxed |
+| `--zoom n` | open at n× the cart's size (still resizable) |
+| `--width px --height px` | open the window at an explicit size instead |
+| `--window` / `--gl` | force the SDL window / force the GL window up front (both are auto-detected; `--gl` is for hybrid carts and debugging) |
+| `--fullscreen`, `-f` | fill the display; the frame is letterboxed into it |
+| `--no-resize` | pin the window to the cart's size; no bars, no scaling |
+| `--stretch` | scale to fill the window, distorting the aspect ratio |
+
+The **cart** decides its resolution: the host may ask for a size via
+`preferredWidth`/`preferredHeight`, but whatever `wc_get_info` reports wins,
+and wasmcart dictates neither a resolution nor an aspect ratio. Window size
+is a separate, host-side decision, and letterboxing is what reconciles the
+two — which is why fullscreen needs no special handling.
+
+Letterboxing applies to both rendering paths: 2D carts are scaled on blit, and
+GL carts get a viewport fitted inside the drawable with the surrounding area
+cleared to black.
+
+The windowed player runs on the org's own stack —
+[`@kmamal/sdl`](https://github.com/kmamal/node-sdl) (window, keyboard, audio
+queue, game controllers) and [`webgl-node`](https://github.com/monteslu/webgl-node)
+(WebGL2-over-native GLES for GL carts, auto-detected from the wasm imports) — with
+audio-paced frame stepping so sound never
+stutters. Keys: arrows/WASD d-pad, `x`/`z` = A/B, Enter = Start, Tab = Select,
+Esc/`q` quits; the first plugged-in controller maps automatically. No display?
+It falls back to the terminal player, and headless mode is scriptable: same
+seed → byte-identical PNG, so a shell loop is a regression test. Hosts that
+embed `CartHost` (harnesses like [romdevtools](https://www.npmjs.com/package/romdevtools))
+keep supplying their OWN backends via `load(..., { glBackend })` — these
+dependencies power the CLI, they are not required by the embedding API.
+
+### The terminal player
+
+`--term` plays a cart in the terminal, with no window or GPU display: 2D carts
+directly, GL and WebGPU carts by reading their frame back. Frames are turned
+into text by [chafa](https://hpjansson.org/chafa/) (through
+[`chafa-wasm`](https://www.npmjs.com/package/chafa-wasm),
+in a worker thread so the cart's 60 Hz logic never waits on it). The options
+have the same names and values as [retroemu](https://github.com/monteslu/retroemu)'s
+terminal player, so flags carry over between the two:
+
+| Option | Values | Default |
+|---|---|---|
+| `--symbols <set>` | `ascii`, `block`, `half`, `ascii+block`, `solid`, `stipple`, `quad`, `sextant`, `octant`, `braille`, `matrix`, `halfblock` | `ascii` |
+| `--colors <mode>` | `true` (24-bit), `256`, `16`, `2` | `true` |
+| `--fg-only` | foreground colour only, on a black background | on with the default symbols |
+| `--dither` | Floyd-Steinberg dithering | off |
+| `--contrast <n>` | contrast boost around mid-grey, `1.0` = unchanged | `1.0` |
+| `--term-fps <n>` | terminal refresh rate, 1 to 60 (`--fps` is the same option) | `30` |
+| `--frame-skip <n>` | draw every nth frame (60/n fps) | |
+| `--scale <cols>` | width in columns | fit the terminal |
+
+**The default is ASCII characters in foreground colour on a black background**
+(retroemu's `--symbols ascii --fg-only`). It reads as text art in any terminal
+and any font: it needs no block, sextant or braille glyphs, which many fonts
+draw badly or not at all, and the black background keeps the terminal's own
+colour theme out of the picture. Give `--symbols` and the background comes
+back unless you add `--fg-only`, as in retroemu.
+
+`--fg-only` keeps filled areas. chafa picks each glyph from a cell's two
+colours, which draws edges and text; a flat cell has no edge, and dropping its
+background would leave it black, so a solid shape came out as an empty
+outline. A flat cell is drawn from a density ramp (` .:-=+*#%@`) by its
+brightness instead (any other symbol set gets its full-cell glyph), an edge
+cell is inked in the brighter of its two colours, and ASCII ink is lifted
+toward full brightness, since a thin glyph in a dark colour vanishes on black.
+The darkest tones of the frame (just above its commonest dark level) stay
+black, so a game's backdrop reads as empty while the dim shapes of a dark
+scene still show.
+
+`--symbols halfblock` is wasmcart's own renderer, without chafa: one `▀` per
+cell, the nearest pixel of its top half as the foreground and of its bottom
+half as the background, in 24-bit colour. It is the fastest mode and the
+closest to the cart's pixels; `--colors`, `--fg-only` and `--dither` do not
+apply to it. `matrix` draws the frame in green katakana and digits.
+
+Keys: arrows/WASD d-pad, `x`/`z` = A/B, Enter = Start, Tab = Select,
+`[`/`]` = L/R, `q` or Ctrl-C quits. chafa is LGPL-3.0; it is a separate npm
+package loaded at run time, so it can be replaced like any dependency.
+
+Requires Node.js >= 22.
+
+## RNG seeding: entropy by default, determinism by request
+
+On every **normal** load, a spec-compliant host rolls a fresh random `u32`
+and calls the cart's `wc_set_seed` export (if present) before `wc_init` —
+so a cart that draws all its randomness from `wc_rand()` deals a different
+game every power-on, with **zero cart-side effort**.
+
+Determinism is the opt-in: `load(cart, { deterministic: { seed } })` (CLI:
+`--seed n`) pins that seed AND fixes the virtual clock, giving identical
+frame sequences for replays, goldens, and regression loops. Same seed +
+same input script = byte-identical run.
+
+| Layer | Responsibility |
+|---|---|
+| **Host** (`CartHost`) | random seed per normal load; pinned seed + fixed clock in deterministic mode |
+| **Cart/engine** | export `wc_set_seed(u32)` (the `wc_cart.h` macro provides it) and use `wc_rand()` as the only entropy source |
+| **Game code** | nothing — or mix in human input timing as belt-and-braces on pre-fix hosts |
+
+Both bundled hosts implement this: **`CartHost`** (Node) rolls a random
+u32 per normal load and pins it in `deterministic:{seed}` mode;
+**`CartHostWeb`** (browser, `wasmcart/web`) seeds from
+`crypto.getRandomValues` on every page load (it has no deterministic mode
+— replay tooling is Node-side).
+
+History: before wasmcart 0.17.0, `CartHost` called `wc_set_seed` only in
+deterministic mode and `CartHostWeb` never called it at all, so normal
+runs booted from the compile-time constant and dealt the same "random"
+sequence every load. If a game repeats itself identically on power-on,
+the host is running a pre-0.17.0 wasmcart.
+
+## Cart Formats
+
+| Format | Description |
+|--------|-------------|
+| `.wasm` | Standalone WASM file, assets embedded as C arrays |
+| `.wasc` | ZIP archive: `manifest.json` + `cart.wasm` + `assets/` (recommended for games with assets) |
+| cart directory | The same tree unzipped. Runs locally (`npx wasmcart <dir>`), and on the web straight from a static server: `await host.load('/games/mygame/')` |
+
+A cart directory on the web starts after only its wasm downloads: in a browser
+with JSPI (Chrome/Edge 137+, Firefox 153+, Safari 27+) each asset is fetched
+the first time the cart asks for it, and the cart waits on that fetch inside
+its ordinary `wc_load_asset` call, so ported engines need no change. Drive such
+a cart with `await host.runFrame(pads)`. A cart that enumerates its assets
+(`_filelist.txt`) needs the optional manifest `files` list there, since HTTP
+cannot list a directory: `npx wasmcart index <dir>` writes it.
+
+A large `.wasc` never has to sit in a page's memory. `CartHostWeb.load()` takes
+a `Blob` (a `File` from a file picker or a drop) and a `.wasc` URL is fetched as
+a Blob; above 128 MiB (`load(source, {streamAbove})`) only the archive's index,
+manifest and wasm are read before the cart starts, and each asset is read from
+the Blob when the cart asks for it (with JSPI, as for a cart directory: drive it
+with `await host.runFrame(pads)`). Cart threads read assets from the same Blob,
+passed to them as a handle, so a 1 GB threaded cart starts in a few tens of MB.
+
+A cart that streams a world can ask for the files it will need before it reads
+them: `wc_asset_prefetch(path, len, priority)` starts a background fetch into
+the host's memory and, called again, reports its state; once it answers
+`WC_PREFETCH_READY` the ordinary `wc_load_asset` is a copy and the frame never
+waits. Both hosts implement it and say so with `WC_HOST_FLAG_ASSET_PREFETCH` in
+the host-info flags, which a cart reads once in `wc_init` (an older host stubs
+the import). See SPEC.md, "Asset prefetch".
+
+## The ABI
+
+Every cart exports three functions:
+
+- **`wc_get_info()`** - returns a pointer to a struct describing the cart's memory layout (framebuffer, audio ring, input pads, save data, timing)
+- **`wc_init()`** - called once at startup
+- **`wc_render()`** - called every frame (~60fps)
+
+The cart declares all buffers as static globals. The host reads their locations from `wc_get_info()`, writes input/timing before each frame, and reads pixels/audio after `wc_render()` returns.
+
+See [SPEC.md](SPEC.md) for the normative struct layouts, [`src/abi.js`](src/abi.js)
+for the machine-readable constants, and [`include/wc_cart.h`](include/wc_cart.h) for
+the C-side boilerplate that fills the struct for you.
+
+### Rendering Mode
+
+Every cart declares its rendering mode via `wc_info_t.gpu_api`:
+
+| Value | Mode | Description |
+|-------|------|-------------|
+| 0 | **2D Framebuffer** | Cart writes ARGB8888 pixels to the framebuffer. Host reads and displays them. *(legacy - prefer gpu_api=1)* |
+| 1 | **WebGL2 / GLES3** | Cart renders via GL function imports. The GPU output is the primary display. **Recommended for all carts.** |
+| 2 | **WebGPU** | Cart renders through `webgpu.h` (Emscripten + Dawn's emdawnwebgpu port). Optional per host; see [docs/webgpu.md](docs/webgpu.md). |
+
+Any other value is refused at load.
+
+**Rendering mode is declared once** in `wc_get_info()` and does not change during the cart's lifetime.
+
+### Recommended: All Carts Use GPU (gpu_api = 1)
+
+**Every wasmcart host has OpenGL.** The recommended approach is for all carts to set `gpu_api = 1` and render all output through GL - even 2D pixel-buffer carts.
+
+For carts that render pixels to a CPU buffer (software renderers, SDL2 2D games), use the `wc_gl_blit()` helper to upload the pixel buffer as a GL texture and draw a fullscreen quad:
+
+```c
+#define WC_USE_GL
+#include "wasmcart.h"
+#include "wc_gl_blit.h"   // single-header GL blit library
+
+// In wc_get_info():
+info.gpu_api = 1;
+
+// In wc_render(), after drawing to your pixel buffer:
+wc_gl_blit(my_pixels, width, height);  // uploads as GL texture + draws quad
+```
+
+This eliminates the host-side complexity of detecting 2D vs GL carts and managing two display paths. One rendering path for all carts, all hosts.
+
+**Performance:** `glTexImage2D` is a DMA transfer - the GPU pulls pixel data without CPU waiting. At 1080p, this is significantly faster than the old CPU-side pixel copy + format conversion. 2D games that previously ran at 30fps at 1080p now run at 60fps with this approach.
+
+**SDL2 carts** using the `sdl2_wc` backend can enable GL blit automatically:
+```c
+info.gpu_api = 1;                    // in wc_get_info()
+SDL_WASMCART_SetGLBlit(1);           // in wc_init(), after SDL_Init
+// Link with: sdl2_wc/sdl2_gl_blit.c
+```
+
+SDL's software renderer draws pixels as usual. The `sdl2_wc` backend uploads them to GL on `SDL_RenderPresent`. No game code changes needed.
+
+### Legacy: 2D Framebuffer (gpu_api = 0)
+
+Still supported for simplicity. The cart writes ARGB8888 pixels to a framebuffer, the host reads and displays them. No GL imports needed.
+
+- Simplest possible cart - just write pixels to a buffer
+- Host handles format conversion and display
+- Performance limited by CPU pixel copy at high resolutions
+
+### GPU Carts (gpu_api = 1)
+
+- Render via GL function imports (`"gl"` WASM module)
+- The host displays GL output directly (swapBuffers)
+- If the host needs pixels (terminal rendering, screenshots), the **host** performs readback (`glReadPixels`) at whatever frequency it chooses
+- 2D and 3D content can coexist on the same GL context
+
+**Compositing** (e.g., 2D HUD over 3D scene) is the cart's responsibility within its chosen GPU API. There is no hybrid mode - a cart that uses GL for 3D and wants a 2D overlay renders both through GL.
+
+**Hosts reject carts they cannot run** with the reason: an unknown `gpu_api`, or a WebGPU-only cart on a host without WebGPU. A cart that imports both GL and WebGPU runs everywhere: the host tells it which one it got (SPEC.md, "WebGPU").
+
+### Resolution Negotiation
+
+The host and cart negotiate resolution through a two-step process:
+
+1. **Host → Cart**: Before calling `wc_init()`, the host writes its preferred resolution to `wc_host_info_t.preferred_width` and `preferred_height`. This is a *suggestion* - the host's display capability, not a requirement. A value of 0 means "no preference."
+
+2. **Cart → Host**: the cart reads the host's preference and decides its actual rendering resolution, writing it to `wc_info_t.width` / `wc_info_t.height`. It may use the preference directly, scale it, clamp it, or ignore it entirely.
+
+The host reads those dimensions from `wc_get_info()`, which it calls **before** `wc_init()` (it needs `save_size` to stage save data first). A cart whose resolution depends on work done in `wc_init` — an interpreted cart whose script calls something like `set_mode()`, say — must therefore report a sensible size from `wc_get_info` up front, or declare `width`/`height` in its manifest; a host cannot wait for `wc_init` to size a window or a GL context that has to exist before the cart is even instantiated.
+
+These dimensions define:
+- **2D carts**: the framebuffer size in pixels (ARGB8888, `width × height × 4` bytes)
+- **GL carts**: the viewport/render target dimensions for GL calls
+
+**Display scaling** is the host's responsibility:
+- The host creates its display surface at whatever size it wants (its own preferred resolution, fullscreen, user-resizable window, etc.)
+- The host scales the cart's output to fit the display, **preserving the cart's aspect ratio** with letterboxing/pillarboxing as needed
+- The cart never knows or cares about the actual display size
+
+**If no preferred resolution is specified** (both 0), the host should create its window at the cart's returned dimensions so pixels map 1:1. (The bundled player additionally opens small carts -- 400px tall or less -- at 2x so they are legible on modern displays; the frame itself is still rendered at the cart's resolution.)
+
+Example flow:
+```
+Host sets preferred: 1920×1080
+Cart reads preference, decides: 640×360 (16:9, manageable for this engine)
+Host creates window: 1920×1080
+Host scales 640×360 → 1920×1080 (exact 3x, no letterboxing needed)
+```
+
+```
+Host sets preferred: 0×0 (no preference)
+Cart uses its default: 320×240
+Host creates window: 320×240 (1:1 match)
+```
+
+```
+Host sets preferred: 1920×1080
+Cart ignores it, uses fixed: 960×540
+Host creates window: 1920×1080
+Host scales 960×540 → 1920×1080 (exact 2x)
+```
+
+This design means:
+- The same `.wasc` cart works on any display size - phone, desktop, 4K TV, RetroArch
+- The cart controls its rendering budget - a simple game can render at 320×240, a complex game at 1080p
+- The host controls the display - letterboxing, fullscreen, window resize all work without cart cooperation
+
+### Manifest (`.wasc` carts)
+
+The `manifest.json` inside a `.wasc` archive describes the cart:
+
+```json
+{
+  "name": "My Game",
+  "version": "1.0.0",
+  "abi": 4,
+  "entry": "cart.wasm",
+  "width": 640,
+  "height": 480,
+  "players": 2,
+  "net": {
+    "domains": ["api.mygame.com"],
+  }
+}
+```
+
+**The manifest as a whole is optional.** A `.wasc` with no `manifest.json` loads
+and runs: `entry` falls back to `cart.wasm` and every other field takes its
+default. A host must not refuse a cart for lacking one.
+
+Every field is optional, and none of them gate a capability the cart declares
+about itself. Pointer and keyboard input are governed *only* by `WC_FLAG_POINTER`
+and `WC_FLAG_KEYBOARD` in the cart's own `wc_info_t` — there are no `"pointer"` /
+`"keyboard"` manifest fields any more. A field that had to agree with the cart
+could only ever disagree with it, and the failure was silent: input simply
+stopped arriving. Gamepad input is always available regardless.
+
+A host ignores every field it does not know, so a cart carrying a field from a
+later revision of the SPEC runs on an older host as if the field were absent.
+
+`title`, `description`, `author` and `art` are for launchers: the game's name
+as people read it (`name` stays the short id), what the game is, who
+made it, and its pictures (an icon, box art, key art with no text, a
+transparent logo, the title screen, labelled screenshots), PNG or JPEG files
+the archive carries under `art/`. A launcher can show them without running the
+cart, and none of them changes how the cart runs. Shapes, sizes and how they map
+onto libretro's and ES-DE's art folders: [docs/art.md](docs/art.md).
+
+`net` is the exception, and deliberately so. It is not a restatement of a cart
+flag, it is a *permission* the cart cannot grant itself, so it fails closed: no
+manifest, or no `net` entry, means no network access.
+
+`width` / `height` declare the cart's resolution *ahead of time*. `wc_get_info()`
+remains authoritative — this does not override it — but a host has to size a
+window, and a GL context, **before** the cart is instantiated, and at that
+point nothing has run yet. Without a declaration the host guesses, and a
+wrong guess strands a GL cart's frame in a corner of an undersized drawable.
+Declare it whenever the cart's resolution is not the host's default, and
+always for a cart whose script picks the resolution at init time.
+`wasmcart pack --width W --height H` writes these fields.
+
+### Networking & Extended Input
+
+Opt-in features beyond the core framebuffer/audio/gamepad loop:
+
+- **Pointer input** (`WC_FLAG_POINTER`) - host writes `wc_pointer_t[10]` state (unified mouse + multitouch) and optionally calls `wc_ptr_on_down`, `wc_ptr_on_move`, `wc_ptr_on_up` exports
+- **Keyboard input** (`WC_FLAG_KEYBOARD`) - host writes `uint8_t[32]` key state bitmask (USB HID scancodes) and optionally calls `wc_kb_on_down`, `wc_kb_on_up` exports
+- **Rumble** (no flag needed) - cart calls `wc_pad_rumble(pad, low, high, ms)`; query support per device with `wc_pad_has_rumble(pad)`. Maps to SDL rumble natively and W3C `dual-rumble` in the browser
+- **Text input** (no flag needed) - optional `wc_on_text(utf8, len)` export plus `wc_text_input_begin` / `end` imports. The host delivers characters the OS already composed (layout, dead keys, IME), so a cart never implements a keyboard layout
+- **Lifecycle** (no flag needed) - optional `wc_on_suspend` / `wc_on_resume` / `wc_on_focus_lost` / `wc_on_focus_gained` exports. The host stops calling `wc_render` while suspended and rebases the clock on resume, so a cart that ignores them is still correct
+- **Loop inversion** (no flag needed) - for ported engines that own their main loop: call `wc_frame_yield()` from inside your existing `while` loop and the host suspends the whole engine stack out of `wc_render()`, resuming it next frame. Requires an asyncify build; see [docs/porting.md](docs/porting.md)
+- **Peer connections** (`"net": {"domains": [...]}`) - cart calls `wc_peer_open`/`send`/`close`; the host delivers events via `wc_peer_on_open`/`on_message`/`on_close`. Only connections the CART opens are allowlisted
+- **Host-supplied peers** (no manifest grant needed) - the host may hand the cart a peer it established itself (data channel, LAN socket, serial link). The cart sees it through the same `wc_peer_*` family and cannot tell which transport it is
+
+All of these exports are optional - the host silently skips events if the cart doesn't export the callbacks.
+
+Hosts refuse a cart whose `wc_info_t.version` is older than ABI v4: v4 moved every field of `wc_pad_t` after `buttons`, so an older cart cannot be read correctly. Rebuild it against the current `wasmcart.h`.
+
+## GPU ABI
+
+There is **one universal GPU ABI: WebGL2 (OpenGL ES 3.0)**. All hosts present the same ES 3.0 GL surface. This is the ceiling for GL - no host may expose ES 3.1+ or desktop GL features.
+
+Carts that need more (compute shaders, storage buffers, a modern engine renderer) can use the optional **WebGPU tier** instead, or as well: see [WebGPU carts](#webgpu-carts).
+
+A cart that doesn't use the GPU at all can write pixels directly to a shared-memory framebuffer (ARGB8888). This is not a second GPU ABI - it's just pixels in a buffer, no GL involved.
+
+### Rules for GPU carts
+
+1. **ES 3.0 core only.** Do not use ES 3.1+ features (compute shaders, SSBO, image load/store). The browser host is WebGL2 which is ES 3.0. Native hosts cap `GL_VERSION` to ES 3.0.
+
+2. **Declare all GL functions as WASM imports at compile time.** There is no `eglGetProcAddress` or runtime function discovery in WASM. If a function isn't in the cart's import table, it cannot be called.
+
+3. **Extensions are informational, not guaranteed.** Hosts pass through real driver extensions via `GL_EXTENSIONS` (some carts like Godot need them for format detection). But extension *function pointers* are only available if the cart declares them as WASM imports. Calling an undeclared extension function traps.
+
+4. **GPU engines with getProcAddress callbacks** (Skia Ganesh, ANGLE, etc.) must override `glGetString(GL_EXTENSIONS)` in their callback to return empty - preventing the engine from probing for extension function pointers that don't exist as WASM imports. The engine then falls back to its core-GL path, which is all the cart can import anyway. See [`docs/gl-surface.md`](docs/gl-surface.md) for what the GL surface guarantees, and the porting guide in [wasmcart-sdl2](https://github.com/wasmcart/wasmcart-sdl2) for the full pattern.
+
+5. **The host writes GL strings and mappings into your cart's own heap.** `glGetString`, `glGetStringi` and `glMapBufferRange` return memory the host gets from your cart's `wc_alloc`/`wc_free` exports (text and network payloads and WebGPU use them too). You don't need to do anything if you use `wasmcart.h`, the wgpu-wasi CMake helper, or the `wasmcart-alloc` Rust crate (`rust/wasmcart-alloc`): they export both. A cart that never reaches those paths needs neither. See SPEC.md, "Cart memory the host writes".
+
+6. **Same `.wasc` runs everywhere.** If a cart works in the browser, it must work on Node.js, native, and RetroArch hosts. Staying within ES 3.0 core guarantees this.
+
+## Features
+
+- **2D framebuffer** - ARGB8888 pixel buffer for software-rendered carts (no GL)
+- **WebGL2 GPU** - one GL ABI everywhere. Cart imports WebGL2 functions, host provides them (native GLES3 on Node.js, WebGL2 in browser). Emscripten's GL output works directly.
+- **WebGPU (optional tier)** - `webgpu.h` through Dawn's emdawnwebgpu port, built with Emscripten or with wasi-sdk (threads included, through [`wgpu-wasi/`](wgpu-wasi/README.md)); Node (webgpu-node), browser (Chrome / Chromium; Firefox on Linux only with `dom.webgpu.enabled`; Safari untested), wasmcart-native and, on Linux, wasmcart-libretro hosts. Other libretro builds and the Android host refuse WebGPU-only carts for now. A cart importing both GPU APIs runs everywhere.
+- **Stereo audio** - Float32 or Int16 ring buffer, cart-declared sample rate
+- **Gamepad input** - 4 pads with buttons, analog sticks, triggers (always available)
+- **Pointer input** - unified mouse + touch via shared memory state + event callbacks (opt-in)
+- **Keyboard input** - 256-bit key state bitmask (USB HID scancodes) + event callbacks (opt-in)
+- **WebSocket networking** - event-driven WebSocket API with domain allowlist (opt-in)
+- **Data channels** - peer-to-peer communication via host-managed connections (opt-in)
+- **Save data** - persistent save blob (host manages storage)
+- **Asset loading** - `.wasc` carts load files at runtime via `wc_asset_size()` / `wc_load_asset()`
+- **Asset prefetch** - a cart says which assets it will want (`wc_asset_prefetch`), the host fetches them in the background, and the read that follows is a copy: a streamed world on the web never stalls a frame on a download. Advertised by `WC_HOST_FLAG_ASSET_PREFETCH`; a cart that never calls it is unaffected. See SPEC.md, "Asset prefetch"
+- **WASI threads** - carts compiled with wasi-sdk `-pthread` can spawn background threads via pthreads
+- **WebAssembly exceptions** - standardized Wasm EH, including wasi-sdk's native `setjmp`/`longjmp`
+- **Runtime code generation** - a cart that compiles code as it runs (a Lua or JavaScript VM) links the wasm it generates with `wc_jit_link`; the host compiles it and installs it in the cart's own function table, with nothing beyond the cart's own exports. Every host provides it; `jit: false` / `WASMCART_JIT=0` turns it off, loudly. See SPEC.md, "Runtime code generation"
+- **Input actions** - Steam Input style: a cart declares named actions ("Jump", "Steer") in action sets, each with a default pad binding; the host owns the binding (remaps, devices) and tells the cart what each action is on (`wc_action_origin`: "Space", "Cross", "RT"), so prompts are right on every device. Optional for carts; every host provides the imports. Embedders feed labels with `setInputDescriber`, `setInputDevice`, `setActionBinding`, and read `getActions()` for remap/help UI. See SPEC.md, "Input actions"
+
+## Node.js API
+
+```js
+import { CartHost } from 'wasmcart';
+
+const cart = new CartHost();
+await cart.load('game.wasc');
+
+// Main loop
+const gamepads = [];  // array of { buttons, axes, ... }
+const frame = cart.runFrame(gamepads);
+
+// frame.framebuffer - Uint8Array of ARGB pixels (for 2D carts)
+// frame.audio - Int16Array of stereo PCM samples
+// frame.saveData - Uint8Array (if cart uses save)
+
+cart.destroy();
+```
+
+### Options
+
+```js
+await cart.load('game.wasc', {
+  glBackend: gl,                // OPTIONAL override: render into THIS context
+                                // (a WebGL2 context, or a factory returning one)
+                                // instead of the one the host makes itself
+  preferredWidth: 800,          // hint for resolution negotiation
+  preferredHeight: 600,
+  saveData: existingSaveBuffer,  // restore previous save
+  wasm: fetch('game.wasm'),     // CartHostWeb: the cart's wasm at its own URL (or a
+                                // fetch already started), compiled while it downloads
+                                // and kept compiled by the browser; the .wasc may then
+                                // leave its entry out
+  assetPrefetch: false,         // leave wc_asset_prefetch out, as a host built before
+                                // 0.35 did: a cart then sees the flag clear and reads
+                                // synchronously (for testing that fallback)
+});
+```
+
+In the browser a cart's wasm fetched from a URL (a `.wasm` URL, a cart
+directory, or the `wasm` option) is compiled with
+`WebAssembly.compileStreaming` while it downloads, and the browser keeps the
+compiled code for the next load. Serve it as `application/wasm`. A `.wasc`'s
+own entry is in the archive, so it is compiled from the bytes each load: a
+page that loads the same game often (an exported game) ships the wasm beside
+the `.wasc` and passes `wasm`.
+
+### WebGPU Carts
+
+A cart that imports WebGPU functions runs on WebGPU (SPEC.md, "WebGPU";
+[docs/webgpu.md](docs/webgpu.md) for building one, starting from
+[examples/webgpu-hello](examples/webgpu-hello/)). The host owns the device;
+the cart renders into its `"#canvas"` surface, which is a texture the host
+owns, and the host reads it back or draws it into a window:
+
+```js
+await cart.load('wgpu_game.wasc');          // Node: through webgpu-node
+cart.usesWgpu;                              // true
+cart.runFrame(pads);                        // synchronous, as for GL
+await new Promise((r) => setImmediate(r));  // then yield a task: see below
+const { width, height, data } = await cart.readGpuFrame();   // top-down RGBA
+
+// Present into your own window: a canvas context configured on the cart's device
+cart.presentWgpuTo(windowContext, { x: 0, y: 0, w: width, h: height });
+```
+
+**Yield an event-loop turn between frames** (a `setImmediate` or
+`setTimeout`, or the next animation frame; a bare `await` is not enough):
+that is when async results the cart asked for (buffer maps, error scopes)
+reach it. Textures and buffers the cart released are destroyed when its
+frame ends (`runFrame` returns), once nothing it still holds uses them.
+Options:
+
+```js
+await cart.load('game.wasc', {
+  wgpu: false,                    // refuse WebGPU: a WebGPU-only cart fails to
+                                  // load with the reason; a dual cart runs on GL
+  gpu: navigatorGpuLike,          // your own WebGPU implementation (Node)
+  gpuGlobals: webgpuGlobals,      // its classes: GPUValidationError, GPUOutOfMemoryError, ... (Node)
+  adapterOptions: { featureLevel: 'compatibility' }, // force a level; WASMCART_WGPU_FEATURE_LEVEL too.
+  // By default a host takes core WebGPU where the GPU has it, else compatibility
+  // mode. A cart must also run on compatibility mode: test it with this.
+  // adapterOptions: { powerPreference: 'low-power' } picks the GPU on a
+  // two-GPU machine; WASMCART_WGPU_POWER=low-power|high-performance sets the
+  // default for every load. cart.getGpuAdapterInfo() says which GPU it got.
+  wgpuCanvas: myCanvas,           // browser: render straight into a visible canvas
+  onGpuLost: ({ reason, message }) => showMessage('The GPU was reset; reload to continue'),
+});
+```
+
+If the host's GPU device is lost (a driver reset, the GPU removed), the cart
+cannot continue: the host stops calling its `wc_render`, sets
+`cart.gpuLost` to `{ reason, message }` and calls `onGpuLost` once.
+`runFrame()` keeps returning the last frame, so show the player a message
+rather than a black screen. `wasmcart-play` prints the reason and exits 4.
+
+`webgpu-node` is a dependency, as `webgl-node` is for GL, and is loaded only
+when a WebGPU cart arrives. Without a GPU adapter a WebGPU-only cart is
+refused at load with the reason, never run on stubs. In the browser, WebGPU
+is what the browser offers: Chrome and Chromium run WebGPU carts; Firefox on
+Linux does only with `dom.webgpu.enabled` set; Safari is untested (see the
+host table in [docs/webgpu.md](docs/webgpu.md#hosts)).
+
+### GL Carts
+
+GL carts import functions from the `"gl"` WASM module. The host provides a
+WebGL2-compatible context — either directly, or (since 0.6.0) as a **factory**
+that CartHost invokes exactly once, and only if the cart's wasm actually
+imports GL. The factory form means a launcher never needs to know what kind
+of cart it's loading (this is how `npx wasmcart` auto-detects GL carts; the
+detection ground truth is the wasm import section, never a manifest field):
+
+```js
+// Factory (recommended): runs only for GL carts, may be async
+await cart.load('game.wasc', {
+  glBackend: () => {
+    const canvas = document.createElement('canvas');   // browser
+    return canvas.getContext('webgl2');
+  },
+});
+
+// Node.js factory — offscreen context (headless harnesses) or a
+// window-bound one (see bin/play-window.js for the SDL wiring)
+await cart.load('game.wasc', {
+  glBackend: async () => (await import('webgl-node')).createWebGL2Context(1280, 720).gl,
+});
+
+// Plain context still works (created up front, GL cart or not)
+await cart.load('gl_game.wasm', { glBackend: glContext });
+```
+
+A GL cart never runs on stubs. If a context cannot be obtained, the load is a
+**load error** — never a silent success that renders black:
+
+```js
+// Either host: no glBackend needed, the host makes its own context.
+await cart.load('gl_game.wasc', {});
+
+// Where GL genuinely cannot be obtained (no driver, headless box with no
+// EGL, ancient browser, blocklisted driver):
+// Error: ... a WebGL2 context could not be created.
+```
+
+Stubbing looks harmless because a hybrid cart can still fill its 2D
+framebuffer, but for a cart that *renders* through GL every call becomes a
+no-op, `load()` reports success, and the player sees a black screen with no
+error anywhere.
+
+There is **no opt-out**. GL is part of the host contract, not a capability a
+host advertises: a cart author writes against the guarantee that if their cart
+imports `gl`, any conformant host can run it. Most carts never import `gl` and
+never create a context — the factory form below exists precisely so a 2D-only
+session pays nothing.
+
+**You do not have to pass anything on either host.** `CartHostWeb` creates its
+own WebGL2 context (offscreen where available); `CartHost` creates one through
+`webgl-node`, a regular dependency. `glBackend` is an **override** meaning
+"render into THIS context instead of one you make" — the common case being an
+on-screen canvas or an SDL window — not the host's only source of GL.
+
+## CLI Tools
+
+### wasmcart-pack
+
+Create `.wasc` archives from a `.wasm` file and an assets directory:
+
+```bash
+npx wasmcart-pack --wasm cart.wasm --assets assets/ -o game.wasc
+npx wasmcart-pack --wasm cart.wasm --assets assets/ -o game.wasc --name "My Game" --version 1.2.0
+
+# Manifest extras: multiplayer, a network grant, an on-screen-controls hint
+npx wasmcart-pack --wasm cart.wasm -o game.wasc --players 4 --ws api.mygame.com
+npx wasmcart-pack --wasm cart.wasm -o game.wasc --controls dpad,a,b,start
+npx wasmcart-pack --wasm cart.wasm -o game.wasc --controls none   # played by touch: no on-screen pad
+
+# The cart's pictures for launchers (icon, cover, screenshots...), and who made it
+npx wasmcart-pack --wasm cart.wasm --assets assets/ -o game.wasc --art art/ \
+  --title "Sunlit Isles" --description "Sail, trade and fight across a sunlit archipelago." --author "Me"
+# (pointer/keyboard need NO flag: the cart declares WC_FLAG_POINTER /
+#  WC_FLAG_KEYBOARD in its own wc_info_t, and that is the only gate)
+```
+
+Or pack a **dev directory** that already has its own `manifest.json` — the
+same layout `npx wasmcart <dir>` runs — keeping that manifest verbatim:
+
+```bash
+npx wasmcart-pack --source my-game/ -o game.wasc
+```
+
+The flag form above *generates* a manifest, so it cannot express a cart whose
+manifest already says something specific (a custom `assets` root, a field
+with no flag). `--source` resolves the wasm through the manifest's own
+`entry`, packs every other file at its original path, and rewrites only
+`entry` to the archive's `cart.wasm` and `version` to the cart's version
+(below).
+
+#### The version
+
+Every cart's manifest carries a `version`, and without `--version` the packer
+works it out from the git checkout the cart is packed from (the `--source`
+directory, else the wasm's directory, the assets directory, then the working
+directory), by the same rule as cartwheel's build:
+
+| The checkout | The cart's `version` |
+|---|---|
+| at a `v1.4.2` tag, no changes to tracked files | `1.4.2` |
+| at that tag with a tracked file changed | `1.4.2-dev.g1a2b3c4` |
+| any commit after the last tag | `1.4.2-dev.g1a2b3c4` (the commit) |
+| no tag yet | `0.0.0-dev.g1a2b3c4` |
+| not a git checkout | a `--source` manifest's own `version`, else `0.1.0` |
+
+So a build at a release tag is the release, and any other build says it is a
+dev build. Tags are `v` plus semver (`v1.4.2`, `v2.0.0-rc.1`); a tag of another
+shape is ignored, and "the last tag" is the nearest one behind the commit, not the highest
+(a fork keeps its upstream's tags, and its builds follow its own). `--version` wins over all of it, `--source` included (a
+`--source` manifest's `version` is only a placeholder while git can say
+better). Every version must be semver (`MAJOR.MINOR.PATCH`, optionally
+`-prerelease` and `+build`): the packer stops on `1.0` or `v1.0.0` rather
+than pack it. A project with its own version file (`package.json`,
+`Cargo.toml`) passes that with `--version`. An SDK that packs a game from a
+staging copy, with its own runtime as the wasm, passes
+`--version-from <game dir>` so the version is the game's, not the SDK's.
+
+A CI checkout must have the tags: a tag push checks the tag out, but a shallow
+clone of a branch has none, so its carts say `0.0.0-dev.g<commit>` unless the
+checkout fetches them (`fetch-depth: 0` in `actions/checkout`). A release job
+can check the result by reading `version` from the `.wasc`'s `manifest.json`.
+
+All flags: `--wasm`, `--assets`, `--source`, `--output`/`-o`, `--name`,
+`--version` (wins in both forms; default from git, above), `--version-from`,
+`--width`/`--height`, `--players`, `--controls` (comma-separated or
+repeatable; `none` writes `[]`), `--art <dir>`, `--title`, `--description`, `--author`, `--files`,
+`--ws`/`--websocket` (repeatable). Bare positional arguments are
+taken as the wasm path, then the output path. `--pointer`, `--keyboard`, and
+`--data-channel` are accepted, warning no-ops from the double-gate era.
+
+### wasmcart art
+
+Copy the art carts carry (`--art` above; SPEC: manifest `art`) to where a
+frontend looks for it, without running the carts:
+
+```bash
+# ES-DE: covers/ screenshots/ titlescreens/ marquees/ fanart/, one picture per cart
+npx wasmcart art carts/ --esde ~/ES-DE/downloaded_media/wasmcart
+# RetroArch thumbnails for a playlist: Named_Boxarts/ Named_Snaps/ Named_Titles/
+npx wasmcart art carts/ --libretro ~/.config/retroarch/thumbnails/wasmcart
+# every picture, to out/<cart>/ with an art.json: a folder --art packs back
+npx wasmcart art game.wasc --out out/
+```
+
+| key | ES-DE folder | libretro folder |
+|---|---|---|
+| `cover` | `covers` | `Named_Boxarts` |
+| first of `screenshots` | `screenshots` | `Named_Snaps` |
+| `title` | `titlescreens` | `Named_Titles` |
+| `logo` | `marquees` | |
+| `background` | `fanart` | |
+
+Each argument is a `.wasc`, a cart directory, or a directory of `.wasc` files,
+and each picture is named for the cart's file name without `.wasc`, the name
+both frontends match a game by (libretro's thumbnails also replace
+``& * / : ` < > ? \ |`` with `_`). A picture keeps its format: `.png` or
+`.jpg`. libretro thumbnails must be PNG, and a JPEG is not converted: it is
+named in the cart's line and skipped. A file already there is kept (for ES-DE,
+one of the same name in any picture format) unless `--force`. It prints one
+line per cart: what it wrote, what it kept, or `no art`, which is not an
+error; only a cart it cannot read fails the run.
+
+The game's name as people read it is the manifest's `title` (`--title` above),
+and each cart's line shows it: `racer ("Kart Racer"): esde: wrote 5`. ES-DE
+shows a game's name from its own `gamelist.xml`, which `wasmcart art` never
+writes, so set the names there yourself. A RetroArch playlist whose labels are
+the titles needs thumbnails named the same way: `--name-by title` names them
+for the cart's `title` (a cart without one keeps its file name).
+
+## Writing Carts
+
+The ABI is three exported functions and a struct, so the language question is
+really two questions: does your toolchain emit standalone WASM, and are you
+willing to compile at all?
+
+**If you would rather not compile**, the engine is already built and ships as
+WASM - a language runtime that happens to satisfy the ABI. Your game is source,
+packed into the cart as an asset:
+
+| | Repo |
+|---|---|
+| Lua | [wasmcart-lua](https://github.com/wasmcart/wasmcart-lua) - LÖVE-style API |
+| Python | [wasmcart-pygame](https://github.com/wasmcart/wasmcart-pygame) - CPython 3.13 + pygame-ce |
+| Ruby | [wasmcart-mruby](https://github.com/wasmcart/wasmcart-mruby) - DragonRuby-style API |
+| JavaScript | [wasmcart-jsgame](https://github.com/wasmcart/wasmcart-jsgame) - Canvas 2D, WebGL2, Web Audio |
+| GDScript | [wasmcart-godot](https://github.com/wasmcart/wasmcart-godot) - Godot 4 |
+
+**If you compile**, you pay nothing for it: no interpreter, no GC, and the
+smallest carts anyone can produce. A complete Zig cart that fills the screen is
+432 bytes with zero imports.
+
+| | Repo |
+|---|---|
+| Rust | [wasmcart-rust](https://github.com/wasmcart/wasmcart-rust) - `no_std` bindings, `wc_cart!` macro |
+| Zig | [wasmcart-zig](https://github.com/wasmcart/wasmcart-zig) - freestanding bindings, comptime `Cart(.{...})` |
+| C / C++ | this repo's [`include/`](include/), or [wasmcart-sdl2](https://github.com/wasmcart/wasmcart-sdl2) to port an existing SDL game |
+
+The rest of this section is the C path, which is also the reference for what any
+binding has to do.
+
+### Minimal 2D cart (C + [Emscripten](https://emscripten.org))
+
+```c
+#include "wasmcart.h"
+#include <string.h>
+
+#define WIDTH 320
+#define HEIGHT 240
+
+static uint32_t framebuffer[WIDTH * HEIGHT];
+static wc_info_t info;
+
+__attribute__((export_name("wc_get_info")))
+wc_info_t* wc_get_info(void) {
+    info.version = WC_ABI_VERSION;
+    info.width = WIDTH;
+    info.height = HEIGHT;
+    info.fb_ptr = (uint32_t)(uintptr_t)framebuffer;
+    return &info;
+}
+
+__attribute__((export_name("wc_init")))
+void wc_init(void) {}
+
+__attribute__((export_name("wc_render")))
+void wc_render(void) {
+    // Fill screen red
+    for (int i = 0; i < WIDTH * HEIGHT; i++)
+        framebuffer[i] = 0xFFFF0000;
+}
+```
+
+```bash
+emcc -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 --no-entry -O2 -o cart.wasm cart.c
+```
+
+### Shared cart-author libraries
+
+The [`include/`](include/) directory ships reusable C headers:
+
+| Header | Purpose |
+|--------|---------|
+| `wasmcart.h` | **The ABI header** - `wc_info_t`/`wc_pad_t` structs, flags, GL + host imports, and the `wc_alloc`/`wc_free` exports the host writes through. Include this first. |
+| `wc_cart.h` | Cart boilerplate - buffer declarations + `WC_FILL_INFO`, plus the opt-in `WC_DEBUG_FIELDS` |
+| `wc_fb.h` | 2D drawing (fill_rect, blit, alpha blend) |
+| `wc_gl.h` / `wc_gl_blit.h` | Shader compile/link, VAO/VBO helpers, CPU→GPU blit |
+| `wc_math.h` | sin, cos, sqrt, atan2 (no libm) |
+| `wc_mat4.h` / `wc_vec3.h` | 4x4 matrix + 3D vector ops |
+| `wc_pcm_mixer.h` | Multi-channel PCM mixer + WAV parser |
+
+For porting *existing* C/SDL games, [`docs/porting.md`](docs/porting.md) is the
+short version; the [**wasmcart-sdl2**](https://github.com/wasmcart/wasmcart-sdl2)
+repo has the SDL2 backend itself plus the full porting guide.
+
+### Threading ([wasi-sdk](https://github.com/WebAssembly/wasi-sdk))
+
+Carts can spawn background threads using standard pthreads. Requires wasi-sdk (not Emscripten):
+
+```bash
+${WASI_SDK}/bin/clang --target=wasm32-wasip1-threads -pthread \
+  -Wl,--import-memory,--shared-memory,--max-memory=67108864 \
+  -Wl,--no-entry -nostartfiles -O2 -o cart.wasm cart.c
+```
+
+The host detects a threaded cart from its wasm imports (shared memory) and wires
+up the worker pool itself - no manifest field, and no change to the three-export
+contract.
+
+A threaded cart can also be a WebGPU cart: see [`wgpu-wasi/`](wgpu-wasi/README.md).
+WebGPU, GL and the other `wc_*` imports are main-thread only, and on the web
+the main thread must poll its workers rather than block on them.
+
+### `setjmp` / `longjmp` ([wasi-sdk](https://github.com/WebAssembly/wasi-sdk))
+
+wasmcart hosts support standardized WebAssembly exception handling. With
+wasi-sdk 33, opt into its Wasm-native SjLj implementation at compile time and
+link `libsetjmp`:
+
+```bash
+${WASI_SDK}/bin/clang --target=wasm32-wasip1-threads -pthread \
+  -mllvm -wasm-enable-sjlj -O2 -Wl,--no-entry \
+  -o cart.wasm cart.c -lsetjmp
+```
+
+Use the same SjLj setting for every translation unit participating in the
+operation. No wasmcart manifest field or host import is required; this is a
+runtime-engine feature. The Node.js and browser test suites both execute a
+native SjLj fixture.
+
+## Examples
+
+Example carts range from minimal (`hello`) to full game ports. They live outside
+this repo - the game ports are upstream forks on a `wasmcart` branch, each
+shipping its `.wasc` as a Release artifact:
+
+| Example | Type | Description |
+|---------|------|-------------|
+| `hello` | 2D | Minimal ABI demo |
+| `hello_gl` | GL | Minimal GL triangle |
+| `hello_threads` | 2D + threads | WASI threads demo |
+| `snake`, `breakout`, `tetris` | 2D | Classic arcade games |
+| `doom` | 2D | DOOM (doomgeneric) |
+| `neverball`, `neverputt` | GL | GL1.x via [gl4es](https://github.com/ptitSeb/gl4es) |
+| `chromium_bsu` | GL | GL1.x shoot-em-up |
+| `etr` | GL | Extreme Tux Racer (SFML port) |
+| `openarena2` | GL | Quake III Arena (ioquake3) |
+| `flare`, `flare_es` | 2D | FLARE RPG (hand-port and SDL2 backend) |
+
+### Made with wasmcart
+
+Original games built as wasmcart carts (C99 on [three.c](https://github.com/monteslu/three.c), compiled with
+Emscripten) at [HeatSync Labs](https://heatsynclabs.org) in Mesa, Arizona, for the lab's Batocera game station
+(through [wasmcart-libretro](https://github.com/wasmcart/wasmcart-libretro)) and the browser. Each repo holds the
+source, and each page plays the cart in the browser.
+
+**KEYHOLDER** ([source](https://github.com/virgilvox/keyholder), [play in the browser](https://virgilvox.github.io/keyholder/), [`.wasc`](https://github.com/virgilvox/keyholder/releases/latest))<br>
+One day hosting at a hackerspace, 9 am to midnight: a PS2-style action visual novel with voiced cutscenes, a camera director, sword fights, three nights after the day and a nightmare attic.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/keyholder/main/docs/shots/02-arena-fight.jpg" width="49%" alt="KEYHOLDER screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/keyholder/main/docs/shots/03-attic-mannequins.jpg" width="49%" alt="KEYHOLDER screenshot"></p>
+
+**COFFEE & KILL** ([source](https://github.com/virgilvox/coffee-and-kill), [play in the browser](https://virgilvox.github.io/coffee-and-kill/), [`.wasc`](https://github.com/virgilvox/coffee-and-kill/releases/latest))<br>
+A two-player 3D brawler in a hackerspace workshop: thirteen fighters, weapons, EXTREME specials and a tourney mode.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/coffee-and-kill/main/docs/shots/01-workshop-brawl.jpg" width="49%" alt="COFFEE & KILL screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/coffee-and-kill/main/docs/shots/03-extreme-special.jpg" width="49%" alt="COFFEE & KILL screenshot"></p>
+
+**DROPSHOT** ([source](https://github.com/virgilvox/dropshot), [play in the browser](https://virgilvox.github.io/dropshot/), [`.wasc`](https://github.com/virgilvox/dropshot/releases/latest))<br>
+A flamingo who washes windows in orbit versus three derelict arcology ships: a third-person scope-and-glide shooter with in-engine cutscenes.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/dropshot/main/docs/shots/01-orbital-drop.jpg" width="49%" alt="DROPSHOT screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/dropshot/main/docs/shots/04-scope-weak-point.jpg" width="49%" alt="DROPSHOT screenshot"></p>
+
+**SMALL PARTS** ([source](https://github.com/virgilvox/small-parts), [play in the browser](https://virgilvox.github.io/small-parts/), [`.wasc`](https://github.com/virgilvox/small-parts/releases/latest))<br>
+Two makers shrunk to nine centimetres fight five hundred plastic army men across a real hackerspace: a PS1-style shooter.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/small-parts/main/docs/shots/01-jetpack-member-storage.jpg" width="49%" alt="SMALL PARTS screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/small-parts/main/docs/shots/02-rubber-band-firefight.jpg" width="49%" alt="SMALL PARTS screenshot"></p>
+
+**RED TAG RUMBLE** ([source](https://github.com/virgilvox/red-tag-rumble), [play in the browser](https://virgilvox.github.io/red-tag-rumble/))<br>
+Build a robot from abandoned projects in sixty seconds, then fight it in split screen for one to four players.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/red-tag-rumble/main/docs/shots/01-split-screen-hit.jpg" width="49%" alt="RED TAG RUMBLE screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/red-tag-rumble/main/docs/shots/03-garage-builder.jpg" width="49%" alt="RED TAG RUMBLE screenshot"></p>
+
+**DO-OCRACY** ([source](https://github.com/virgilvox/do-ocracy), [play in the browser](https://virgilvox.github.io/do-ocracy/))<br>
+An arcade game about one night of running a hackerspace: whoever does it, decides. Phones join as controllers by QR code.
+
+<p><img src="https://raw.githubusercontent.com/virgilvox/do-ocracy/main/docs/shots/01-open-house-night.jpg" width="49%" alt="DO-OCRACY screenshot"> <img src="https://raw.githubusercontent.com/virgilvox/do-ocracy/main/docs/shots/03-late-night.jpg" width="49%" alt="DO-OCRACY screenshot"></p>
+
+## Documentation
+
+- **[SPEC.md](SPEC.md)** - the normative specification
+- **[`docs/`](docs/)** - per-subsystem guides: [input](docs/input.md), [networking](docs/networking.md), [GL surface](docs/gl-surface.md), [framebuffer](docs/bind_framebuffer.md), [fetch](docs/fetch.md), [porting](docs/porting.md), [art](docs/art.md)
+- **[`include/`](include/)** - C headers for cart authors (`wc_cart.h` is the contract; `wc_fb.h`/`wc_gl.h`/math/mixer are a lightweight SDK)
+
+## Vendored headers
+
+Several SDKs and ports copy `include/*.h` rather than depending on the npm
+package -- reasonable, since a C toolchain should not need node -- but a copy
+rots every time the ABI moves. That has happened: thirteen copies of
+`wasmcart.h` had drifted into four different versions, one of them empty, still
+declaring the `wc_ws_*` / `wc_dc_*` families the `wc_peer_*` merge removed.
+
+```sh
+./scripts/sync-headers.sh          # report drift, change nothing
+./scripts/sync-headers.sh --write  # overwrite drifted copies from include/
+```
+
+It searches sibling directories, so run it from a tree with the other repos
+checked out, before releasing an ABI change. A copy carrying declarations the
+canonical header lacks is reported as a `FORK` and never overwritten.
+
+## The wasmcart org
+
+wasmcart is a small ecosystem. This repo is the spec + JS reference hosts; the rest
+are separate repos, all running the *same* carts. Full list:
+**[github.com/orgs/wasmcart/repositories](https://github.com/orgs/wasmcart/repositories)**
+
+| Repo | What it is |
+|------|------------|
+| [**wasmcart**](https://github.com/wasmcart/wasmcart) (this repo) | Spec, JS reference hosts (`CartHost`, `CartHostWeb`), the `wasmcart` CLI + packer |
+| [**wasmcart-sdl2**](https://github.com/wasmcart/wasmcart-sdl2) | SDL2 backend + `stb_*` helpers + the full porting guide - for porting existing C/SDL games |
+| [**wasmcart-mruby**](https://github.com/wasmcart/wasmcart-mruby) | write games in Ruby (mruby runtime, DragonRuby-style API) - prebuilt engine, games ship only Ruby |
+| [**wasmcart-lua**](https://github.com/wasmcart/wasmcart-lua) | write games in Lua (Lua 5.4, LÖVE-style API, batched GL2D renderer) - prebuilt engine, games ship only Lua |
+| [**wasmcart-pygame**](https://github.com/wasmcart/wasmcart-pygame) | write games in Python (CPython 3.13 + pygame-ce) - one reusable runtime, games ship only Python and assets |
+| [**wasmcart-jsgame**](https://github.com/wasmcart/wasmcart-jsgame) | write games in JavaScript - sandboxed QuickJS runtime with Canvas 2D, WebGL2 and Web Audio |
+| [**wasmcart-godot**](https://github.com/wasmcart/wasmcart-godot) | write games in GDScript - Godot 4 compiled to standalone WebAssembly |
+| [**wasmcart-rust**](https://github.com/wasmcart/wasmcart-rust) | write games in Rust - `no_std` bindings + a `wc_cart!` macro, no runtime and no allocator |
+| [**wasmcart-zig**](https://github.com/wasmcart/wasmcart-zig) | write games in Zig - freestanding bindings + a comptime `Cart(.{...})` helper |
+| [**wasmcart-libretro**](https://github.com/wasmcart/wasmcart-libretro) | libretro core - run carts in RetroArch / RetroDECK |
+| [**wasmcart-native**](https://github.com/wasmcart/wasmcart-native) | native host built on libnode - a standalone player with no Node install |
+| [**build-libnode**](https://github.com/wasmcart/build-libnode) | precompiled libnode for V8-WASM use, the substrate the native host builds on |
+| [**retroemu**](https://github.com/monteslu/retroemu) | terminal + SDL host (libretro cores *and* wasmcart carts) |
+| game port forks | each an upstream game fork on a `wasmcart` branch (`.wasc` shipped as Release artifacts) |
+
+## License
+
+MIT - see [LICENSE](LICENSE). Compatible with all dependencies
+([fflate](https://github.com/101arrowz/fflate),
+[yauzl](https://github.com/thejoshwolfe/yauzl),
+[yazl](https://github.com/thejoshwolfe/yazl) - all MIT).

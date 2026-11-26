@@ -1,0 +1,157 @@
+#!/usr/bin/env node
+// Regenerates src/wgpu/emdawnwebgpu-glue.mjs: the host half of the `wgpu`
+// capability (see SPEC.md, "WebGPU").
+//
+// A WebGPU cart is built with Emscripten and Dawn's emdawnwebgpu port. The
+// port compiles a C++ library into the cart and expects the rest, the
+// functions it imports, to come from JavaScript. That JavaScript is what this
+// script produces, from the SAME emdawnwebgpu release carts are told to build
+// against. The pair is the contract; a cart built against another release can
+// disagree with this glue about struct layouts.
+//
+// How: link a C file that takes the address of every function in webgpu.h,
+// so every JS function the port has is pulled in, then keep Emscripten's
+// generated JS and drop its wasm. Five edits make it hostable and fast:
+//   - `navigator` and `document` become per-instance values the host passes
+//     in, so two carts in one process can hold different devices and canvases;
+//   - the WebGPU object table and the memory-view refresh are exported;
+//   - every allocation in cart memory (malloc, memalign, Emscripten's stack
+//     helpers) goes through the cart's wc_alloc/wc_free instead
+//     (wgpu/glue-alloc.mjs; SPEC.md "Cart memory the host writes");
+//   - the object table reports every object made, looked up and released,
+//     so the host can destroy released textures and buffers nothing uses
+//     (wgpu/glue-release.mjs; docs/webgpu.md "GPU memory").
+//   - setBindGroup gets its dynamic offsets as a reused array rather than a
+//     HEAPU32 range (wgpu/glue-offsets.mjs).
+//
+// Needs emcc at the version pinned in wgpu/emdawnwebgpu.json (`glueEmcc`):
+// the transforms match that release's generated code, and another emcc
+// arranges its exports differently. Not run by npm install or tests:
+// the output is committed, and is the frozen snapshot.
+//
+//   node scripts/build-wgpu-glue.mjs [path/to/emdawnwebgpu_pkg]
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { routeGlueAllocation, ALLOCATOR_EXPORTS } from './wgpu/glue-alloc.mjs'
+import { hookGlueObjects } from './wgpu/glue-release.mjs'
+import { arrayDynamicOffsets } from './wgpu/glue-offsets.mjs'
+import { gateClosedCallbacks } from './wgpu/glue-closed.mjs'
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const pin = JSON.parse(fs.readFileSync(path.join(root, 'scripts/wgpu/emdawnwebgpu.json'), 'utf8'))
+const out = path.join(root, 'src/wgpu')
+
+function emcc() {
+  if (process.env.EMCC) return process.env.EMCC
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    const file = path.join(dir, 'emcc')
+    if (fs.existsSync(file)) return file
+  }
+  throw new Error('emcc not found: put emsdk on PATH or set EMCC')
+}
+
+function checkEmcc(file) {
+  const v = execFileSync(file, ['--version'], { encoding: 'utf8' }).split('\n')[0]
+  if (!v.includes(` ${pin.glueEmcc} `)) {
+    throw new Error(`the glue is generated with emcc ${pin.glueEmcc} (scripts/wgpu/emdawnwebgpu.json glueEmcc), found: ${v}`)
+  }
+  return file
+}
+
+// The package: a path given on the command line, or the pinned release
+// downloaded and checked against its recorded SHA-256.
+function packageDir(work) {
+  if (process.argv[2]) return path.resolve(process.argv[2])
+  const zip = path.join(work, `emdawnwebgpu_pkg-${pin.release}.zip`)
+  execFileSync('curl', ['-fsSL', '-o', zip, `https://github.com/google/dawn/releases/download/${pin.release}/emdawnwebgpu_pkg-${pin.release}.zip`], { stdio: 'inherit' })
+  const sum = crypto.createHash('sha256').update(fs.readFileSync(zip)).digest('hex')
+  if (sum !== pin.sha256) throw new Error(`emdawnwebgpu package checksum ${sum} does not match the pinned ${pin.sha256}`)
+  execFileSync('unzip', ['-q', zip, '-d', work])
+  return path.join(work, 'emdawnwebgpu_pkg')
+}
+
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'wgpu-glue-'))
+try {
+  const pkg = packageDir(work)
+  const version = fs.readFileSync(path.join(pkg, 'VERSION.txt'), 'utf8')
+  if (!version.includes(pin.release)) throw new Error(`package is not ${pin.release}: ${version.trim()}`)
+
+  const header = fs.readFileSync(path.join(pkg, 'webgpu/include/webgpu/webgpu.h'), 'utf8')
+  const names = [...new Set([...header.matchAll(/WGPU_EXPORT [^;]*?\b((?:wgpu[A-Za-z0-9]+)|emscripten_webgpu_[a-z_]+)\(/g)].map(m => m[1]))].sort()
+  fs.writeFileSync(path.join(work, 'all.c'), [
+    '#include <webgpu/webgpu.h>',
+    '#include <emscripten.h>',
+    'void* volatile wc_all[] = {',
+    ...names.map(n => `  (void*)&${n},`),
+    '};',
+    'EMSCRIPTEN_KEEPALIVE int wc_keep(int i) { return wc_all[i] != 0; }',
+    '',
+  ].join('\n'))
+  fs.writeFileSync(path.join(work, 'post.js'), "Module['WebGPU'] = WebGPU;\nModule['wcUpdateMemoryViews'] = updateMemoryViews;\n")
+
+  execFileSync(checkEmcc(emcc()), [
+    path.join(work, 'all.c'), '-O1', `--use-port=${path.join(pkg, 'emdawnwebgpu.port.py')}`,
+    '--no-entry', '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=web,node',
+    '-sALLOW_MEMORY_GROWTH=1', '-sASSERTIONS=0', "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$WebGPU",
+    '--post-js', path.join(work, 'post.js'), '-o', path.join(work, 'glue.mjs'),
+  ], { stdio: 'inherit' })
+
+  let js = fs.readFileSync(path.join(work, 'glue.mjs'), 'utf8')
+  // A threaded cart's memory is a SharedArrayBuffer, and browsers refuse to
+  // TextDecoder.decode a view of one; decode from a copy then, as Emscripten's
+  // own threaded builds do. (Node accepts either, so only a browser shows it.)
+  const decode = 'return UTF8Decoder.decode(heapOrArray.subarray(idx, endPtr));'
+  if (js.split(decode).length !== 2) throw new Error('generated glue changed shape: cannot find its UTF8 decode')
+  js = js.replace(decode, 'return UTF8Decoder.decode(heapOrArray.buffer instanceof ArrayBuffer ? heapOrArray.subarray(idx, endPtr) : heapOrArray.slice(idx, endPtr));')
+  // Emscripten names the post-js file by its path; keep the output byte-stable.
+  js = js.split(work).join('<build>')
+  const anchor = 'var Module = moduleArg;\n'
+  if (js.split(anchor).length !== 2) throw new Error('generated glue changed shape: cannot find the Module assignment')
+  // The WebGPU classes the glue names as bare globals (instanceof checks,
+  // feature probes on a prototype). A browser has them on window; Node does
+  // not, so the host passes them in (webgpu-node's `globals`).
+  const classes = [...new Set([...js.matchAll(/(?:instanceof\s+(GPU[A-Za-z]+)|\b(GPU[A-Za-z]+)\.prototype\b)/g)].map(m => m[1] || m[2]))].sort()
+  js = js.replace(anchor, anchor + "// wasmcart: the host supplies these per cart (see scripts/build-wgpu-glue.mjs).\nvar navigator = Module['wcNavigator'];\nvar document = Module['wcDocument'];\n"
+    + classes.map(c => `var ${c} = Module['wcGlobals']['${c}'];\n`).join(''))
+
+  // Allocation in the cart goes through wc_alloc/wc_free, not the cart's
+  // malloc or stack.
+  js = routeGlueAllocation(js)
+  // Released textures and buffers are destroyed once nothing uses them.
+  js = hookGlueObjects(js)
+  // setBindGroup's dynamic offsets as a reused array (Dawn's Node binding
+  // takes the typed-array overload only after failing the array one).
+  js = arrayDynamicOffsets(js)
+  // No async callback reaches the cart after the host's destroy().
+  js = gateClosedCallbacks(js)
+
+  // The functions a cart may import from this glue, read from the glue's own
+  // import list so the host can name anything a cart wants that it lacks.
+  const wasm = new WebAssembly.Module(fs.readFileSync(path.join(work, 'glue.wasm')))
+  const provided = WebAssembly.Module.imports(wasm).map(i => i.name)
+    .filter(n => /^(wgpu|emwgpu|emscripten_webgpu_)/.test(n) || n === 'emscripten_has_asyncify').sort()
+
+  // What the glue calls back INTO the cart. An Emscripten link exports these
+  // by itself; a wasi-sdk cart must export them (wgpu-wasi/exports.txt, one
+  // name per line, for -Wl,--export=).
+  const cartExports = [...new Set([...js.matchAll(/wasmExports\['([A-Za-z_0-9]+)'\]/g)].map(m => m[1]))]
+    .filter(n => !['__wasm_call_ctors', 'wc_keep', 'memory', '__indirect_function_table'].includes(n))
+    .concat(ALLOCATOR_EXPORTS).sort()
+  fs.writeFileSync(path.join(root, 'wgpu-wasi/exports.txt'), cartExports.join('\n') + '\n')
+  // And every function the kit lets a cart import (the glue's, plus the one
+  // emscripten.h stand-in), so a cart linked with --allow-undefined can audit
+  // its imports: anything not in env's list here is a symbol that went missing.
+  fs.writeFileSync(path.join(root, 'wgpu-wasi/imports.txt'), provided.join('\n') + '\n')
+
+  fs.mkdirSync(out, { recursive: true })
+  const banner = `// GENERATED by scripts/build-wgpu-glue.mjs from Dawn emdawnwebgpu ${pin.release}.\n// Do not edit; regenerate. Emscripten's output, MIT licensed (see the Emscripten\n// and Dawn notices in emdawnwebgpu's LICENSE files).\n`
+  fs.writeFileSync(path.join(out, 'emdawnwebgpu-glue.mjs'), banner + js)
+  fs.writeFileSync(path.join(out, 'emdawnwebgpu-glue-manifest.js'), banner + `export default ${JSON.stringify({ release: pin.release, imports: provided, globals: classes, cartExports }, null, 2)};\n`)
+  console.log(`wrote src/wgpu/emdawnwebgpu-glue.mjs (${js.length} bytes) and a manifest of ${provided.length} import names`)
+} finally {
+  fs.rmSync(work, { recursive: true, force: true })
+}

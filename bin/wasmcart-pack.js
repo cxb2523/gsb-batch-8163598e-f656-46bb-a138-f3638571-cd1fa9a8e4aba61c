@@ -1,0 +1,548 @@
+#!/usr/bin/env node
+
+/**
+ * wasmcart-pack - Package a .wasm cart + assets into a .wasc archive
+ *
+ * Usage:
+ *   wasmcart-pack --wasm build/cart.wasm --assets assets/ --output game.wasc
+ *   wasmcart-pack --wasm build/cart.wasm --output game.wasc  (no assets)
+ *   wasmcart-pack --wasm build/cart.wasm --assets assets/ --name "My Game" --version "1.0.0" --output game.wasc
+ *
+ *   wasmcart-pack --source my-game/ --output game.wasc
+ *     Pack a DEV DIRECTORY that already has its own manifest.json, keeping
+ *     that manifest verbatim -- including `entry` and `assets`. This is the
+ *     layout `npx wasmcart <dir>` runs, so the same tree packs to a .wasc
+ *     without hand-translating it into flags. The flag form above generates a
+ *     manifest instead, which cannot express a cart whose manifest already
+ *     says something specific.
+ *
+ *   --art <dir>  add the cart's pictures for launchers (SPEC: manifest 'art'):
+ *     icon, cover, background, logo, title and screenshots, by file name or by
+ *     the dir's art.json. They go in the archive under art/, outside the assets.
+ *
+ *   --version <semver>  the cart's version. Without it the version comes from
+ *     the git checkout holding the source (the --source dir, else the wasm's
+ *     dir, the assets dir, then the working directory): the tag at a clean
+ *     v<semver> tag, else <last tag>-dev.g<commit> (0.0.0-dev.g<commit> before
+ *     the first tag); outside git, a --source manifest's own version, else
+ *     0.1.0. A version that is not semver stops the pack. Same rule as
+ *     cartwheel's cw_add_app.
+ *
+ *   --version-from <dir>  read the git version from this directory's checkout
+ *     instead (an SDK that packs a game's files from a staging copy points it
+ *     at the game).
+ *
+ *   --files  also record the asset list in the manifest (optional `files`), so
+ *     the archive can be unzipped and served as a cart DIRECTORY on the web,
+ *     where _filelist.txt has no other source. A .wasc itself never needs it.
+ */
+
+import { createWriteStream, readFileSync, statSync, readdirSync } from 'fs';
+import { resolve, relative, join, basename, extname, dirname } from 'path';
+import { readArtDir, describeArtProblems } from '../src/cartArt.js';
+import { resolveCartVersion } from '../src/cartVersion.js';
+import { ZipFile } from 'yazl';
+import { ABI_VERSION } from '../src/abi.js';
+
+// Parse arguments
+const args = process.argv.slice(2);
+let wasmPath = null;
+let assetsDir = null;
+let sourceDir = null;
+let cartWidth = 0;
+let cartHeight = 0;
+let outputPath = null;
+let gameName = null;
+let gameVersion = null;  // --version; else the git rule (src/cartVersion.js)
+let versionFrom = null;  // --version-from: the checkout the git rule reads
+let players = null;
+let netWebsocket = null;  // array of domain strings
+let netDataChannel = false;
+let usePointer = false;
+let useKeyboard = false;
+let controls = null;   // array of pad-subset tokens (SPEC: manifest 'controls')
+let writeFiles = false; // --files: record the asset list (SPEC: manifest 'files')
+let artDir = null;      // --art: the cart's pictures (SPEC: manifest 'art')
+let title = null;       // --title: the game's name as people read it (SPEC: manifest 'title')
+let description = null;
+let author = null;
+
+for (let i = 0; i < args.length; i++) {
+  switch (args[i]) {
+    case '--wasm':
+      wasmPath = resolve(args[++i]);
+      break;
+    case '--assets':
+      assetsDir = resolve(args[++i]);
+      break;
+    case '--source':
+      sourceDir = resolve(args[++i]);
+      break;
+    case '--width':
+      cartWidth = parseInt(args[++i], 10) || 0;
+      break;
+    case '--height':
+      cartHeight = parseInt(args[++i], 10) || 0;
+      break;
+    case '--output':
+    case '-o':
+      outputPath = resolve(args[++i]);
+      break;
+    case '--name':
+      gameName = args[++i];
+      break;
+    case '--version':
+      gameVersion = args[++i];
+      break;
+    case '--version-from':
+      versionFrom = resolve(args[++i]);
+      break;
+    case '--players':
+      players = parseInt(args[++i], 10);
+      break;
+    case '--ws':
+    case '--websocket':
+      if (!netWebsocket) netWebsocket = [];
+      netWebsocket.push(args[++i]);
+      break;
+    case '--data-channel':
+      netDataChannel = true;
+      break;
+    case '--pointer':
+      usePointer = true;
+      break;
+    case '--keyboard':
+      useKeyboard = true;
+      break;
+    case '--controls':
+      if (!controls) controls = [];
+      controls.push(...args[++i].split(',').map((t) => t.trim()).filter(Boolean));
+      break;
+    case '--files':
+      writeFiles = true;
+      break;
+    case '--art':
+      artDir = resolve(args[++i]);
+      break;
+    case '--title':
+      title = args[++i];
+      break;
+    case '--description':
+      description = args[++i];
+      break;
+    case '--author':
+      author = args[++i];
+      break;
+    case '--help':
+    case '-h':
+      printUsage();
+      process.exit(0);
+      break;
+    default:
+      if (!args[i].startsWith('-')) {
+        // Positional: treat as wasm path if not set, else output
+        if (!wasmPath) wasmPath = resolve(args[i]);
+        else if (!outputPath) outputPath = resolve(args[i]);
+      }
+      break;
+  }
+}
+
+if (sourceDir && wasmPath) {
+  console.error('Error: --source and --wasm are alternatives, not both');
+  process.exit(1);
+}
+
+// --source: a dev directory that already carries its own manifest.json.
+// The manifest is kept VERBATIM -- entry, assets, and any field this CLI has
+// no flag for -- because the point is that the tree `npx wasmcart <dir>` runs
+// is the tree that packs.
+let sourceManifest = null;
+if (sourceDir) {
+  let raw;
+  try {
+    raw = readFileSync(join(sourceDir, 'manifest.json'), 'utf8');
+  } catch {
+    console.error(`Error: no manifest.json in ${sourceDir}`);
+    console.error('  (a dev directory needs one; use --wasm to generate a manifest instead)');
+    process.exit(1);
+  }
+  try {
+    sourceManifest = JSON.parse(raw);
+  } catch (e) {
+    console.error(`Error: manifest.json in ${sourceDir} is not valid JSON: ${e.message}`);
+    process.exit(1);
+  }
+  const entry = sourceManifest.entry || 'cart.wasm';
+  wasmPath = resolve(join(sourceDir, entry));
+  try {
+    statSync(wasmPath);
+  } catch {
+    console.error(`Error: manifest entry "${entry}" not found in ${sourceDir}`);
+    process.exit(1);
+  }
+  if (!gameName) gameName = sourceManifest.name || basename(sourceDir);
+}
+
+if (!wasmPath) {
+  console.error('Error: --wasm <path> or --source <dir> is required');
+  printUsage();
+  process.exit(1);
+}
+
+if (!outputPath) {
+  // Default: same name as wasm but with .wasc extension
+  outputPath = resolve(basename(wasmPath, extname(wasmPath)) + '.wasc');
+}
+
+if (!gameName) {
+  gameName = basename(wasmPath, extname(wasmPath));
+}
+
+// Validate wasm file exists
+try {
+  statSync(wasmPath);
+} catch {
+  console.error(`Error: WASM file not found: ${wasmPath}`);
+  process.exit(1);
+}
+
+// Validate new fields
+if (players !== null) {
+  if (!Number.isInteger(players) || players < 1 || players > 4) {
+    console.error('Error: --players must be an integer between 1 and 4');
+    process.exit(1);
+  }
+}
+
+// controls is a PRESENTATION HINT (SPEC: advisory, never binding, never
+// gating) and hosts must ignore unknown tokens -- so an unknown token here is
+// most likely a typo that would silently hide a button from on-screen pads.
+// Warn, but write it anyway: the CLI must not reject tokens a future spec
+// revision defines.
+const KNOWN_CONTROLS = new Set([
+  'dpad', 'a', 'b', 'x', 'y', 'l', 'r', 'start', 'select',
+  'left_stick', 'right_stick', 'left_trigger', 'right_trigger', 'l3', 'r3',
+]);
+// `none` writes an empty list: no on-screen pad, the cart plays by touch
+// (SPEC: controls []). It stands alone; with other tokens it means nothing.
+if (controls && controls.includes('none') && controls.length > 1) {
+  console.error('wasmcart-pack: --controls none means no on-screen pad; it cannot be combined with other controls');
+  process.exit(1);
+}
+if (controls) {
+  for (const t of controls) {
+    if (t !== 'none' && !KNOWN_CONTROLS.has(t)) {
+      console.warn(`wasmcart-pack: unknown --controls token "${t}" (hosts will ignore it; known: ${[...KNOWN_CONTROLS].join(', ')})`);
+    }
+  }
+}
+
+if (netWebsocket) {
+  for (const domain of netWebsocket) {
+    if (!domain || domain.includes('/') || domain.includes(':') || domain.startsWith('.')) {
+      console.error(`Error: invalid WebSocket domain: "${domain}" (must be a bare domain name)`);
+      process.exit(1);
+    }
+  }
+}
+
+// The version: --version, else the git checkout the cart is packed from, else
+// (outside git) a --source manifest's own version, else 0.1.0. A --source
+// manifest's version is a placeholder as soon as git can say better: a tree
+// that commits "1.0.0" would otherwise pack every build, release or not, as
+// 1.0.0. Anything that is not semver stops here rather than reaching a
+// launcher that compares versions.
+const versionInfo = resolveCartVersion({
+  set: gameVersion,
+  // --version-from names the one checkout to read: an SDK packing a game from
+  // its own runtime's directory (the wasm) and a staging copy (the assets)
+  // would otherwise read the SDK's version, not the game's.
+  dirs: versionFrom ? [versionFrom] : [sourceDir, dirname(wasmPath), assetsDir, process.cwd()],
+  fallback: sourceManifest ? sourceManifest.version : null,
+});
+if (versionInfo.error) {
+  console.error(`Error: ${versionInfo.error}`);
+  process.exit(1);
+}
+
+// Build manifest. In --source mode the cart's own manifest is kept, except
+// for the version (above), the entry and the fields a flag sets: rewriting
+// the rest would defeat the purpose, and it may carry fields this CLI has no
+// flag for.
+const manifest = sourceManifest ? { ...sourceManifest } : {
+  name: gameName,
+  version: versionInfo.version,
+  // From the constant, not a literal: this was pinned at 3 and kept emitting
+  // 3 after the ABI moved to 4, so freshly packed carts described themselves
+  // with the previous version.
+  abi: ABI_VERSION,
+  entry: 'cart.wasm',
+};
+if (sourceManifest) {
+  if (gameName) manifest.name = gameName;
+  manifest.version = versionInfo.version;
+  manifest.entry = 'cart.wasm';   // the entry is renamed inside the archive
+}
+
+if (players !== null && players > 1) {
+  manifest.players = players;
+}
+
+// Like --name, an explicit --controls overrides even a --source manifest:
+// flags the user typed win over what the tree carries.
+if (controls && controls.length) {
+  manifest.controls = controls[0] === 'none' ? [] : controls;
+}
+
+// --pointer / --keyboard used to write manifest fields that gated input
+// delivery. They no longer do: WC_FLAG_POINTER / WC_FLAG_KEYBOARD in the
+// cart's own wc_info_t is the only gate, so a manifest field could only ever
+// disagree with the cart and silently drop its input. The flags are kept as
+// accepted no-ops so existing build scripts do not break, but they warn
+// rather than writing a field nothing reads.
+if (usePointer || useKeyboard) {
+  const names = [usePointer && '--pointer', useKeyboard && '--keyboard'].filter(Boolean);
+  const which = names.join(' and ');
+  const verb = names.length > 1 ? 'do' : 'does';
+  console.warn(`wasmcart-pack: ${which} no longer ${verb} anything. The cart declares ` +
+    `pointer/keyboard input itself, via WC_FLAG_POINTER / WC_FLAG_KEYBOARD in wc_info_t.`);
+}
+
+if (netWebsocket || netDataChannel) {
+  manifest.net = {};
+  // net.domains is the allowlist for cart-initiated connections. (--ws is kept
+  // as an alias because the flag predates the wc_peer_* merge.)
+  if (netWebsocket) manifest.net.domains = netWebsocket;
+  // --data-channel used to write net['data-channel'], which enabled
+  // host-registered peers. Nothing reads it now: a peer the HOST establishes
+  // needs no cart-side grant, because the host already chose it. Kept as an
+  // accepted no-op so existing build scripts do not break.
+  if (netDataChannel) {
+    console.warn('wasmcart-pack: --data-channel no longer does anything. Peers the ' +
+      'host establishes need no manifest grant; net.domains gates only the ' +
+      'connections a cart opens itself.');
+  }
+}
+
+if (!sourceManifest && assetsDir) {
+  manifest.assets = 'assets/';
+}
+
+if (title !== null) {
+  if (title.length > 64) console.warn(`wasmcart-pack: --title is ${title.length} characters; hosts may cut it after 64`);
+  manifest.title = title;
+}
+if (description !== null) {
+  if (description.length > 300) console.warn(`wasmcart-pack: --description is ${description.length} characters; hosts may cut it after 300`);
+  manifest.description = description;
+}
+if (author !== null) manifest.author = author;
+
+// --art: the pictures a launcher shows (SPEC: manifest 'art'). Advisory: a
+// file that is not a PNG or JPEG is an error (it can only be a mistake), a
+// picture of the wrong shape or size only warns.
+let art = null;
+if (artDir) {
+  try {
+    art = readArtDir(artDir);
+  } catch (e) {
+    console.error(`Error: --art ${artDir}: ${e.message}`);
+    process.exit(1);
+  }
+  for (const w of art.warnings) console.warn(`wasmcart-pack: ${w}`);
+  manifest.art = art.manifest;
+}
+
+// A cart's own resolution, declared up front. A host sizes its window -- and
+// a self-provisioned GL context -- before the cart runs, so without this a
+// 1600x900 game gets a 640x480 context and renders into a corner of it.
+if (cartWidth > 0 && cartHeight > 0) {
+  manifest.width = cartWidth;
+  manifest.height = cartHeight;
+}
+
+// --files: the asset list, built from exactly what goes into the archive
+// (walkDir below skips dotfiles), relative to the asset prefix. In --source
+// mode it replaces any list the tree's manifest carried, since an archive's
+// list must describe the archive.
+if (writeFiles) {
+  if (sourceDir) {
+    const raw = manifest.assets;
+    const prefix = raw === undefined || raw === null || raw === '' ? 'assets/' : String(raw).replace(/\/?$/, '/');
+    manifest.files = walkDir(sourceDir, '')
+      .map(({ relPath }) => relPath)
+      .filter((p) => p.startsWith(prefix))
+      .map((p) => p.slice(prefix.length))
+      .sort();
+  } else {
+    manifest.files = assetsDir ? walkDir(assetsDir, '').map(({ relPath }) => relPath).sort() : [];
+  }
+}
+
+// Collect asset files
+function walkDir(dir, base) {
+  const files = [];
+  const entries = readdirSync(dir);
+
+  for (const entry of entries) {
+    if (entry.startsWith('.')) continue;
+    const fullPath = join(dir, entry);
+    const relPath = join(base, entry);
+
+    try {
+      const s = statSync(fullPath);
+      if (s.isDirectory()) {
+        files.push(...walkDir(fullPath, relPath));
+      } else if (s.isFile()) {
+        files.push({ fullPath, relPath: relPath.replace(/\\/g, '/') });
+      }
+    } catch {
+      // Skip inaccessible files
+    }
+  }
+
+  return files;
+}
+
+// Create ZIP
+const zipfile = new ZipFile();
+
+// Add manifest.json
+const manifestJson = JSON.stringify(manifest, null, 2);
+zipfile.addBuffer(Buffer.from(manifestJson), 'manifest.json');
+
+// Add cart.wasm.
+//
+// Small carts are stored uncompressed: a hand-written C cart really is
+// already compact, and storing it keeps load cheap. But that assumption
+// breaks badly for a language runtime -- a CPython cart deflates to 35% and
+// the Godot runtime to 16% (56 MB -> 9 MB), so storing those was costing
+// tens of megabytes per cart for nothing. Above the threshold, compress.
+const WASM_COMPRESS_THRESHOLD = 4 * 1024 * 1024;
+const wasmSize = statSync(wasmPath).size;
+zipfile.addFile(wasmPath, 'cart.wasm', {
+  compress: wasmSize > WASM_COMPRESS_THRESHOLD,
+});
+
+// Add the art, under art/ (outside the asset prefix: the cart never loads it)
+if (art) {
+  for (const { fullPath, zipPath } of art.files) zipfile.addFile(fullPath, zipPath, { compress: false });
+} else if (sourceManifest && sourceManifest.art) {
+  // a --source tree's own art: the files pack with the tree below; say which are missing
+  for (const w of describeArtProblems(sourceManifest.art, (p) => { try { return readFileSync(join(sourceDir, p)); } catch { return null; } })) {
+    console.warn(`wasmcart-pack: ${w}`);
+  }
+}
+
+// Add asset files
+let assetCount = 0;
+let assetBytes = 0;
+
+if (sourceDir) {
+  // Everything in the tree except the manifest and the entry wasm, at its
+  // ORIGINAL path. The manifest's `assets` prefix refers to these paths, so
+  // rewriting them would break the very field we kept verbatim.
+  const entryRel = (sourceManifest.entry || 'cart.wasm').replace(/\\/g, '/');
+  const srcFiles = walkDir(sourceDir, '');
+  for (const { fullPath, relPath } of srcFiles) {
+    if (relPath === 'manifest.json' || relPath === entryRel) continue;
+    zipfile.addFile(fullPath, relPath);
+    const s = statSync(fullPath);
+    assetBytes += s.size;
+    assetCount++;
+  }
+} else if (assetsDir) {
+  try {
+    statSync(assetsDir);
+  } catch {
+    console.error(`Error: Assets directory not found: ${assetsDir}`);
+    process.exit(1);
+  }
+
+  const assetFiles = walkDir(assetsDir, '');
+  for (const { fullPath, relPath } of assetFiles) {
+    const zipPath = 'assets/' + relPath;
+    zipfile.addFile(fullPath, zipPath);
+    const s = statSync(fullPath);
+    assetCount++;
+    assetBytes += s.size;
+  }
+}
+
+// Write output
+const outputStream = createWriteStream(outputPath);
+zipfile.outputStream.pipe(outputStream);
+
+outputStream.on('close', () => {
+  const outSize = statSync(outputPath).size;
+  const wasmSize = statSync(wasmPath).size;
+
+  console.log(`Created: ${outputPath}`);
+  console.log(`  Version: ${versionInfo.version}${versionInfo.from === 'set' ? '' : ` (${versionInfo.from.replace(/^git .*/, 'git')})`}`);
+  console.log(`  WASM:   ${formatSize(wasmSize)}`);
+  if (assetCount > 0) {
+    console.log(`  Assets: ${assetCount} files, ${formatSize(assetBytes)} (uncompressed)`);
+  }
+  if (art) {
+    const bytes = art.files.reduce((n, f) => n + statSync(f.fullPath).size, 0);
+    console.log(`  Art:    ${art.files.length} files, ${formatSize(bytes)}`);
+  }
+  console.log(`  Total:  ${formatSize(outSize)}`);
+});
+
+zipfile.end();
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function printUsage() {
+  console.log(`wasmcart-pack - Package a .wasm cart + assets into a .wasc archive`);
+  console.log(``);
+  console.log(`Usage: wasmcart-pack --wasm <cart.wasm> [--assets <dir>] --output <game.wasc>`);
+  console.log(``);
+  console.log(`Options:`);
+  console.log(`  --wasm <path>      Path to the compiled cart.wasm file (required)`);
+  console.log(`  --assets <dir>     Directory of assets to include`);
+  console.log(`  --output, -o       Output .wasc file path (default: <name>.wasc)`);
+  console.log(`  --name <name>      Game name for manifest (default: wasm filename)`);
+  console.log(`  --version <semver> Cart version for the manifest (default: from git: the tag`);
+  console.log(`                     at a clean v<semver> tag, else <last tag>-dev.g<commit>;`);
+  console.log(`                     outside git a --source manifest's version, else 0.1.0)`);
+  console.log(`  --version-from <d> Read that version from <d>'s git checkout (a game packed`);
+  console.log(`                     from a staging copy: point it at the game)`);
+  console.log(`  --width <px>       Cart resolution width (hosts size their window to it)`);
+  console.log(`  --height <px>      Cart resolution height`);
+  console.log(`  --players <n>      Number of local players (1-4, default: 1)`);
+  console.log(`  --controls <list>  Comma-separated pad subset the game reads (advisory`);
+  console.log(`                     hint for hosts drawing on-screen touch controls, e.g.`);
+  console.log(`                     dpad,a,b,start; repeatable; omit for the retro default;`);
+  console.log(`                     "none" for no on-screen pad, a game played by touch)`);
+  console.log(`  --art <dir>        The cart's pictures for launchers: icon, cover, background,`);
+  console.log(`                     logo, title (.png/.jpg) and screenshot*.png, or the dir's`);
+  console.log(`                     art.json naming them, with screenshot labels`);
+  console.log(`  --title <text>     The game's name as people read it ("Tux Racer"; --name is the id)`);
+  console.log(`  --description <t>  What the game is, a sentence or two (under 300 characters)`);
+  console.log(`  --author <name>    Who made it, as it should be credited`);
+  console.log(`  --files            Record the asset list in the manifest (optional; lets the`);
+  console.log(`                     unzipped cart be served as a directory on the web)`);
+  console.log(`  --ws <domain>      Allow WebSocket to domain (repeatable)`);
+  console.log(`  --data-channel     (deprecated, no-op: host-supplied peers need no grant)`);
+  console.log(`  --pointer          (deprecated, no-op: the cart sets WC_FLAG_POINTER)`);
+  console.log(`  --keyboard         (deprecated, no-op: the cart sets WC_FLAG_KEYBOARD)`);
+  console.log(`  -h, --help         Show this help`);
+  console.log(``);
+  console.log(`The .wasc file is a ZIP archive containing:`);
+  console.log(`  manifest.json    Metadata (name, version, ABI, entry point)`);
+  console.log(`  cart.wasm        The compiled cart (code only)`);
+  console.log(`  assets/          Game assets (textures, levels, audio, etc.)`);
+  console.log(`  art/             The cart's pictures for launchers (optional)`);
+  console.log(``);
+  console.log(`Examples:`);
+  console.log(`  wasmcart-pack --wasm build/cart.wasm --assets assets/ -o game.wasc`);
+  console.log(`  wasmcart-pack --wasm hello.wasm -o hello.wasc`);
+}

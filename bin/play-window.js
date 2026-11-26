@@ -1,0 +1,589 @@
+/*
+ * play-window - the SDL-windowed mode of `npx wasmcart`, on the org's own
+ * native stack: @kmamal/sdl for window/input/audio, webgl-node for GL carts.
+ *
+ * Two paths:
+ *   2D (default): plain SDL window, framebuffer blitted with
+ *     window.render(..., 'bgra32', ...) (CartHost pixels are XRGB LE = BGRX).
+ *   GL (auto-detected): opengl window + createWebGL2Context({nativeWindow}),
+ *     created lazily by a glBackend FACTORY that CartHost invokes only if the
+ *     cart imports from the "gl" module; present via swapBuffers. --gl forces
+ *     the GL window up front.
+ *
+ * Pacing: audio-paced when the cart emits audio (keep the SDL queue topped
+ * up, step frames as it drains — the anti-choppiness rule); 60fps timer
+ * otherwise. Real keyDown/keyUp edges (no terminal hold emulation), plus up
+ * to four game controllers, each its own pad (src/padSlots.js).
+ */
+
+import { BUTTON, WHEEL_DELTA } from '../src/abi.js';
+import { IN, DEVICE, GLYPH, glyphId, padOrigin, padFamily } from '../src/actions.js';
+import { fitRect } from '../src/letterbox.js';
+import { savPathFor, loadSave, makeSaver } from '../src/save.js';
+import { createPadSlots } from '../src/padSlots.js';
+import { openFootSwitches } from '../src/footSwitch.js';
+
+const KEYMAP = {
+  up: 'UP', down: 'DOWN', left: 'LEFT', right: 'RIGHT',
+  w: 'UP', s: 'DOWN', a: 'LEFT', d: 'RIGHT',
+  x: 'A', z: 'B', space: 'A', return: 'START', tab: 'SELECT',
+  '[': 'L', ']': 'R',
+};
+
+// What KEYMAP puts each logical input on, for input-action prompts (SPEC.md,
+// "Input actions"): the first key listed above, as a label and HID scancode.
+// Inputs with no key here (X, Y, sticks, triggers) are unbound on keyboard.
+const KEY_ORIGINS = {
+  [IN.A]: ['Space', 0x2c], [IN.B]: ['Z', 0x1d], [IN.START]: ['Enter', 0x28], [IN.SELECT]: ['Tab', 0x2b],
+  [IN.L]: ['[', 0x2f], [IN.R]: [']', 0x30], [IN.UP]: ['Up', 0x52], [IN.DOWN]: ['Down', 0x51],
+  [IN.LEFT]: ['Left', 0x50], [IN.RIGHT]: ['Right', 0x4f], [IN.DPAD]: ['Arrow keys', 0],
+};
+
+
+
+/*
+ * Load SDL, choosing its video driver.
+ *
+ * On a Wayland desktop that also runs Xwayland (GNOME, KDE), SDL 2 opens X11
+ * windows. A WebGPU surface (Vulkan) on an Xwayland window presents through
+ * Xwayland's Present extension, which paced Rider at anything from 1 to 24
+ * fps with 100 ms stalls on a 30 Hz desktop (Mesa 26, Mutter), against a
+ * steady 30 on a Wayland window of the same session. So a WebGPU cart's window
+ * is a Wayland window when the session has one, X11 otherwise. GL carts stay
+ * on SDL's default: webgl-node draws into X11 windows only. An explicit
+ * SDL_VIDEODRIVER is never overridden.
+ */
+async function openSdl(wantWayland) {
+  if (wantWayland && process.platform === 'linux' && process.env.WAYLAND_DISPLAY && !process.env.SDL_VIDEODRIVER) {
+    process.env.SDL_VIDEODRIVER = 'wayland,x11';
+  }
+  return (await import('@kmamal/sdl')).default;
+}
+
+export async function runWindowed(cartPath, opt, { CartHost, toInt16, gpuLostMessage, saveIdentity = cartPath, cleanupSource }) {
+  // SDL is loaded when the first window is made, because what kind of cart
+  // this is decides its video driver (see openSdl above).
+  let sdl = null;
+
+  const host = new CartHost();
+  const held = new Set();
+  let window = null;
+  let swapBuffers = null;
+  // GL letterboxing: the viewport is only recomputed when the drawable size
+  // actually changes, so the steady-state frame costs nothing.
+  let glForResize = null;
+  let glLastW = -1, glLastH = -1;
+
+  const loadOpts = {};
+  // The JIT off switch (WASMCART_JIT=0) must be unmistakable: a banner on
+  // stderr and in the window title, since a cart that relies on runtime code
+  // generation may run slowly or not at all without it.
+  let jitOff = null;
+  const JIT_TITLE = 'wasmcart - RUNTIME CODE GENERATION OFF (WASMCART_JIT=0)';
+  loadOpts.onJitNotice = (msg) => {
+    jitOff = msg;
+    console.error(`\n*** ${msg} ***\n`);
+    try { window?.setTitle(JIT_TITLE); } catch { /* no window yet */ }
+  };
+  if (opt.seed !== null) loadOpts.deterministic = { seed: opt.seed };
+  // cart SRAM: a .sav next to the cart, loaded before wc_init, written on quit
+  const savPath = savPathFor(saveIdentity);
+  loadOpts.saveData = loadSave(savPath);
+
+  // GL is AUTO-DETECTED: this factory is handed to CartHost, which invokes it
+  // only if the cart's wasm actually imports from the "gl" module - the
+  // launcher never needs to know what kind of cart it's launching. It's a
+  // callback (not a post-load branch) because the GL context must exist
+  // before wasm instantiation, bound to a real opengl window - and a 2D cart
+  // must NOT get an opengl window (separate-GL-context fights, see playtest).
+  const makeGlWindow = async () => {
+    const { createWebGL2Context } = await import('webgl-node');
+    sdl ??= await openSdl(false);
+    // Size from the cart's own declaration, not a fixed 720p. The cart draws
+    // at its declared resolution and wc_gl_blit's viewport is the context, so
+    // a mismatch here puts the frame in a corner rather than scaling it.
+    const m = host.getManifest() || {};
+    const w = opt.width || m.width || 1280;
+    const h = opt.height || m.height || 720;
+    window = sdl.video.createWindow({
+      title: 'wasmcart', width: w, height: h,
+      resizable: opt.resizable !== false, opengl: true,
+    });
+    const nativeGL = window.native?.gl;
+    if (!nativeGL) throw new Error('no native GL window handle from SDL (try a different video driver)');
+    const glResult = createWebGL2Context(window.pixelWidth, window.pixelHeight, { nativeWindow: nativeGL });
+    swapBuffers = glResult.swapBuffers;
+    /* Block on vsync: the present is a cheap GPU swap, and unsynced swaps
+     * land at random phases of the refresh — microstutter at a "perfect"
+     * frame rate. (On macOS the interval only works at all as of
+     * native-gles 0.6.0's Metal backend; before that it was ignored.) */
+    glResult.setSwapInterval?.(1);
+    glForResize = glResult.gl;
+    return glResult.gl;
+  };
+  // --gl forces the GL window up front (hybrid carts, debugging); default is lazy.
+  loadOpts.glBackend = opt.gl ? await makeGlWindow() : makeGlWindow;
+
+  await host.load(cartPath, loadOpts);
+  host.runFrame([{ connected: true, buttons: 0 }]); // settle: final resolution
+  const info = host.getInfo();
+
+  const zoom = opt.zoom || (info.height <= 400 ? 2 : 1);
+  // A WebGPU cart (SPEC.md, "WebGPU") renders into a texture the host owns;
+  // the window gets a WebGPU surface on the cart's device, and each frame is
+  // drawn into it letterboxed, as the GL path does with its redirect FBO.
+  let wgpuWindow = null;
+  sdl ??= await openSdl(host.usesWgpu);
+  if (!window && host.usesWgpu) {
+    const { createWebGPUContext } = await import('webgpu-node');
+    window = sdl.video.createWindow({
+      title: 'wasmcart', width: opt.width || info.width * zoom, height: opt.height || info.height * zoom,
+      resizable: opt.resizable !== false, webgpu: true,
+    });
+    wgpuWindow = await createWebGPUContext(window.pixelWidth, window.pixelHeight, {
+      window, device: host.getGpuDevice(), presentMode: 'fifo',
+    });
+  } else if (!window) {
+    window = sdl.video.createWindow({
+      title: 'wasmcart', width: info.width * zoom, height: info.height * zoom,
+      resizable: opt.resizable !== false,
+    });
+  } else if (!opt.width && !opt.height) {
+    // A GL cart's window had to be created during load(), before wc_get_info
+    // could say how big the cart actually is -- so it opened at a guess. Now
+    // that the cart has answered, adopt its size. The cart is the authority
+    // on resolution; the host only asks. Skipped when the user named an
+    // explicit --width/--height, since that IS the host asking.
+    const want = [info.width * zoom, info.height * zoom];
+    if (window.width !== want[0] || window.height !== want[1]) {
+      try { window.setSize(want[0], want[1]); } catch { /* compositor said no */ }
+    }
+  }
+
+  if (jitOff) { try { window.setTitle(JIT_TITLE); } catch { /* title unsupported */ } }
+
+  // Fullscreen is just another window size: the frame is letterboxed into
+  // whatever the drawable turns out to be, so the cart's aspect ratio holds
+  // on a display of any shape.
+  if (opt.fullscreen) {
+    try { window.setFullscreen(true); } catch { /* not supported here */ }
+  }
+
+  // input: real press/release edges
+  window.on('keyDown', (e) => {
+    const k = (e.key ?? e.scancode ?? '').toString().toLowerCase();
+    // While the cart is taking text, keys are CHARACTERS, not controls: typing
+    // "q" into a name field must not quit the player, and "w" must not also
+    // walk the player forward. Escape still works, as the universal "get me
+    // out of here" -- a cart that wants it for its own field can read it
+    // through the keyboard ABI.
+    if (host.textInputActive) {
+      if (k === 'escape') return quit();
+      return;
+    }
+    if (k === 'escape' || k === 'q') return quit();
+    const name = KEYMAP[k];
+    if (name) { held.add(name); host.setInputDevice(0, DEVICE.KEYBOARD_MOUSE); }
+  });
+
+  // Committed text from SDL: already layout-, shift- and IME-processed. The
+  // host forwards unconditionally; CartHost drops it unless the cart asked.
+  window.on('textInput', (e) => {
+    if (typeof e.text === 'string') host.textInput(e.text);
+  });
+
+  // Anything held when a text field opens would otherwise stick: keyDown is
+  // suppressed during text input, and the matching keyUp arrives while the
+  // cart is still typing, so the pad would report the key held forever. Clear
+  // on the transition into text input rather than trying to reconcile later.
+  let textWasActive = false;
+  const syncTextInputState = () => {
+    const now = host.textInputActive;
+    if (now && !textWasActive) held.clear();
+    textWasActive = now;
+  };
+  window.on('keyUp', (e) => {
+    const name = KEYMAP[(e.key ?? e.scancode ?? '').toString().toLowerCase()];
+    if (name) held.delete(name);
+  });
+
+  /* --- mouse ---------------------------------------------------------------
+   *
+   * The cart sees CART-SPACE pixels, so every event is run backwards through
+   * the same letterbox that put the frame on screen. Without that inversion a
+   * click lands wherever the window happens to be sized, which is correct
+   * only at 1:1 and silently wrong at every other size.
+   *
+   * TWO COORDINATE SPACES. SDL reports mouse position in WINDOW coordinates
+   * (logical points -- it packs SDL_MouseMotionEvent.x/y straight through),
+   * while the letterbox rect is computed in DRAWABLE pixels; on a HiDPI
+   * display those differ by the backing scale factor. So the position is
+   * scaled by pixelWidth/width rather than assumed to be in either space:
+   * the ratio is 1 on a normal display and 2 on a Retina one, and the
+   * arithmetic is identical either way.
+   *
+   * OUTSIDE THE FRAME IS NOT A POSITION. The letterbox bars are not part of
+   * the cart's picture, and x/y go over the wire as int16, so an unclamped
+   * position there would report a coordinate the cart cannot have. The
+   * pointer is reported INACTIVE while the cursor is over the bars instead,
+   * which is the same shape as a touch that is not currently touching --
+   * and `active` is the field a cart already has to check.
+   */
+  const MOUSE_ID = 0;   // pointer 0 is the mouse; 1+ are touch slots
+  // SDL button numbers are 1=LEFT 2=MIDDLE 3=RIGHT (verified against
+  // sdl.mouse.BUTTON), and the ABI's bits are 0=primary 1=secondary
+  // 2=middle. That is a REMAP, not an offset: subtracting one would quietly
+  // swap right and middle.
+  const MOUSE_BUTTON_BIT = { 1: 0, 3: 1, 2: 2 };
+  // Stays inactive until the cursor is first seen inside the frame, so a cart
+  // cannot read a stale (0,0) pointer before the mouse has ever moved.
+  let mouseInside = false;
+
+  /** Window-space event coords -> cart-space pixels, or null when outside. */
+  const toCart = (ex, ey) => {
+    const pw = window.pixelWidth, ph = window.pixelHeight;
+    if (!pw || !ph) return null;
+    // Logical -> drawable. The guards keep a zero-sized (minimized) window
+    // from dividing by zero.
+    const px = ex * (window.width ? pw / window.width : 1);
+    const py = ey * (window.height ? ph / window.height : 1);
+    if (opt.stretch) {
+      // --stretch fills the drawable, so the whole window is cart space.
+      return {
+        x: Math.min(info.width - 1, Math.max(0, Math.floor(px * info.width / pw))),
+        y: Math.min(info.height - 1, Math.max(0, Math.floor(py * info.height / ph))),
+      };
+    }
+    const r = fitRect(info.width, info.height, pw, ph);
+    if (px < r.x || py < r.y || px >= r.x + r.width || py >= r.y + r.height) return null;
+    // Clamped because the rect is rounded to integers: the last fractional
+    // pixel of a scaled-up frame can otherwise compute info.width exactly.
+    return {
+      x: Math.min(info.width - 1, Math.floor((px - r.x) * info.width / r.width)),
+      y: Math.min(info.height - 1, Math.floor((py - r.y) * info.height / r.height)),
+    };
+  };
+
+  window.on('mouseMove', (e) => {
+    const p = toCart(e.x, e.y);
+    if (!p) {
+      // Left the picture: drop the pointer rather than pinning it to an edge,
+      // so a cart can tell "cursor elsewhere" from "cursor against the wall".
+      if (mouseInside) { host.setPointer(MOUSE_ID, 0, 0, 0, false); mouseInside = false; }
+      return;
+    }
+    // pointerMove updates position but does NOT set `active` (only
+    // pointerDown does), so entering the frame has to activate explicitly --
+    // otherwise a cart that gates on `active` sees nothing until the first
+    // click, and a crosshair/cursor never appears under a moving mouse.
+    if (!mouseInside) {
+      mouseInside = true;
+      host.setPointer(MOUSE_ID, p.x, p.y, 0, true);
+    }
+    host.pointerMove(MOUSE_ID, p.x, p.y);
+  });
+
+  window.on('mouseButtonDown', (e) => {
+    const bit = MOUSE_BUTTON_BIT[e.button];
+    if (bit === undefined) return;   // a side/extra button the ABI has no bit for
+    const p = toCart(e.x, e.y);
+    if (!p) return;                  // a press on the bars is not a press on the cart
+    mouseInside = true;
+    host.pointerDown(MOUSE_ID, p.x, p.y, bit);
+  });
+
+  window.on('mouseButtonUp', (e) => {
+    const bit = MOUSE_BUTTON_BIT[e.button];
+    if (bit === undefined) return;
+    // Released ALWAYS, even outside the frame: a button pressed inside and
+    // released over the bars must not stay stuck down forever.
+    host.pointerUp(MOUSE_ID, bit);
+  });
+
+  /* Wheel. The ABI's unit is 1/120 of a notch (WHEEL_DELTA) with UP positive.
+   * SDL's wheel.y is also up-positive and is passed through unscaled, so the
+   * conversion is a multiply, not a negate. `flipped` is SDL_MOUSEWHEEL_FLIPPED
+   * -- the platform has already inverted the values for "natural" scrolling --
+   * so undoing it here keeps one direction meaning one thing to every cart.
+   * CartHost accumulates these and delivers one delta per frame. */
+  window.on('mouseWheel', (e) => {
+    const sign = e.flipped ? -1 : 1;
+    host.wheel(Math.round((e.dx || 0) * WHEEL_DELTA * sign),
+               Math.round((e.dy || 0) * WHEEL_DELTA * sign));
+  });
+  // Split out of quit() so every exit path can reach it: a save that only
+  // survives a graceful window close is not a save. Defined HERE, above the
+  // lifecycle handlers, because those reference it -- a `const` declared later
+  // in the same scope would throw a TDZ ReferenceError if a minimize arrived
+  // before initialization.
+  const persistSave = makeSaver(host, savPath);
+
+  window.on('close', quit);
+
+  // Lifecycle. minimize/hide means the host stops driving frames entirely;
+  // focus/blur means the game is still rendering but is not the active window,
+  // which is what lets a cart auto-pause on alt-tab without going dark.
+  //
+  // Persisting on suspend is the point of having it: a backgrounded app can be
+  // killed by the OS without ever reaching quit(), so this is often the last
+  // moment a save can be written at all.
+  window.on('minimize', () => { host.suspend(); persistSave(); });
+  window.on('hide',     () => { host.suspend(); persistSave(); });
+  window.on('restore',  () => host.resume());
+  window.on('show',     () => host.resume());
+  window.on('blur',     () => host.blur());
+  window.on('focus',    () => host.focus());
+
+  /* --- game controller ----------------------------------------------------
+   *
+   * OPENED ON deviceAdd, NOT ONCE AT STARTUP. SDL does not fill its device
+   * list at the same moment on every platform: on Linux it is already
+   * populated when the module finishes importing, but on macOS it is empty
+   * and fills a second or two later as IOKit reports the device. A one-shot
+   * read of devices[0] therefore found the pad on Linux and silently found
+   * nothing on a Mac, so only the keyboard and mouse ever reached the cart
+   * while the controller itself worked fine in other software.
+   *
+   * Listening also gets reconnects for free, which a startup-only read never
+   * could: a Bluetooth pad that drops mid-session comes back.
+   */
+  // Up to four controllers, each its own pad and player (src/padSlots.js);
+  // the keyboard plays pad 0 with the first controller.
+  const padFam = [GLYPH.GAMEPAD, GLYPH.GAMEPAD, GLYPH.GAMEPAD, GLYPH.GAMEPAD];
+  // Input-action origins follow the device each player used last.
+  host.setInputDescriber((player, input, device) => {
+    if (device === DEVICE.GAMEPAD) return padOrigin(padFam[player] ?? GLYPH.GAMEPAD, input);
+    if (player !== 0) return null;
+    const k = KEY_ORIGINS[input];
+    return k ? { label: k[0], glyph: k[1] ? glyphId(GLYPH.KEY, k[1]) : 0 } : null;
+  });
+  host.setInputDevice(0, DEVICE.KEYBOARD_MOUSE);
+  const usePad = (slot = 0) => host.setInputDevice(slot, DEVICE.GAMEPAD);
+  let padSlots = null;
+  try {
+    padSlots = createPadSlots(sdl.controller, {
+      added(slot, dev) {
+        padFam[slot] = padFamily(`${dev.name ?? ''} ${dev.type ?? ''}`);
+        usePad(slot);
+        host.inputChanged();
+      },
+      removed(slot) { host.setInputDevice(slot, slot === 0 ? DEVICE.KEYBOARD_MOUSE : DEVICE.UNKNOWN); },
+      used: usePad,
+    });
+  } catch { /* controllers are optional */ }
+
+  // Route cart rumble to the controller in that pad's slot. A slot with no
+  // controller reports no rumble, the honest answer rather than a silent
+  // no-op the cart cannot detect. `closed` is checked (in padSlots) because
+  // SDL throws on a device unplugged mid-effect.
+  const rumbler = (padId) => { const c = padSlots?.controller(padId); return c && c.hasRumble ? c : null; };
+  host.setRumbleHandler({
+    hasRumble: (padId) => !!rumbler(padId),
+    rumble: (padId, low, high, ms) => rumbler(padId)?.rumble(low, high, ms),
+    stopRumble: (padId) => rumbler(padId)?.stopRumble(),
+  });
+
+  // USB foot pedals (src/footSwitch.js) add face buttons to pad 0, alongside
+  // the keyboard and the first controller. Optional: no node-hid, no pedal.
+  const footSwitch = await openFootSwitches({ log: (m) => console.error(m) }).catch(() => null);
+
+  const pad = () => {
+    let buttons = footSwitch ? footSwitch.buttons() : 0;
+    for (const name of held) buttons |= BUTTON[name];
+    return padSlots ? padSlots.pads(buttons) : [{ connected: true, buttons }];
+  };
+
+  // audio sink (SDL playback queue)
+  const rate = info.audioSampleRate || 48000;
+  const AUDIO_QUEUE_MAX = rate * 4 * 0.08; // 80 ms of s16 stereo
+  let audioDev = null;
+  let audioDropped = 0;
+  try {
+    audioDev = sdl.audio.openDevice({ type: 'playback' }, {
+      channels: 2, frequency: rate, format: 's16lsb', buffered: 2048,
+    });
+    audioDev.play();
+  } catch { /* no audio device (headless server) — video still runs */ }
+
+  let frame = null;
+  let ticks = 0;
+  // --stats: measure what the cart ACTUALLY gets, in wall-clock terms, and how
+  // much audio it produced for those frames. "The game feels slow" has several
+  // possible causes -- the host not calling, the display not presenting, the
+  // cart not keeping up -- and they need different fixes, so print the numbers
+  // rather than leaving it to be guessed at.
+  let statsFrames = 0, statsSince = performance.now(), statsAudio = 0;
+  const reportStats = () => {
+    const now = performance.now();
+    const elapsed = now - statsSince;
+    if (elapsed < 1000) return;
+    const fps = (statsFrames * 1000) / elapsed;
+    console.error(`wasmcart: ${fps.toFixed(1)} fps  (${statsFrames} frames in ${elapsed.toFixed(0)} ms, ` +
+      `${statsAudio} audio samples${audioDropped ? `, ${audioDropped} dropped behind the queue` : ''})`);
+    statsFrames = 0; statsAudio = 0; audioDropped = 0; statsSince = now;
+  };
+
+  const step = () => {
+    syncTextInputState();
+    frame = host.runFrame(pad());
+    ticks++;
+    if (opt.stats) {
+      statsFrames++;
+      if (frame.audio) statsAudio += frame.audio.length;
+      reportStats();
+    }
+    if (audioDev && frame.audio && frame.audio.length) {
+      const i16 = toInt16(frame.audio);
+      // Audio more than AUDIO_QUEUE_MAX behind is dropped, a frame's worth at
+      // a time, until the queue is back under it. A long frame (loading, a
+      // hitch) hands over its whole dt of audio at once, and without this the
+      // queue kept that latency for the rest of the run: 150-200 ms here.
+      if (i16 && audioDev.queued <= AUDIO_QUEUE_MAX) audioDev.enqueue(Buffer.from(i16.buffer, i16.byteOffset, i16.byteLength));
+      else if (i16) audioDropped += i16.length;
+    }
+  };
+
+  /*
+   * Present the frame scaled into the current window.
+   *
+   * The window opens at the cart's declared size and is resizable; the frame
+   * is letterboxed so the cart's aspect ratio survives the resize. A cart that
+   * declares 480x600 is making a choice about SHAPE, so the leftover area goes
+   * black rather than the frame being stretched to fit. --stretch opts out,
+   * --no-resize pins the window to the cart's size (making this a no-op).
+   */
+  const present = async () => {
+    if (wgpuWindow) {
+      const pw = window.pixelWidth, ph = window.pixelHeight;
+      const f = opt.stretch ? { x: 0, y: 0, width: pw, height: ph } : fitRect(info.width, info.height, pw, ph);
+      host.presentWgpuTo(wgpuWindow.context, { x: f.x, y: f.y, w: f.width, h: f.height });
+      wgpuWindow.present();
+      return;
+    }
+    if (swapBuffers) {
+      // The cart rendered into a context sized to ITS resolution, and
+      // wc_gl_blit's viewport is the context, so scaling to a resized window
+      // is a viewport concern: shrink the viewport to the letterboxed rect and
+      // clear the bars around it. Recomputed only when the drawable size
+      // actually changes, so a steady-state frame costs nothing extra.
+      if (glForResize && !opt.stretch) {
+        const gl = glForResize;
+        const pw = window.pixelWidth, ph = window.pixelHeight;
+        if (pw !== glLastW || ph !== glLastH) {
+          glLastW = pw; glLastH = ph;
+          const r = fitRect(info.width, info.height, pw, ph);
+          gl.viewport(r.x, r.y, r.width, r.height);
+          gl.disable(gl.SCISSOR_TEST);
+          gl.clearColor(0, 0, 0, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+      }
+      // A GL cart that renders through the REDIRECT FBO has drawn nothing into
+      // the default framebuffer, so swapping alone presents an empty surface -
+      // a black window, with no GL error to explain it. presentToSurface()
+      // blits the redirect FBO onto the window. Carts that draw straight into
+      // the default framebuffer return false here and are unaffected.
+      //
+      // Found with a Defold cart (91 env.gl* imports, FBO-redirected): black in
+      // the window while the SAME cart rendered correctly headless and through
+      // romdev, because both of those read the redirect FBO rather than the
+      // swapped surface.
+      if (host.glRedirected) {
+        const pw = window.pixelWidth, ph = window.pixelHeight;
+        const r = opt.stretch ? { x: 0, y: 0, w: pw, h: ph, winW: pw, winH: ph }
+          : (() => { const f = fitRect(info.width, info.height, pw, ph);
+                     return { x: f.x, y: f.y, w: f.width, h: f.height, winW: pw, winH: ph }; })();
+        host.presentToSurface(r);
+      }
+      swapBuffers();
+      return;
+    }
+    if (!frame) return;
+    const opts = opt.stretch ? undefined
+      : { dstRect: fitRect(frame.width, frame.height, window.pixelWidth, window.pixelHeight) };
+    await window.render(frame.width, frame.height, frame.width * 4, 'bgra32',
+      Buffer.from(frame.framebuffer.buffer, frame.framebuffer.byteOffset, frame.framebuffer.byteLength),
+      opts);
+  };
+
+
+  let closing = false;
+  let exitCode = 0;   // 4: the GPU device was lost
+  function quit() {
+    if (closing) return;
+    closing = true;
+    persistSave();
+    try { audioDev?.close(); } catch { /* already gone */ }
+    try { footSwitch?.close(); } catch { /* already gone */ }
+    // The surface before the window it presents to (the device is the cart's;
+    // host.destroy() releases it).
+    try { wgpuWindow?.destroy(); } catch { /* already gone */ }
+    try { window?.destroy(); } catch { /* already gone */ }
+    host.destroy();
+    cleanupSource?.();
+    process.exit(exitCode);
+  }
+
+  // Ctrl-C and `kill` are ordinary ways to stop a game, not crashes, so they
+  // must not cost the player their progress. quit() is idempotent via `closing`.
+  process.on('SIGINT', quit);
+  process.on('SIGTERM', quit);
+  // Last-ditch: an uncaught throw still gets one attempt at the save before the
+  // process dies. Best-effort by definition -- the host may be mid-corruption --
+  // but losing a save on top of a crash is strictly worse than trying.
+  process.on('uncaughtException', (err) => {
+    console.error(err);
+    quit();
+  });
+
+  /*
+   * Video and audio are paced INDEPENDENTLY.
+   *
+   * This loop used to derive the frame rate from the audio queue: step frames
+   * only while the queue was below a target, then present once per batch. That
+   * makes the visible frame rate a side effect of how fast the cart happens to
+   * drain audio -- up to five simulated frames per presented one, so motion
+   * advances in jumps -- and a cart that is silent at that moment starves the
+   * loop entirely.
+   *
+   * A frame is drawn every tick with the real elapsed time as dt, which is what
+   * the cart's physics integrates against, and swapBuffers blocks on vsync so
+   * the rate settles at the display's refresh. Audio is pushed from the same
+   * step but gates nothing: it is a ring the device drains on its own clock.
+   */
+  /*
+   * What bounds the loop depends on how the frame reaches the window.
+   *
+   * A GL cart presents through swapBuffers, which waits for vsync, so the
+   * display sets the rate and a timer on top of it would only add jitter.
+   *
+   * A 2D cart presents through window.render(), an SDL blit that does NOT
+   * wait. Left to spin it saturates the event queue and the cart ends up
+   * running slower than if it had been paced, so that path keeps a timer.
+   */
+  const paceWithVsync = !!swapBuffers || !!wgpuWindow;  // both present with fifo (vsync)
+  // Vsync is what bounds these paths, and it is not guaranteed: a driver may
+  // ignore the swap interval, a compositor stops pacing a window it is not
+  // showing (a locked screen, a minimized window). A frame that comes back
+  // from present well inside a refresh period waits out the rest of it, so the
+  // loop never runs faster than the display refreshes. When vsync blocks, the
+  // period has already passed and this waits for nothing.
+  const refreshMs = () => 1000 / (window.display?.frequency || 60);
+  const tick = async () => {
+    if (closing) return;
+    const t0 = performance.now();
+    step();
+    if (host.gpuLost) {
+      console.error(gpuLostMessage(host.gpuLost));
+      exitCode = 4;
+      return quit();
+    }
+    await present();
+    if (opt.frames > 0 && ticks >= opt.frames) return quit();
+    if (paceWithVsync) {
+      const wait = t0 + refreshMs() - 1 - performance.now();
+      if (wait > 1) setTimeout(tick, wait); else setImmediate(tick);
+    } else setTimeout(tick, 1000 / 60);
+  };
+  tick();
+}

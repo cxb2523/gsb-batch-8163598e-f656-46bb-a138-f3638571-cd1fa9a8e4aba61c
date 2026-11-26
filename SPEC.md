@@ -1,0 +1,1870 @@
+# wasmcart Specification
+
+> **ABI version: 4.** This is the normative specification for the wasmcart virtual
+> cartridge format - the host↔cart contract that any conforming host (see the
+> reference implementations in [`src/`](src/)) and any cart must follow. The
+> machine-readable form of these constants lives in [`src/abi.js`](src/abi.js); the
+> C-side contract in [`include/wc_cart.h`](include/wc_cart.h).
+
+
+## Overview
+
+A cart exports three functions (`wc_get_info`, `wc_init`, `wc_render`) and
+declares its capabilities in `wc_info_t.flags`. Gamepad input is always
+available; extended input (pointer, keyboard) is opt-in per cart via those
+flags. Networking is the one capability a cart cannot grant itself, so it is
+declared in the manifest and fails closed. The host provides everything through
+a small set of imports and shared-memory regions; the cart owns its own memory
+and reaches nothing else.
+
+Everything a cart can call is listed under [Imports](#imports-host-provides).
+That list is the complete attack surface -- see [Security Model](#security-model).
+
+### WebAssembly execution baseline
+
+Carts MAY use the standardized WebAssembly exception-handling instructions.
+Conforming hosts MUST execute them. This is an engine capability, not a
+wasmcart import, permission, or manifest feature, so it does not change the ABI
+and existing carts are unaffected.
+
+In particular, C and C++ carts may use wasi-sdk's Wasm-native
+`setjmp`/`longjmp`. With wasi-sdk 33, every translation unit that uses SjLj must
+be compiled with `-mllvm -wasm-enable-sjlj`, and the final link must include
+`-lsetjmp`. The reference Node.js and browser hosts exercise such a cart in
+their conformance suites.
+
+### Why each part of the ABI exists
+
+The ABI is deliberately small, and additions are held to a bar: **a cart must
+not be able to solve the problem itself.** This table records which parts met
+that bar because something was *broken*, and which are conveniences that could
+in principle have been left out. It exists so the next person weighing an
+addition can see the standard that was applied, and hold a new proposal to it.
+
+| Feature | Why | Could a cart do this itself? |
+|---|---|---|
+| **Delta clamp** | **Bug.** An unclamped `delta_ms` handed a cart the length of any stall -- a GC pause, a disk hit, a suspended tab -- and integrating velocity by that dt teleports objects through walls. Measured at 30000ms for a 30s stall. | No. The cart cannot see the stall, and clamping cart-side means every cart reimplements it. |
+| **Resize validation** | **Bug.** A cart writing an oversized `width`/`height` was *reported* at that size while the framebuffer was silently clamped -- the host described a frame whose pixels did not exist. | No. The corruption was in the host's own reporting. |
+| **Save durability** | **Bug.** Saves were written only on a graceful quit, so Ctrl-C or an OS kill lost them. The terminal player never saved at all. | No. The host owns persistence by design. |
+| **Loop inversion** (`wc_frame_yield`) | **Bug** in the web host, which stubbed the import and hung the tab on the first frame. The mechanism itself is a **necessity**: an engine that owns its main loop cannot return a frame without it. | No. Unwinding the stack requires host cooperation. |
+| **Text input** (`wc_on_text`) | **Necessity.** Scancodes are key positions, not characters: `Shift+2` differs by layout and `é` has no scancode. | No. Deriving characters from scancodes means reimplementing every keyboard layout, and non-Latin input stays impossible. |
+| **Optional manifest** | **Bug.** Manifest fields double-gated capabilities the cart already declared, so a mismatch silently dropped input with nothing logged. | No. |
+| **Lifecycle** (`wc_on_suspend`, …) | **Mixed.** Suspension itself is host-owned and needs no cart cooperation. The callbacks are a **convenience** -- pausing audio, dropping a netplay connection, flushing a save before a backgrounded app is killed. The clock rebase they enable is a refinement over the clamp, not a replacement for it. | Partly. A cart cannot detect suspension, but it also does not have to: the host simply stops calling it. |
+| **WebGPU tier** (optional) | **Necessity.** GL ES 3.0 has no compute and no storage buffers, and the engines moving past GL (Defold's WebGPU adapter, three.js WebGPURenderer) target WebGPU. | No. The GPU is reached only through the host. Kept to the import set Emscripten's own port already emits, plus one host-info bit for dual carts. |
+| **Rumble** (`wc_pad_rumble`) | **Additive.** Nothing is broken without it. Included because it is table stakes on every console, and maps 1:1 onto SDL and the W3C haptics API with no per-platform divergence. | No -- but nothing breaks in its absence either. |
+| **Asset prefetch** (`wc_asset_prefetch`) | **Necessity.** On the web an asset read is a download, and the asset ABI is synchronous: a streamed world stalls a frame on every cell it loads. JSPI hides the wait from the cart's code, not from the frame. | No. A cart cannot start a fetch; only the host reaches the network, and only the host can hold bytes the cart has not asked for yet. |
+
+Deliberately **not** added, as examples of what fails the bar: IME preedit state
+(large surface, every host must plumb composition through, cart must render it)
+and host-owned text fields (dictates editing behaviour and fights a cart drawing
+its own UI). Both were considered and rejected.
+
+Every entry above is optional: a cart that exports and imports none of them runs
+unchanged.
+
+---
+
+## Manifest
+
+**The manifest is OPTIONAL.** A cart with no `manifest.json` runs: every field
+has a default, and `entry` defaults to `cart.wasm`. A host MUST NOT refuse a
+cart for lacking one.
+
+**A manifest field never gates a capability the cart declares about itself.**
+The cart's `wc_info_t.flags` and its wasm import section are the ground truth,
+and both are visible to the host without the packager's cooperation. Requiring
+the manifest to *also* say yes creates a capability that is on in one place and
+off in the other, whose failure mode is silence: the cart loads, the feature
+does nothing, and no error is reported anywhere. That is the worst outcome
+available, and it has now been fixed twice — once for GL detection, once for
+pointer and keyboard input.
+
+So the manifest carries only what the cart cannot state for itself:
+
+- **Deployment policy** the packager decides, not the code — the network
+  allowlist above all. A cart asserting its own permission to reach any host
+  would defeat the point of having one.
+- **Presentation hints** a launcher wants before instantiation, like
+  `width`/`height` (see Resolution) — advisory, never binding.
+- **Human metadata**: `name`, `title`, `version`, `description`, `author`, and
+  the cart's `art` (its icon, cover, screenshots: see below) for a launcher
+  to show before the cart runs.
+
+**A host MUST ignore any manifest field it does not know, and any unknown key
+inside an object it does know** (`net`, `art`, a screenshot entry). Every
+field is optional, so a cart that carries a field from a later revision runs on
+an earlier host exactly as if the field were absent, and a cart without it runs
+on a later host unchanged. A packer MAY warn about a field it does not know
+(likely a typo) but MUST NOT refuse to pack it.
+
+```json
+{
+  "name": "Game Name",
+  "version": "1.0.0",
+  "abi": 4,
+  "entry": "cart.wasm",
+  "players": 4,
+  "net": {
+    "domains": ["api.mygame.com", "leaderboard.example.com"]
+  }
+}
+```
+
+### Fields
+
+**`players`** (integer, optional, default: 1)
+- How many gamepad inputs the game uses (1-4)
+
+**`controls`** (array of strings, optional)
+- Which parts of the standard pad the game actually reads. The pad ABI is
+  always the full Xbox-360-style `wc_pad_t` — every button and axis is
+  delivered whether declared or not. This field is a **presentation hint** in
+  the same class as `width`/`height`: a host drawing on-screen touch controls
+  uses it to show only what the game needs, and every other host ignores it.
+  Advisory, never binding, never gating. From the cart's side NOTHING changes
+  either way: the host still writes the full struct every frame, and a
+  control the UI chose not to draw simply never changes -- indistinguishable
+  from a player who never touches it. Carts MUST NOT try to detect or adapt
+  to the hint.
+- Tokens (mirroring `wc_pad_t`): `dpad`, `a`, `b`, `x`, `y`, `l`, `r`,
+  `start`, `select`, `left_stick`, `right_stick`, `left_trigger`,
+  `right_trigger`, `l3`, `r3`. Unknown tokens MUST be ignored (forward
+  compatibility).
+- Omitted: hosts SHOULD assume the retro default set
+  `["dpad","a","b","x","y","start","select","l","r"]` (sticks and triggers
+  only appear when declared).
+- Empty (`[]`): the game reads no pad on a touchscreen; it plays by touch
+  through the pointer (a puzzle game that swaps tiles under the finger, a
+  game that drags to aim). Hosts MUST NOT draw on-screen pad controls for it.
+  This is the only way a cart turns the on-screen pad off: `WC_FLAG_POINTER`
+  says the cart reads the pointer, not that it has no use for a pad, and
+  hosts MUST NOT hide on-screen controls because of it.
+- **The host draws the on-screen pad; a cart never draws its own.** A cart
+  that wants touch play declares the pad controls it reads and lets the host
+  draw them, so every game gets the same placement, sizing, haptics and
+  player settings (hide, move, resize), and the same cart runs unchanged
+  where there is no touchscreen. Touch as gameplay (tapping or dragging in
+  the game's own picture) is pointer input, not a pad, and is the cart's to
+  handle.
+- A host that draws `left_stick` or `right_stick` SHOULD deliver analog
+  values (the stick's deflection), not only the eight directions.
+- Examples: a two-button platformer ships `["dpad","a","b","start"]`; a twin-
+  stick shooter ships `["left_stick","right_stick","a","start"]`; declaring
+  both `dpad` and `left_stick` is allowed and means the game reads either; a
+  match-three game played by tapping ships `[]`.
+- `wasmcart-pack --controls dpad,a,b,start` writes it (repeatable or
+  comma-separated; unknown tokens warn at pack time but still pack, since
+  hosts tolerate them by rule); `--controls none` writes `[]`.
+
+**`files`** (array of strings, optional)
+- Every asset path, relative to the asset prefix (`assets`, default
+  `assets/`). It exists for ONE case: a cart directory served over HTTP (see
+  Cart directories), where a web host has no way to list the directory and so
+  no other source for `_filelist.txt`. Wherever the host can enumerate the
+  assets itself -- a `.wasc` (the zip index) or a local directory -- the real
+  listing wins and this field is ignored.
+- Optional at every layer: no host requires it, a cart runs without it, and
+  without it only `_filelist.txt` is missing (`-1`) on the web. Sizes and
+  loads never need it. Most carts never read `_filelist.txt` at all.
+- Generated, not hand-written: `wasmcart index <dir>` writes it (`--check`
+  verifies, `--remove` drops it), and `wasmcart-pack --files` records it in
+  an archive so the archive can be unzipped and served as a directory. A host
+  loading a local directory whose `files` disagrees with the directory SHOULD
+  warn, naming the files: a stale list only fails once deployed, as files that
+  load by name but are missing from the listing.
+
+**`title`** (string, optional)
+- The game's name as people should read it ("Tux Racer"), for a launcher's
+  list, a frontend's game name and a window title; `name` stays the cart's
+  short id. A **presentation hint** like `description`: advisory, never
+  gating. A host without it falls back to `name`. Keep it under 64
+  characters; a host MAY cut a longer one.
+- Not `art.title`, which is the title-screen picture.
+
+**`description`** (string, optional)
+- What the game is, in a sentence or two of plain text, for a launcher's
+  details pane. Keep it under 300 characters; a host MAY cut a longer one.
+
+**`author`** (string, optional)
+- Who made the cart: a person, a team or a studio, as it should be credited.
+
+**`art`** (object, optional)
+- Pictures of the cart for a launcher, a library or a frontend to show before
+  or without running it: the icon on a home screen, the cover in a grid, the
+  screenshots in a details pane. A **presentation hint** in the same class as
+  `width`/`height` and `controls`: advisory, never binding, never gating.
+- Each value is a path relative to the archive's root, validated like
+  `entry` (no absolute path, no `..`), to a **PNG or JPEG** file in the
+  archive. Put them under `art/`, outside the asset prefix: the cart never
+  loads them, and they stay out of `_filelist.txt`.
+- A host MUST NOT refuse, delay or change a cart because its art is missing,
+  unreadable or the wrong size; it SHOULD fall back to what it shows without
+  art (the name). A host that shows art reads it from the archive without
+  instantiating the cart.
+- Keys (all optional; unknown keys are ignored):
+
+| key | what it is | shape | at least |
+|---|---|---|---|
+| `icon` | the app icon on a home screen or in a list | square; PNG may be transparent; keep the subject inside the centred circle of 80% of the width, since a host may mask it to a circle or a rounded square | 256 x 256 (512 recommended) |
+| `cover` | box art: the game's picture with its name on it | portrait 2:3 | 600 x 900 |
+| `background` | key art with **no text**, for a launcher to draw the name or the `logo` over | landscape 16:9 | 1920 x 1080 |
+| `logo` | the game's name as the game draws it, on a **transparent** background | PNG, wider than tall | 1280 wide or 720 tall |
+| `title` | the title screen, as the game shows it | the cart's own aspect, usually 16:9 | the cart's resolution |
+| `screenshots` | an array of `{ "path": ..., "label": ... }`: play as the game shows it; the first is the one to show when there is room for only one; `label` is a short description for screen readers and captions | the cart's own aspect | the cart's resolution |
+
+```json
+"art": {
+  "icon": "art/icon.png",
+  "cover": "art/cover.jpg",
+  "background": "art/background.jpg",
+  "logo": "art/logo.png",
+  "title": "art/title.png",
+  "screenshots": [
+    { "path": "art/shot-1.png", "label": "Three ships trading broadsides at dusk" }
+  ]
+}
+```
+
+- JPEG suits the large, painted pictures (`cover`, `background`); PNG suits
+  the icon, the logo (it needs transparency) and screenshots of flat art.
+- Frontends that keep art in folders by game name map onto these keys:
+  libretro's thumbnails take `cover` as `Named_Boxarts`, the first
+  screenshot as `Named_Snaps` and `title` as `Named_Titles`; ES-DE's media
+  folders take `cover` as `covers`, `screenshots` as `screenshots`,
+  `title` as `titlescreens`, `logo` as `marquees` and `background` as
+  `fanart`.
+- `wasmcart-pack --art <dir>` writes it (see the README).
+
+**`pointer`** / **`keyboard`** — **REMOVED.** These were the double gate
+described above: the cart set `WC_FLAG_POINTER`/`WC_FLAG_KEYBOARD` and the
+manifest had to independently agree, or input was silently dropped. The flag
+alone now governs. Hosts MUST ignore these fields if present in an older
+manifest; carts MUST NOT rely on them.
+
+**`debug`** — **REMOVED** (same doctrine as `pointer`/`keyboard` above: a
+manifest field never gates a capability the cart declares about itself, and
+nothing ever read this one). The debug surface is governed entirely by the
+cart: `WC_FLAG_DEBUG` in `wc_info_t.flags` plus the `wc_debug_state()` export
+(see [Debug state](#debug-state)). A cart without the flag exports no debug
+surface and is byte-for-byte a non-debug cart — structurally absent, not
+merely inert — and debug state is read PULL-ONLY (on host demand), never per
+frame, so exposing fields costs nothing at runtime.
+
+**`net`** (object, optional)
+- Gates only connections the CART opens. Omitted = `wc_peer_open` always fails;
+  peers the HOST registers still reach the cart (see Peer Connection).
+- Host MAY refuse to provide networking (e.g., offline device) - cart must handle gracefully
+
+**`net.domains`** (array of strings, optional)
+- Domain allowlist for peer connections addressed by URL
+- Host enforces - `wc_peer_open` to an unlisted domain returns -1
+- No wildcards, no raw IPs, no localhost
+- `net.websocket` is the superseded spelling and is still read, so manifests
+  written before the `wc_peer_*` merge keep working
+
+This is a **permission, not a capability declaration**, which is why it lives in
+the manifest rather than in `wc_info_t.flags`. Everywhere else in this ABI the
+cart is the authority on what it wants (see Manifest), but a cart cannot be
+trusted to grant itself network reach: that decision belongs to whoever packaged
+it. So it fails closed - no manifest, or no `net` entry, means the cart cannot
+dial out. (Peers the host itself registers are unaffected: that is the host's
+own decision, not a reach the cart requested.)
+
+Opening a connection requires **both** gates: the cart's `WC_FLAG_NET_PEER`
+(it asked for the imports) **and** a manifest grant covering the address (it is
+allowed to reach that host). Either alone is insufficient.
+
+---
+
+## Exports (cart provides)
+
+```c
+wc_info_t* wc_get_info(void);  // returns cart info struct
+void wc_init(void);             // called once at startup
+void wc_render(void);           // called every frame
+```
+
+Optional (opt-in via a flag, absent by default):
+
+```c
+wc_debug_field_t* wc_debug_state(void);  // WC_FLAG_DEBUG carts only
+void wc_set_seed(uint32_t seed);         // host calls it whenever exported, BEFORE
+                                         // _initialize and wc_init: fresh entropy on a
+                                         // normal load, the pinned seed on a
+                                         // deterministic run (see Deterministic replay)
+void* wc_alloc(size_t size, size_t align); // memory the host writes into; see
+void  wc_free(void* ptr);                  // "Cart memory the host writes"
+```
+
+---
+
+## Imports (host provides)
+
+```c
+// Logging
+void wc_log(const char* ptr, uint32_t len);
+
+// Assets (v2+)
+int32_t wc_asset_size(const char* path, uint32_t path_len);
+int32_t wc_load_asset(const char* path, uint32_t path_len, void* dest, uint32_t max_size);
+// Asset prefetch (additive to v4; hosts that implement it set WC_HOST_FLAG_ASSET_PREFETCH)
+int32_t wc_asset_prefetch(const char* path, uint32_t path_len, int32_t priority);
+void    wc_asset_prefetch_cancel(const char* path, uint32_t path_len);
+
+// Rumble (v3) - see Rumble
+uint32_t wc_pad_has_rumble(uint32_t pad_id);
+void wc_pad_rumble(uint32_t pad_id, float low, float high, uint32_t duration_ms);
+void wc_pad_rumble_stop(uint32_t pad_id);
+
+// GL (~100 functions, optional, imported from "gl" module)
+void glClear(uint32_t mask);
+// ... etc
+```
+
+**GL surface (normative):** the `gl` module is **OpenGL ES 3.0 C signatures
+with WebGL2 semantics** — the same profile on every host; see
+[docs/gl-surface.md](docs/gl-surface.md) for the full surface (shader
+versions, texture formats, FBO/VAO rules). **GL detection:** a cart *is* a GL
+cart iff its wasm import section imports from the `gl` module — the import
+section is the ground truth a host can read before instantiation; the
+`gpu_api` field confirms it after `wc_get_info` (a manifest field never gates
+GL). Hosts SHOULD accept `glBackend` as a lazy factory (invoked once, only
+for GL carts) so launchers need no advance knowledge of what they're loading.
+
+**Hosts MUST be able to supply a GL context.** GL is part of the host
+contract, not an advertised capability: a cart author writes against the
+guarantee that any conformant host can run a cart importing `gl`. Most carts
+never import it and no context is ever created — that is what the lazy factory
+is for — but a host that cannot produce one when asked is not conformant.
+
+A host SHOULD satisfy this itself rather than requiring its embedder to. A
+browser host can always create a WebGL2 context (offscreen or on a detached
+canvas); a native host links a GL provider and creates one on demand. `glBackend` then means "render
+into THIS context instead of one you make" — an override for the common case
+of drawing into an on-screen canvas — not the host's only source of GL.
+
+Consequently, loading a GL cart without a usable context is a load **error**,
+never a silent stub, and there is no opt-out flag. This covers BOTH a factory
+that returns nothing AND no `glBackend` passed at all; the two are the same
+failure. Stubbing is prohibited because it is undetectable from the cart's
+side: every GL call succeeds, `load()` reports success, and the frame is
+blank — indistinguishable from a broken cart.
+
+## Cart memory the host writes
+
+**Why.** A few host calls must hand the cart bytes at an address the *host*
+picks, not one the cart passed in:
+
+- GL: `glGetString` and `glGetStringi` return a pointer to a string;
+  `glMapBufferRange` returns a pointer to the mapping.
+- WebGPU: the glue writes adapter info, feature lists and shader compilation
+  messages, mapped buffer ranges (`wgpuBufferGetMappedRange` /
+  `GetConstMappedRange`), and the strings passed to callbacks (error
+  messages, device-lost reasons).
+- Text input and peers: `wc_on_text`, `wc_peer_on_connect` and
+  `wc_peer_on_message` receive `(ptr, len)`.
+
+The host owns none of the cart's memory, so it asks the cart to allocate.
+
+**The contract.** Two optional exports:
+
+```c
+void* wc_alloc(size_t size, size_t align);  // 0 on failure; align is a power of two
+void  wc_free(void* ptr);                   // ptr from wc_alloc; 0 is ignored
+```
+
+They are optional: a cart needs them **only if it reaches one of the paths
+above**. A 2D cart, or a GL cart that never calls glGetString, glGetStringi
+or glMapBufferRange and takes no text or peer payloads, runs without them. In
+practice every WebGPU cart should have them: adapter info, mapping and any
+error message go through them, so the WebGPU toolchains below always provide
+them.
+
+**You don't write them.** `wasmcart.h` defines both
+over `aligned_alloc`/`free` and exports them, for Emscripten and wasi-sdk
+alike, with no linker flags. They are weak: a cart that defines its own wins.
+`WASMCART_NO_ALLOC` leaves them out; a cart with no libc gets none and exports
+its own if it needs them. wasi-sdk WebGPU carts get them from
+`wgpu-wasi/` (`wasmcart_wgpu_wasi()`), and Rust carts from the
+`wasmcart-alloc` crate (`rust/wasmcart-alloc`). A hand-rolled cart exports
+`wc_alloc` and `wc_free` under those names.
+
+**Alignment.** The host asks for what it needs: 1 for strings and payloads,
+16 for mappings and WebGPU structs. The returned pointer must honour it.
+
+**Lifetime and ownership.**
+
+| Block | Allocated | Freed |
+| --- | --- | --- |
+| glGetString / glGetStringi string | once per distinct string, on first call | never (GL strings are static) |
+| glMapBufferRange mapping | at map | by the host with `wc_free`, at `glUnmapBuffer` |
+| text / peer payload | before the callback | by the host with `wc_free`, when the callback returns (the pointer is valid only during the call: copy what you keep) |
+| WebGPU callback string | before the callback | by the host with `wc_free`, when the callback returns |
+| WebGPU mapped range | at `Get(Const)MappedRange` | by the host with `wc_free`, at `wgpuBufferUnmap` |
+| WebGPU adapter info, features, compilation info | when the cart asks | by the cart, through the matching `wgpu*FreeMembers`, which calls `free()` |
+
+That last row means: in a WebGPU cart, `wc_alloc` must return memory C's
+`free()` accepts. wasmcart.h's does.
+
+**Bounds checks.** The host checks every pointer the cart returns before
+writing through it: it must be non-zero, aligned as asked, and `ptr + size`
+must lie within the cart's memory (measured after the call, which may have
+grown it). Anything else is an error, never a write.
+
+**Errors.** A failure is an error the cart does not survive, naming the call
+that needed memory:
+
+- no allocator: `wasmcart: glGetString must write into the cart's memory, but
+  the cart exports no allocator. Export wc_alloc(size, align) and wc_free(ptr):
+  wasmcart.h defines them for C/C++ ...`
+- `wc_alloc` returned 0: `... returned 0 (out of memory)`
+- a bad pointer: `... returned 0x..., which is outside its N-byte memory` or
+  `... which is not 16-byte aligned`
+
+A synchronous call (glGetString, a mapping, a payload delivered before
+`wc_render`) throws at that call. An allocation inside an asynchronous WebGPU
+callback is reported from the host's next frame. A host never refuses to
+load a cart for lacking an allocator: the error comes at first use, because
+a cart may never reach such a path.
+
+There is no fallback that writes elsewhere. Earlier hosts wrote into the top
+of linear memory when a cart had no allocator; that is the cart's live heap
+(or its statics, in a small cart), and it corrupted carts silently.
+
+**Threads.** The host calls `wc_alloc`/`wc_free` from the thread running the
+cart's entry points (the main thread). In a threaded cart they must still be
+thread-safe against the cart's own allocations on other threads;
+`aligned_alloc` and Rust's global allocator are.
+
+**Only `wc_alloc`/`wc_free`.** A cart's `malloc`, `memalign` or `free`
+exports (Emscripten links export them) are never used: a cart that exports
+`malloc` but not `wc_alloc` is a cart without an allocator, and gets the
+same error at first use.
+
+---
+
+## WebGPU
+
+An **optional** second GPU tier, for carts that need what GL ES 3.0 lacks:
+compute shaders, storage buffers, a modern engine's renderer. GL stays the
+universal tier: every conformant host must run a `gl` cart, while WebGPU is a
+capability a host may lack. Nothing below changes `wc_info_t`, `wc_pad_t` or
+any existing import, and no cart that does not import WebGPU is affected.
+
+### What a WebGPU cart is
+
+A cart that imports WebGPU functions: any function import, from module `env`
+or `wgpu`, named `wgpu*` or `emwgpu*` (followed by an upper-case letter) or
+`emscripten_webgpu_*`. As with GL, the import section is the ground truth and
+is readable before instantiation; `gpu_api = 2` declares it after
+`wc_get_info`.
+
+The import surface is **frozen**: it is the one produced by Dawn's
+`emdawnwebgpu` Emscripten port at release **v20261002.154047** (Dawn revision
+`b1236a9b`). A cart links that port (`--use-port=.../emdawnwebgpu.port.py`,
+standalone wasm) and writes plain `webgpu.h`; the host supplies the
+JavaScript half of the port, generated from the same release
+(`scripts/build-wgpu-glue.mjs`, pinned with its SHA-256 in
+`scripts/wgpu/emdawnwebgpu.json`). Later releases may only add functions.
+A cart importing a WebGPU function the host's glue lacks is refused at load,
+naming the functions. See [docs/webgpu.md](docs/webgpu.md) for building one.
+
+The definition is the import set, not the compiler: a wasi-sdk cart that
+compiles the same port's C++ half (with the small support in `wgpu-wasi/`,
+which also exports the functions the glue calls back into, listed in
+`wgpu-wasi/exports.txt`) is the same kind of cart and runs on the same hosts.
+
+### The host owns the GPU
+
+- **Device.** The host creates the adapter and device. `emscripten_webgpu_get_device()`
+  returns that device synchronously, from `wc_init` on. It is made with no
+  required features and the default limits of its adapter's feature level:
+  core where the adapter has it, else compatibility mode, the tier's floor
+  (below). A cart must not depend on the higher level unless it checks for
+  it. The device has no uncaptured-error
+  or device-lost callback the cart can see: see
+  [docs/webgpu.md](docs/webgpu.md), "Errors and device loss", for what each
+  host does today. A host whose device is lost while the cart runs stops
+  calling `wc_render` (the cart cannot continue on it) and reports the loss
+  to its embedder or user rather than presenting black frames.
+- **More features or limits.** A cart that needs them asks with
+  `wgpuInstanceRequestAdapter` / `wgpuAdapterRequestDevice` and its required
+  features and limits, and gets a device made for exactly that request, or a
+  failure if the hardware cannot meet it, as in a browser. A request the
+  host's device already satisfies returns that device. Optional features,
+  timestamp queries among them, are off unless requested.
+- **Presenting.** The cart renders into the surface it creates from
+  `WGPUEmscriptenSurfaceSourceCanvasHTMLSelector` with the selector
+  `"#canvas"`: it configures that surface once (its own size, any format the
+  surface reports) and takes `wgpuSurfaceGetCurrentTexture()` each frame.
+  The cart MUST NOT call `wgpuSurfacePresent`. Behind `"#canvas"` is a texture
+  the host owns, the WebGPU counterpart of the GL redirect FBO: after
+  `wc_render` returns the host presents it, scales it into a window, or reads
+  it back. As with a browser canvas, each frame's texture is fresh; a cart
+  must not depend on last frame's contents.
+- **Adapter choice** is the host's. A cart can read which adapter it got
+  (`wgpuAdapterGetInfo`, `wgpuDeviceGetAdapterInfo`).
+
+### Feature level: core where offered, compatibility mode is the floor
+
+Hosts SHOULD give a cart a **core** device where the adapter offers one, and
+MUST otherwise offer a **compatibility-mode** device (`featureLevel:
+"compatibility"`, the GLES 3.1 / D3D11 class), if the GPU has one, rather than
+refuse the cart or drop a dual cart to GL. A core device lets an HDR scene
+multisample and a depth texture be read directly.
+
+**A cart reads the level** with
+`wgpuDeviceHasFeature(device, WGPUFeatureName_CoreFeaturesAndLimits)`, once in
+`wc_init`, and does not use what compatibility mode lacks unless that says yes.
+A cart that cannot run without core WebGPU requests the
+`core-features-and-limits` feature, and runs only where that is available.
+
+**Every cart that does not request core must run in compatibility mode**, which
+restricts, among others: one texture binding view dimension per texture, no
+cube-array views, no layer-subset bindings, identical blend state across colour
+attachments, no `sample_mask`, no storage buffers in the vertex stage, 4 colour
+attachments and 4096-texel textures. A core device does not enforce these, so a
+cart is tested against them by forcing the floor: a host SHOULD offer a way to
+(the reference hosts: `adapterOptions: { featureLevel: 'compatibility' }`, and
+`WASMCART_WGPU_FEATURE_LEVEL=compatibility` on Node hosts), and Dawn then
+enforces them on every backend.
+
+### Asynchronous results
+
+WebGPU's asynchronous operations (buffer mapping, error scopes, work-done,
+async pipeline creation, compilation info) complete through callbacks, and
+**a host delivers them only between frames, on its event loop, never inside
+`wc_render` or `wc_init`**. Use `WGPUCallbackMode_AllowSpontaneous` or
+`AllowProcessEvents`. Nothing blocks: timed `wgpuInstanceWaitAny` is not
+supported (the `TimedWaitAny` instance feature is absent), and no Asyncify or
+JSPI is involved. A host that steps several frames without yielding (a test
+harness) delivers them when it next yields; a cart must not assume a result
+arrives on the next frame.
+
+**A host MUST let its event loop run a full turn (a macrotask, not only
+microtasks) at least every 16 frames.** Asynchronous results, and the freeing
+of objects the cart released, depend on it: a loop of `await host.runFrame()`
+never leaves the microtask queue, and GPU memory then grows without bound.
+
+Mapped ranges are copies in the cart's memory (wasm cannot alias GPU
+memory); `wgpuQueueWriteBuffer` and `wgpuQueueWriteTexture` are the fast
+upload path.
+
+### Threads
+
+WebGPU calls are made from the cart's main thread only: `wc_init`,
+`wc_render`, and the callbacks above. A threaded cart's workers (see
+Threads under Security Model) may do anything else, and a worker that never
+calls a WebGPU function is unaffected by the cart importing them. (On the web
+host the main thread may never block on a worker, WebGPU or not: a browser
+traps `Atomics.wait` there.)
+
+### Hosts without WebGPU, and carts with both APIs
+
+| Cart imports | Host without WebGPU | Host with WebGPU |
+| --- | --- | --- |
+| `gl` only | GL | GL |
+| WebGPU only | **load error, with the reason** | WebGPU |
+| `gl` and WebGPU | GL | WebGPU |
+
+- A host that cannot provide WebGPU (none built in, no adapter, disabled by
+  its embedder) MUST refuse a WebGPU-only cart at load with a message saying
+  so. It MUST NOT stub WebGPU imports: a stubbed GPU call returns 0 and the
+  cart renders nothing with no error anywhere.
+- A **dual cart** imports both, so one binary runs on every host. Before
+  `wc_init` the host writes `WC_HOST_FLAG_GPU_WGPU` (`0x02`) into
+  `wc_host_info_t.flags` if it selected WebGPU, and leaves it 0 for GL. The
+  cart reads the bit once in `wc_init` and uses only that API. The host binds
+  every import of the API it did NOT select to a function that throws, naming
+  the call: a cart that ignores the flag fails loudly. Selection is never a
+  per-frame decision; there is still no hybrid mode.
+- `gpu_api` values a cart does not back are refused at load: 2 with no
+  WebGPU imports, and anything above 2 (3, once reserved for Vulkan, is not a
+  tier).
+
+### Determinism
+
+WebGPU output is not bit-identical across backends and drivers. A WebGPU cart
+should not set `WC_FLAG_DETERMINISTIC` for frame hashes; named debug-state
+checkpoints still work, as long as GPU results never feed game state:
+anything a cart reads back from the GPU (a compute result, a mapped buffer)
+is not cross-backend deterministic either.
+
+---
+
+## wc_info_t
+
+```c
+typedef struct {
+    uint32_t version;           // WC_ABI_VERSION (4)
+    uint32_t width;
+    uint32_t height;
+    uint32_t fb_ptr;
+    uint32_t audio_ptr;
+    uint32_t audio_cap;
+    uint32_t audio_write_ptr;
+    uint32_t input_ptr;         // → wc_pad_t[4]
+    uint32_t save_ptr;
+    uint32_t save_size;
+    uint32_t time_ptr;
+    uint32_t host_info_ptr;
+    uint32_t flags;
+    uint32_t audio_sample_rate;
+    // v3 additions
+    uint32_t pointer_ptr;       // → wc_pointer_t[10] (80 bytes), 0 = not used
+    uint32_t keys_ptr;          // → uint8_t[32] key state bitmask, 0 = not used
+    uint32_t gpu_api;           // byte offset 64: 0 = 2D framebuffer,
+                                // 1 = WebGL2/GLES3, 2 = WebGPU (see WebGPU);
+                                // any other value is refused at load
+    // v3.1 addition
+    uint32_t wheel_ptr;         // byte offset 68: → wc_wheel_t (8 bytes),
+                                // 0 = not used
+} wc_info_t;
+```
+
+### Flags
+
+```c
+#define WC_FLAG_AUDIO_F32   0x01  // audio ring buffer uses float32
+#define WC_FLAG_NET_PEER    0x02  // cart wants peer-connection imports
+                                  // 0x04 RESERVED AND UNUSED (was WC_FLAG_NET_DC
+                                  // before the two net families merged; hosts
+                                  // MUST ignore it, carts MUST NOT set it)
+#define WC_FLAG_POINTER     0x08  // cart wants pointer input
+#define WC_FLAG_KEYBOARD    0x10  // cart wants raw keyboard input
+#define WC_FLAG_DEBUG       0x20  // cart exports wc_debug_state() (opt-in, default off)
+#define WC_FLAG_DETERMINISTIC 0x40 // cart honors deterministic mode (opt-in, default off)
+#define WC_FLAG_HOST_THREADS  0x80 // cart's wc_host_info_t has hardware_threads (24 bytes)
+```
+
+Host-info flags (`wc_host_info_t.flags`, written by the host BEFORE `wc_init`,
+read by the cart ONCE at init — never per frame):
+
+```c
+#define WC_HOST_FLAG_DETERMINISTIC 0x01  // this run is a deterministic replay
+#define WC_HOST_FLAG_GPU_WGPU      0x02  // the host selected WebGPU for a cart
+                                         // importing both GPU APIs (see WebGPU)
+#define WC_HOST_FLAG_ASSET_PREFETCH 0x04 // the host implements wc_asset_prefetch (see Asset prefetch)
+```
+
+### wc_host_info_t
+
+The cart owns this struct (at `host_info_ptr`); the host writes it once,
+before `wc_init`, and the cart reads it during `wc_init`.
+
+```c
+typedef struct {
+    uint32_t preferred_width;   // byte offset 0: the host's preferred size, 0 = none
+    uint32_t preferred_height;  // 4
+    uint32_t _reserved0;        // 8: unused (was host_fps; read wc_time_t.delta_ms).
+                                //    Some hosts still write a frame rate here: ignore it
+    uint32_t audio_sample_rate; // 12
+    uint32_t flags;             // 16: WC_HOST_FLAG_*
+    // only with WC_FLAG_HOST_THREADS
+    uint32_t hardware_threads;  // 20: the host machine's hardware threads, 0 = unknown
+} wc_host_info_t;
+```
+
+**`hardware_threads`** is the number of hardware threads (logical CPUs) the
+host machine offers the process running the cart: Node's
+`os.availableParallelism()`, the browser's `navigator.hardwareConcurrency`,
+`std::thread::hardware_concurrency()` natively. 0 means the host cannot tell.
+A threaded cart sizes its thread pool from it; it is a performance hint, so a
+cart MUST NOT let it change its results (deterministic carts above all).
+
+A cart built before this field has a 20-byte struct, and the four bytes after
+it are its own memory. So the field is written **only** when the cart sets
+`WC_FLAG_HOST_THREADS` in `wc_info_t.flags`, declaring a 24-byte struct; a host
+writes nothing at offset 20 otherwise. A cart that sets the flag and runs on a
+host that predates it reads the 0 it initialised the field with: unknown.
+`wc_cart.h`'s `WC_FILL_INFO` sets the flag, since its `wc_host_info_t` is the
+24-byte one.
+
+---
+
+## Text input
+
+For name entry, chat, seeds -- anywhere the player types **characters** rather
+than pressing game buttons.
+
+The raw keyboard ABI reports HID scancodes, which are physical key positions,
+not characters. `Shift+2` is `@` on a US layout and something else on many
+others; `é` has no scancode at all. Rather than have every cart reimplement
+keyboard layouts, the host delivers text the platform has already composed --
+layout, shift, dead keys, compose sequences and IME commits all applied.
+
+```c
+// Cart export (optional)
+void wc_on_text(const char* utf8, uint32_t len);
+
+// Host imports
+void wc_text_input_begin(void);
+void wc_text_input_end(void);
+uint32_t wc_text_input_active(void);
+```
+
+The `utf8` pointer is valid **only for the duration of the call** and is **not
+null-terminated**; a cart MUST copy what it needs and MUST honour `len`. A
+single call MAY carry several codepoints, since an IME commits a whole word at
+once.
+
+**Text input is off until the cart calls `wc_text_input_begin()`.** A host MUST
+NOT deliver `wc_on_text` before that, and MUST stop on `wc_text_input_end()`.
+A host MAY forward platform text unconditionally and let the gate drop it,
+which is what makes a cart that never asks for text immune to it.
+
+**A host MUST discard text queued but not yet delivered when the cart calls
+`wc_text_input_end()`.** Otherwise what the player typed into one field
+reappears in the next field they open, which reads as a ghost keystroke.
+
+**While text input is active, a host SHOULD suppress its own key bindings and
+gameplay key delivery.** Typing `q` into a name field must not quit, and `w`
+must not also walk the player forward. A host that suppresses key events this
+way MUST also release keys already held at the transition, or they stick down
+for as long as the field is open.
+
+On platforms with an on-screen keyboard, `wc_text_input_begin` / `end` is the
+signal to raise and dismiss it.
+
+Editing keys stay on the keyboard ABI: backspace, arrows and enter are key
+presses rather than characters, so a cart drawing its own text field reads
+those through `wc_kb_on_down` and appends characters from `wc_on_text`.
+
+## Input actions
+
+Steam Input style. A cart declares **actions** ("Jump", "Steer") instead of
+reading buttons, and the host owns which physical input drives each one: its
+defaults, the user's remaps, the device in hand. The host can then tell the
+cart what an action is on, so prompts read "Press [Cross] to Jump" on a
+PlayStation pad and "Press [Space] to Jump" on a keyboard, and the host's own
+remap or help screens can name actions instead of pad positions.
+
+**Optional for carts, required of hosts.** A cart that never calls these
+imports is unaffected and reads `wc_pad_t` as before. Every host provides all
+of them, so a cart that uses them always instantiates; a host that cannot know
+an answer gives "unknown".
+
+```c
+// Declaring (any time; usually wc_init). Names are UTF-8, 1-64 bytes; the host copies.
+int32_t  wc_action_set_add(const char* name, uint32_t len);   // set id, -1 refused
+int32_t  wc_action_add(int32_t set, int32_t kind, int32_t default_input,
+                       const char* name, uint32_t len);       // action id, -1 refused
+void     wc_action_set_activate(int32_t player, int32_t set);
+
+// State, this frame
+int32_t  wc_action_digital(int32_t player, int32_t action);   // 0 / 1
+int32_t  wc_action_analog(int32_t player, int32_t action, float* xy); // writes x, y; returns 1 if nonzero
+
+// Origins
+int32_t  wc_action_origin(int32_t player, int32_t action, char* buf, uint32_t cap);
+int32_t  wc_action_glyph(int32_t player, int32_t action);
+int32_t  wc_input_device(int32_t player);
+uint32_t wc_input_revision(void);
+```
+
+**Declaring.** `kind` is 0 digital or 1 analog. `default_input` is a logical
+pad input: 0-20 the `WC_BTN_*` bit indexes, 32 left stick, 33 right stick, 34
+left trigger, 35 right trigger, 36 d-pad, or -1 none. Sets and actions are
+numbered from 0 in declaration order. Declaring the same name again returns the
+same id (the same set, kind and default input; otherwise -1). Limits: 16 sets,
+64 actions. Every player starts in set 0. Declarations last for the life of the
+instance, including across save-state restores.
+
+**State.** An action outside the player's active set, or unbound, reads 0.
+Otherwise it reads its bound input: a button gives 1 (analog x = 1); a stick
+gives x, y in -1..1 (y down, as in `wc_pad_t`); a trigger gives x in 0..1; the
+d-pad gives x, y in {-1, 0, 1}. A digital action is on when its value's
+magnitude is at least 0.5. **With no remap an action's value is its default
+pad input,** so a cart behaves the same on every host. A host replaying
+deterministically uses the same bindings as the recording.
+
+**Origins.** `wc_action_origin` writes a short UTF-8 label ("Space", "A",
+"Cross", "RT", "Left Stick") into `buf`, truncated to `cap - 1` bytes on a
+codepoint boundary and NUL-terminated, and returns the full length; `0` means
+unbound on the player's current device (hide the prompt), `-1` means the host
+does not know. `buf` may be NULL with `cap` 0 to ask only. `wc_action_glyph`
+returns `(family << 8) | element`, or 0 for none: family 1 Xbox, 2
+PlayStation, 3 Nintendo, 4 other gamepad (element: the logical input, i.e. the
+button's position; Nintendo's south button is labelled B), 5 key (element: HID
+scancode, or 0; draw the label), 6 mouse (0 left, 1 right, 2 middle, 3 wheel,
+4 motion), 7 touch (0 tap, 1 drag, 2 on-screen button). `wc_input_device`
+returns the device the player used last: 0 unknown, 1 keyboard and mouse, 2
+gamepad, 3 touch, 4 remote. Origins are answered for any action, active set or
+not.
+
+**Host rules.** Answers reflect the binding in effect, after remaps.
+`wc_input_revision` is never 0 and changes no later than the next frame after
+anything that could change an answer (device switch, pad plugged in or
+replaced, remap). A host never guesses: unsure is `-1`. These imports are
+main-thread state; called from a thread they answer unknown (`-1`, 0).
+
+**Carts** re-read prompts when the revision changes, not every frame, and fall
+back to their own names when the answer is unknown. `wasmcart.h` wraps this:
+`wc_action_label(player, action, default_input)` returns a printable string.
+
+## Frame timing and the delta clamp
+
+`wc_time_t.delta_ms` is the time since the last rendered frame, so **a host MUST
+clamp it**. Any stall inflates it -- a GC pause, a slow disk read, a debugger
+breakpoint, a throttled background tab -- and a cart integrating velocity by dt
+moves a stall's worth of distance in one step, straight through whatever it
+should have collided with. This is the same cap every engine applies (Unity's
+`maximumDeltaTime`, Unreal's Max Physics Delta Time).
+
+The reference hosts clamp at **250ms** (4fps): slow enough that no real frame
+reaches it, fast enough that it never fires during normal play.
+
+**A host MUST keep `time_ms` consistent with the deltas it delivered.** If
+`time_ms` advanced by the full stall while `delta_ms` was clamped, a cart
+summing deltas and a cart reading `time_ms` would disagree by the length of the
+stall and drift apart for the rest of the session. `time_ms` MUST NOT run
+backwards.
+
+A deterministic fixed step (see Deterministic replay) is NOT clamped: a harness
+setting a step is stating the delta it wants, and clamping it would silently
+break reproducibility for any step above the cap.
+
+The clamp is the general guard. Lifecycle `resume()` additionally rebases the
+clock for stalls the host *knows* about, so a genuine suspend costs the cart no
+phantom time at all -- but the clamp is what protects a cart from the stalls
+nothing reports.
+
+## Lifecycle
+
+Four optional cart exports. A cart MAY export any subset; the host skips those
+it does not find.
+
+```c
+void wc_on_suspend(void);       // host is about to STOP calling wc_render
+void wc_on_resume(void);        // host is about to start calling it again
+void wc_on_focus_lost(void);    // still running, no longer the active window
+void wc_on_focus_gained(void);  // active window again
+```
+
+**Suspension is host-owned.** While a cart is suspended the host MUST NOT call
+`wc_render()`. This is what makes the callbacks optional in practice: a cart
+that exports none of them is still correct under suspension, because it is
+simply not running. A cart handles lifecycle to be polite -- pause audio, drop a
+netplay connection, flush state -- never to be correct.
+
+**Suspend and focus are distinct, deliberately.** Hiding a tab or minimizing a
+window suspends; alt-tabbing only moves focus, and a focused-but-not-suspended
+cart keeps rendering. Conflating them means a game either cannot auto-pause on
+alt-tab, or wrongly freezes when it should still be drawing.
+
+**The host SHOULD rebase the clock across a suspend.** The delta clamp (see
+Frame timing) already prevents a suspended gap from reaching the cart as a giant
+time step, so this is a refinement rather than the protection: rebasing means a
+*known* suspension costs the cart no phantom time at all, where the clamp alone
+leaves it one clamped frame. `time_ms` MUST stay continuous either way, since it
+measures time the cart has been *running*.
+
+**Ordering is guaranteed.** Suspending emits `wc_on_focus_lost` before
+`wc_on_suspend`; resuming emits `wc_on_resume` before `wc_on_focus_gained`. The
+focus pair is therefore always balanced across a suspend/resume round trip, and
+a cart is never left permanently unfocused. A host resuming into a background
+window drops focus again explicitly afterwards.
+
+**Transitions are idempotent.** Hosts receive duplicate visibility events
+routinely, so a second `suspend()` with no intervening `resume()` MUST NOT
+deliver a second callback.
+
+A host SHOULD treat suspend as a persistence point. A backgrounded application
+can be killed by the OS without ever reaching a graceful quit, so this is often
+the last moment a save can be written.
+
+## Loop inversion (`wc_frame_yield`)
+
+Engines ported from native code usually own their main loop: they call
+`while (running) { ... }` internally and never return. The wasmcart contract is
+the opposite -- the host calls `wc_render()` once per frame and expects it back.
+
+`wc_frame_yield` bridges the two. The cart is post-processed with binaryen's
+asyncify pass (`asyncify-imports=env.wc_frame_yield`) and calls the import once
+per iteration of its own loop. The host unwinds the entire engine stack out of
+`wc_render()`, and on the next `runFrame()` rewinds back to exactly that point.
+From the engine's perspective its loop never stopped; from the host's, every
+frame returned.
+
+A cart using it MUST export `wc_yield_buffer()`, returning a pointer to a
+pre-initialized asyncify stack descriptor (a `{current, end}` pair followed by
+the stack area), plus the four `asyncify_*` functions the pass emits. The host
+resolves the buffer once, after `wc_init()`.
+
+**Hosts MUST provide `wc_frame_yield` explicitly, and MUST NOT satisfy it with a
+generic stub.** A host that stubs unknown imports will link such a cart happily
+and then hang on the first frame: the yield does nothing, so the engine's
+infinite loop never unwinds and `wc_render()` never returns. Because the cart
+loads successfully, this presents as a freeze with no diagnostic. A host that
+stubs unknown imports at all SHOULD warn when it does so, for the same reason.
+
+A cart that does not export the asyncify functions never triggers any of this;
+the import is a no-op for it, and hosts MUST still provide it, since a wasm
+module importing a function the host omits fails to instantiate outright.
+
+## Resolution changes
+
+A cart MAY change its resolution at runtime by writing new `width`/`height` into
+its `wc_info_t`. The host re-reads both after every `wc_render()` and adopts the
+new size for that frame's returned framebuffer.
+
+**The cart MUST grow its framebuffer before enlarging its resolution.** These
+fields live in cart memory, so they are untrusted input: the host MUST verify
+that `fb_ptr + width * height * 4` fits within the cart's memory, and MUST
+reject a change it cannot back, keeping the previous size.
+
+Rejecting rather than clamping is normative, and the reason is that the failure
+is otherwise invisible. Reading the framebuffer with a clamped view succeeds and
+returns a short buffer, so a host that skips this check reports a resolution
+whose pixels do not exist, and every consumer that indexes by the reported width
+reads past the real data. A host MUST guarantee that the frame it reports and
+the bytes it returns agree.
+
+The size computation MUST NOT overflow: `width * height * 4` can exceed 2^32
+(65536x65536 is 17GB, which wraps to 0 in 32-bit math), so a host computing it
+in 32-bit integers would turn an absurd request into a small, plausible one.
+
+A host SHOULD warn on rejection, and SHOULD do so once rather than per frame.
+
+**GPU carts.** For a cart with `gpu_api` 1 or 2 the frame is the GL default
+framebuffer or the WebGPU surface, not `fb_ptr`. Such a cart changes size by
+resizing that (for WebGPU, `wgpuSurfaceConfigure` with the new size) and
+writing the same size into `wc_info_t`; the framebuffer bound check above does
+not apply.
+
+## Debug state
+
+**Opt-in, default OFF.** A cart MAY expose named game state to a host or
+development harness. This is the ONLY sanctioned way to read a cart's values by
+name (there is no symbol table in a shipped WASM cart). It is governed by one
+overriding rule:
+
+> **The debug ABI defaults to ABSENT, not merely inert.** A cart that does not
+> opt in exports no `wc_debug_state`, sets no `WC_FLAG_DEBUG`, and is
+> byte-for-byte identical to a cart built before the debug ABI existed. A host
+> MUST NOT execute any debug work in the per-frame path; debug state is read
+> PULL-ONLY, on demand.
+
+A `debug:true` cart sets `WC_FLAG_DEBUG` in `wc_info_t.flags` and exports
+`wc_debug_state()` returning a pointer to a NUL-terminated array of
+`wc_debug_field_t`:
+
+```c
+typedef struct {
+    uint32_t name_ptr;   // → NUL-terminated field name ("player_x")
+    uint32_t value_ptr;  // → the value in cart memory
+    uint8_t  type;       // WC_DBG_* (see below)
+    uint8_t  _pad[3];
+    uint32_t len;        // element count: scalar=1, array>1, bytes=length
+} wc_debug_field_t;      // 16 bytes; array ends at the first name_ptr == 0
+
+#define WC_DBG_U8 0  #define WC_DBG_I8 1  #define WC_DBG_U16 2  #define WC_DBG_I16 3
+#define WC_DBG_U32 4 #define WC_DBG_I32 5 #define WC_DBG_F32 6  #define WC_DBG_F64 7
+#define WC_DBG_BYTES 8
+```
+
+The host reads this table only when a debug consumer asks (e.g. "read
+`player_x`"), resolves the name to `value_ptr` + `type`, and reads/writes the
+value in cart memory. The cart author names only the handful of values worth
+watching — this is opt-in and author-controlled, not a heap dump.
+
+The `wc_cart.h` SDK provides `WC_DEBUG_FIELDS(...)` (with `WC_DBG` / `WC_DBG_ARR`)
+to emit the table + export in one line, kept SEPARATE from the base `WC_CART`
+boilerplate so a non-debug cart pulls in none of it.
+
+### Debug events (frame annotations + captured log)
+
+**Opt-in, default OFF.** A debug-capable cart MAY import:
+
+```c
+void wc_debug_mark(uint32_t id);  // import "env"."wc_debug_mark"
+```
+
+A call stamps an annotation (`{frame, id}`) into the host's event trace —
+"level loaded", "boss spawned" — so a run or replay is navigable by event.
+Debug-capable hosts additionally capture `wc_log()` lines into the same trace
+(`{frame, text}`); `wc_log` remains the one logging import, there is no
+separate debug-log call. Capture is PULL-drained by the consumer, capped, and
+costs nothing per frame on the host side.
+
+An UNCALLED import is not emitted into the WASM binary, so declaring
+`wc_debug_mark` in a header keeps a cart with no call sites byte-identical
+(governing rule upheld). Play-only hosts MUST still instantiate carts that DO
+call it — provide a no-op stub. The intent remains zero call sites in a
+shipped build (keep marks behind your own debug `#ifdef`).
+
+---
+
+## Deterministic replay
+
+**Opt-in, default OFF — and legitimately NOT universal.** By default a cart
+runs on wall-clock time and whatever entropy it chooses; nothing changes. A
+cart that sets `WC_FLAG_DETERMINISTIC` declares a contract:
+
+- its RNG is seeded ONLY by the host, via the optional export
+  `void wc_set_seed(uint32_t seed)`, which a host calls after instantiation and
+  BEFORE `_initialize`/`wc_init`;
+- all timing comes from `wc_time_t` (no other clock reads);
+- it performs no other nondeterministic host calls during a deterministic run.
+
+The host signals a deterministic run by setting `WC_HOST_FLAG_DETERMINISTIC`
+in host-info flags (written before `wc_init`) and driving a fixed virtual
+clock (`setFixedStep`). Everything is selected ONCE at init: neither side
+checks a determinism flag in the per-frame path.
+
+**Guarantee:** same seed + same input script + fixed step → an identical frame
+sequence. This is what makes golden frame-hash regression testing airtight
+instead of flaky.
+
+**Scale honesty (normative):** large or engine-built carts (threading, GPU
+driver variance, float ordering, asset-load timing) often CANNOT honestly
+promise bit-reproducibility. Such carts simply never set the flag, and that is
+a first-class, supported case — a harness MUST NOT assume replay works for an
+arbitrary cart, and SHOULD fall back to named debug-state checkpoints (see
+Debug state), which work at any size.
+
+**Entropy by default (normative since 0.17.0):** on a NORMAL load a host
+SHOULD call `wc_set_seed` with fresh entropy whenever the export exists — so a
+cart drawing all its randomness from `wc_rand()` deals a different game every
+power-on with zero cart-side effort, and only a deterministic run pins the
+seed. The call happens BEFORE `_initialize` runs static constructors, in both
+modes, so constructor-time RNG is seeded too. A cart without the export is
+seeded by nobody and runs as normal.
+
+The `wc_cart.h` SDK provides `WC_DETERMINISTIC_RNG` (xorshift32 +
+`wc_set_seed` export + `wc_rand()`/`wc_rand_range(n)`), kept SEPARATE from the
+base boilerplate so a non-deterministic cart emits none of it. Pair it with
+`WC_FILL_INFO(WC_FLAG_DETERMINISTIC)`.
+
+---
+
+## Peer Connection
+
+The **only** networking primitive. A cart opens connections to peers, sends and
+receives bytes, and is told when a connection opens or closes. That is the whole
+surface.
+
+Opt-in by setting `WC_FLAG_NET_PEER` in `wc_info_t.flags`. Whether a manifest
+grant is ALSO required depends on who initiates the connection, and the two
+directions are deliberately different:
+
+- **The cart dials out** (`wc_peer_open`) — both gates are required: the flag,
+  and a manifest grant covering the address. The cart is naming a destination
+  the packager may never have anticipated, so it fails closed (see Manifest).
+- **The host registers a peer** — the flag alone. A host that establishes a
+  connection has already made the decision; requiring the packager to write a
+  key permitting the embedder's own action is ceremony, not security. A cart
+  with `WC_FLAG_NET_PEER` and no `net` object at all still receives such peers.
+
+### The transport is opaque
+
+A connection may be a WebSocket to a server, a WebRTC data channel, direct TCP,
+a relay, MQTT, or a serial cable — whatever the host implements. **The cart
+cannot tell and MUST NOT care.** This is what makes a cart portable: the same
+binary runs on a host with a matchmaking service and on a host where the player
+types an IP address.
+
+**There is no client/server split in the ABI.** Which end dialed which is a
+host-side fact. Both ends simply have connections. A cart may of course *behave*
+as a server or a client — that is game logic, expressed in the messages it sends
+— and may hold as many connections as it chooses to accept.
+
+### Addressing
+
+`wc_peer_open` takes a string that **the host interprets**. This spec
+deliberately does not define its grammar. Depending on the host, valid addresses
+might look like `wss://game.example.com/lobby`, `room:ABCD`, `192.168.1.7:9000`,
+or `serial:/dev/ttyUSB0`. A host that does not understand an address, or whose
+manifest grant does not cover that address's transport class, fails the open.
+
+### Cart imports (calls into host)
+
+```c
+// Open a connection. addr is host-interpreted; see Addressing.
+// Returns a connection ID (>= 0), or -1 on failure.
+int32_t wc_peer_open(const char* addr, uint32_t addr_len);
+
+// Close a connection.
+void wc_peer_close(int32_t peer_id);
+
+// Send binary data to one peer. Returns bytes sent, or -1 on error.
+int32_t wc_peer_send(int32_t peer_id, const void* data, uint32_t len);
+
+// Send binary data to every connected peer. Returns peer count, or -1 on error.
+int32_t wc_peer_broadcast(const void* data, uint32_t len);
+
+// Connection state: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+int32_t wc_peer_state(int32_t peer_id);
+
+// Number of currently connected peers.
+int32_t wc_peer_count(void);
+
+// Connection ID at an index (0 to peer_count-1), or -1 if out of range.
+// Lets a cart enumerate peers without tracking on_connect events.
+int32_t wc_peer_id(uint32_t index);
+
+// Write the peer's display name (null-terminated) into dest.
+// Returns bytes written, or -1 if peer_id is unknown.
+int32_t wc_peer_name(int32_t peer_id, char* dest, uint32_t max_len);
+
+// OPTIONAL. Transport properties as a bitmask, or 0 (WC_TRANSPORT_UNKNOWN).
+int32_t wc_peer_transport(int32_t peer_id);
+```
+
+### Cart exports (host calls into cart - all optional)
+
+```c
+void wc_peer_on_connect(int32_t peer_id, const char* name, uint32_t name_len);
+void wc_peer_on_message(int32_t peer_id, const void* data, uint32_t len);
+void wc_peer_on_disconnect(int32_t peer_id);
+void wc_peer_on_error(int32_t peer_id);
+```
+
+### Identity: the id is the handle, the name is display-only
+
+Two things identify a peer, and they are **not** interchangeable:
+
+- **`peer_id`** — a small integer, stable for the session, assigned by the host.
+  This is the handle. Key player tables on it; pass it to send.
+- **name** — a display string the host supplies: a username, a room nickname, an
+  OS account name, whatever identity the host has.
+
+**Normative:** a cart MUST NOT assume names are unique, stable across sessions,
+or trustworthy. A host with real accounts may guarantee all three; a host that
+prompts for a nickname guarantees none. Names arrive from remote machines and
+are therefore attacker-controlled text: bound the length, do not assume valid
+UTF-8, and never use a name as a key for anything that matters.
+
+### Transport properties (optional both ways)
+
+Most carts never ask. `wc_peer_transport` exists for the narrow case of a cart
+doing tight per-frame synchronization that must know whether delivery is
+reliable, or whether it is running over something with inherent latency, before
+assuming it can.
+
+```c
+#define WC_TRANSPORT_UNKNOWN     0x00  // host does not characterize it
+#define WC_TRANSPORT_RELIABLE    0x01  // delivery guaranteed
+#define WC_TRANSPORT_ORDERED     0x02  // messages arrive in send order
+#define WC_TRANSPORT_LOW_LATENCY 0x04  // suitable for per-frame traffic
+```
+
+It is optional in **both** directions: optional for the cart to call, and
+optional for the host to answer. A host that does not characterize its transport
+returns `WC_TRANSPORT_UNKNOWN`, and carts MUST handle that — treat it as
+"assume nothing", not "assume the worst" or "assume reliable".
+
+Deliberately *properties*, not a transport name: a name invites carts to write
+`if (transport == "webrtc")`, re-coupling them to the implementations this
+design exists to hide.
+
+### Notes
+
+- **Binary only** — games serialize their own protocols. There is no text-frame
+  variant: text frames are meaningful for WebSocket and meaningless for a serial
+  cable or raw TCP, so framing belongs to the cart.
+- Host buffers events and delivers them before each `wc_render()` call
+- Cart exports are optional - if missing, the cart can still poll via
+  `wc_peer_count()` / `wc_peer_id()` / `wc_peer_state()`
+- Connection IDs are small integers managed by the host (0, 1, 2, ...)
+- `data` / `name` pointers in callbacks are temporary - the cart MUST copy what
+  it needs before returning
+- Delivery semantics are host-defined; query `wc_peer_transport()` if it matters
+
+### Out of scope, deliberately
+
+**Auth and matchmaking are host territory.** They govern *how a connection comes
+to exist*; the cart's world begins once one exists and has an id and a name. A
+host may do accounts, signed tokens, lobbies, room codes, LAN discovery, QR
+codes, or nothing. None of it changes a line of cart code — and a cart that
+never participates in authentication cannot leak a credential or be tricked into
+trusting an identity.
+
+**Custom game attributes are cart-layer data.** Character select, team, colour,
+ready state, protocol version: a cart sends these itself as its first message
+after connect, in its own format. The host MUST NOT parse cart traffic.
+
+**Rollback netplay is not a wasmcart feature.** A cart's state is its whole
+linear memory, which is orders of magnitude too large to snapshot per frame. A
+cart wanting rollback implements it internally over ordinary peer connections,
+rolling back only the state it knows matters. See
+[docs/networking.md](docs/networking.md).
+
+---
+
+## Pointer Input
+
+Unified mouse + touch. Opt-in by setting `WC_FLAG_POINTER` in `wc_info_t.flags`. Both shared-memory state and event callbacks. **The flag is the only gate** — a manifest field never gates a capability the cart declares about itself (see Manifest below).
+
+### Shared memory (host writes every frame)
+
+```c
+typedef struct {
+    int16_t  x;        // cart-space coordinates (0 to width-1)
+    int16_t  y;        // cart-space coordinates (0 to height-1)
+    uint8_t  buttons;  // bitmask: bit0=primary, bit1=secondary, bit2=middle
+    uint8_t  active;   // 1 if this pointer exists
+    uint8_t  _pad[2];
+} wc_pointer_t;        // 8 bytes
+
+// 10 pointer slots, 80 bytes total
+// Cart sets wc_info_t.pointer_ptr to a wc_pointer_t[10] buffer
+```
+
+### Scroll wheel (v3.1)
+
+```c
+typedef struct {
+    int32_t dx;   // horizontal scroll, 1/120 notch, right positive
+    int32_t dy;   // vertical scroll, 1/120 notch, UP positive
+} wc_wheel_t;     // 8 bytes
+
+// Cart sets wc_info_t.wheel_ptr to a wc_wheel_t
+```
+
+A wheel is a DELTA, not a position, so it is not a pointer slot: no
+coordinates, no press, no identity across frames. Same `WC_FLAG_POINTER`
+gate as the array above.
+
+- **Units are 1/120 of a notch** (the `WHEEL_DELTA` convention). One click
+  of a detented wheel = 120; trackpads and precision devices report
+  fractions, so smooth scrolling is not rounded away. Divide by 120.0 for
+  notches.
+- **`dy` is positive UP**, matching "scroll away from you". Hosts receiving
+  the opposite convention (browsers, whose `deltaY` grows downward) flip it
+  before writing.
+- **Host accumulates, writes before `wc_render`, zeroes after.** The cart
+  only reads, and reads a per-frame delta — which is what makes it
+  frame-rate independent, since one trackpad flick is dozens of events.
+- **Zero is normal.** A device with no wheel never writes here, exactly as a
+  desktop never fills touch slots 1-9. The field always exists; hardware
+  that cannot produce it simply leaves it alone. Carts must not gate
+  behaviour on wheel presence — read it and let it be 0.
+- Hosts source it from the platform's own wheel event (`wheel` in a
+  browser, `SDL_MOUSEWHEEL` natively, Android `ACTION_SCROLL` from an
+  attached mouse) and must NOT synthesize it from touch. Pinch is derived
+  by the cart from two pointer slots; see docs/input.md.
+```
+
+### Cart exports (host calls into cart - all optional)
+
+```c
+void wc_ptr_on_down(uint32_t id, int16_t x, int16_t y, uint8_t button);
+void wc_ptr_on_move(uint32_t id, int16_t x, int16_t y);
+void wc_ptr_on_up(uint32_t id, uint8_t button);
+```
+
+### Notes
+- Host normalizes screen coordinates to cart resolution
+- Mouse = pointer 0 (always active when cursor is over window)
+- Touch = each finger gets the next available slot, active only while touching, buttons=0x01
+- If device has both mouse and touch, they coexist - mouse is 0, fingers fill 1+
+- `button` param: 0=primary (left click / touch), 1=secondary (right click), 2=middle
+- State array is always up to date regardless of whether cart exports callbacks
+- Host delivers events before `wc_render()`
+
+---
+
+## Rumble
+
+Rumble runs the opposite way to the rest of input: the cart drives it, so it is a
+set of host **imports** rather than a field in `wc_pad_t`. There is no flag to set
+and no manifest entry - a cart just calls it. Hosts always provide the imports;
+where there is no hardware they are silent no-ops.
+
+```c
+#define WC_RUMBLE_MAX_MS 5000
+
+unsigned int wc_pad_has_rumble(unsigned int pad_id);
+void wc_pad_rumble(unsigned int pad_id, float low, float high,
+                   unsigned int duration_ms);
+void wc_pad_rumble_stop(unsigned int pad_id);
+```
+
+`low` drives the low-frequency ("strong") motor, `high` the high-frequency
+("weak") one, both `0.0 .. 1.0`. These map directly onto SDL's
+`SDL_GameControllerRumble` and the W3C `dual-rumble` effect
+(`strongMagnitude` / `weakMagnitude`), so the same call behaves the same way in a
+native window and in a browser.
+
+### Notes
+
+- **Capability is per-device, not per-platform.** Ask `wc_pad_has_rumble()` rather
+  than assuming: an Xbox 360 pad reports rumble but not trigger rumble, and a
+  keyboard-only setup reports none. A cart may skip the query - calls on a pad
+  without rumble are silent no-ops - but then it cannot offer the player a toggle.
+- **Out-of-range values are clamped, not rejected.** Magnitudes outside `0..1` clamp
+  into range (`NaN` becomes `0`) and `duration_ms` caps at `WC_RUMBLE_MAX_MS`. A cart
+  deriving intensity from game state will overshoot at the edges, and a dropped
+  rumble is harder to diagnose than a saturated one.
+- **Effects stop on the host's timer.** The duration cap means a cart cannot pin the
+  motors indefinitely, and a cart that crashes mid-effect still leaves the controller
+  quiet. Sustained rumble is done by re-arming each frame, which also stops rumble
+  when the cart stops.
+- **Invalid pad slots are ignored.** `pad_id >= 4` never reaches the device.
+- Rumble does not widen the security boundary: it is write-only to hardware the host
+  already owns, and carries no data back to the cart beyond the capability bit.
+
+## Asset prefetch
+
+A cart streaming a world bigger than memory must never block a frame on a download. The asset
+ABI is synchronous, and on a web host a cart directory's assets are downloads: a read of an
+asset that has not arrived suspends the cart (see Cart directories), which hides the wait from
+the cart's code but not from the frame. `wc_asset_prefetch` lets the cart say which assets it
+will want, so the host can fetch them in the background, and tells the cart when the ordinary
+read has become a copy. Optional for carts: one that never calls it is unaffected. Optional for
+hosts, and advertised: a host that implements it writes `WC_HOST_FLAG_ASSET_PREFETCH` (`0x04`)
+into `wc_host_info_t.flags` before `wc_init`.
+
+```c
+int32_t wc_asset_prefetch(const char* path, uint32_t path_len, int32_t priority);
+void    wc_asset_prefetch_cancel(const char* path, uint32_t path_len);
+```
+
+`wc_asset_prefetch` starts fetching the whole asset at `path` into the host's own memory, and
+returns its state. Called again with the same path it starts nothing and returns the current
+state: it is also the poll. `path` is validated exactly as for `wc_asset_size`.
+
+| Return | Meaning |
+|---|---|
+| `0` `WC_PREFETCH_PENDING` | The host is fetching. |
+| `1` `WC_PREFETCH_READY` | The host holds the asset's bytes, decompressed. `wc_asset_size` and `wc_load_asset` for this path now answer from that copy: no disk, no network, no suspension. |
+| `-1` `WC_PREFETCH_MISSING` | No such asset, or an invalid path: exactly the paths for which `wc_asset_size` returns `-1`. |
+| `-2` `WC_PREFETCH_FAILED` | The fetch failed (a network error that is not a 404), or the host could not hold the bytes. Held until the cart cancels the path; cancel and prefetch again to retry. |
+| `-3` `WC_PREFETCH_REFUSED` | Nothing was started: too many prefetches pending, the host's cache is full, or the call came from a cart thread. Not a refusal of the asset; ask again later. |
+
+`priority` orders the start of pending fetches, higher first, `0` by default; a host with a
+concurrency limit starts the highest first. Asking again with a higher priority raises it; a
+lower one is ignored.
+
+**A prefetch ends** when the cart cancels it, or when `wc_load_asset` returns the asset's full
+size (the cart now has its own copy; the host drops its own and forgets the path, so a later
+prefetch of the same path fetches again). `wc_asset_prefetch_cancel` on a pending path lets the
+host drop the bytes when they arrive, or abort; on an unknown path it does nothing. A cart that
+reads what it asked for never needs to cancel.
+
+**Reading early.** `wc_asset_size` or `wc_load_asset` on a path whose prefetch is pending,
+failed or refused behaves as it does without a prefetch: a web host suspends on the fetch (and
+SHOULD wait for the fetch already in flight rather than start a second), a native host reads
+from the archive. A prefetch never makes a read fail that would otherwise succeed.
+
+**Rules for hosts.**
+
+- The flag is a promise about the state, not about threads: a host MAY complete a prefetch
+  synchronously, inside the call, when its assets are local. A host that sets the flag MUST
+  make `READY` mean a copy: it decompresses as part of the prefetch, not in the read.
+- State changes are observed between calls into the cart, never during one (as for every
+  asynchronous result in this ABI).
+- Limits: every host accepts at least 64 prefetches pending or ready at once, and holds at
+  least one asset of the maximum asset size; beyond its limits it answers `-3`, never drops a
+  request silently.
+- These are main-thread state, like the input-action imports: a cart thread's call answers
+  `-3`, and a cart thread's `wc_load_asset` reads the archive as before.
+- The imports widen nothing: they take the same validated paths as `wc_asset_size`, write
+  nothing into cart memory, and a host without them still stubs them as it does any unknown
+  `env` import (the cart detects the host through the flag, not through the stub's value).
+
+**Rules for carts.**
+
+- Read `WC_HOST_FLAG_ASSET_PREFETCH` once in `wc_init`. Without it, do not call these imports:
+  on a host built before them the stubs answer `-1` or `0` depending on the host, and both
+  are wrong. With the flag clear a cart reads synchronously, as it does today.
+- Prefetch state is not deterministic: when the bytes arrive depends on the network. A
+  `WC_FLAG_DETERMINISTIC` cart MUST NOT let the frame a prefetch completes change its state;
+  decide what to load from the simulation, and let a read that is not yet `READY` cost time,
+  not change the game.
+- A `.wasc`'s assets are local on every host but the web: a cart that prefetches on all hosts
+  loses nothing (a local host answers `READY` at once or soon), and gains the web.
+
+## Runtime code generation
+
+For carts that compile code while they run: a language VM turning hot functions
+into WebAssembly. Wasm cannot instantiate a module by itself, so the cart hands
+the bytes to the host, and the host's wasm engine compiling them is the JIT.
+Optional for carts: one that never calls these is unaffected. **Every host
+provides them**, so a cart that calls them may rely on them.
+
+```c
+int32_t wc_jit_link(const uint8_t *bytes, uint32_t len, int32_t *result);
+void    wc_jit_unlink(int32_t first_slot);
+int32_t wc_jit_config(int32_t key);
+```
+
+### `wc_jit_link`
+
+`bytes`/`len` is a complete wasm module in cart memory; the host copies it
+before returning, so the buffer is the cart's again at once. The module may
+import **only from namespace `cart`**, and each import resolves by name to the
+cart instance's own export (its `memory`, `__indirect_function_table`, or an
+exported function). Every function the module exports is installed, in export
+order, into consecutive slots of the cart's exported, growable
+`__indirect_function_table`; the cart calls them with `call_indirect` (in C,
+through a function pointer whose value is the slot).
+
+| Return | Meaning |
+|---|---|
+| `>= 0` | Installed: the slot of the first exported function. |
+| `-1` | Refused: invalid module, an import outside `cart`, a limit exceeded, or the host's switch is off. Keep interpreting. |
+| `-2` | Pending: the host compiles asynchronously and later writes the first slot, or `-1`, into `*result`, always between two calls into the cart, never during one. The cart stores `-2` in the cell before calling and polls it. |
+| `-3` | Try later: too many compiles in flight. Not a refusal; link again later. |
+
+Every outcome is also written to `*result` (when `result` is not 0). Whether a
+host compiles synchronously or asynchronously is its choice, and may depend on
+size (browsers forbid synchronous compiles over 4 KB on the main thread), so a
+cart must handle `-2`.
+
+### `wc_jit_unlink`
+
+Frees the slots of a module installed by `wc_jit_link` (pass the first slot it
+returned). Calling through them afterwards traps, and a later link may reuse
+them. An unknown slot is ignored. A long-running cart unlinks what it no longer
+needs so it does not reach the limits.
+
+### `wc_jit_config`
+
+Host advice; `-1` means no opinion.
+
+| Key | Value |
+|---|---|
+| 0 | Hotness threshold (0 = compile everything on first use) |
+| 1 | `1` = compile nothing: the host's switch is off |
+| 2 | Engine tier-up interval |
+| 3 | Max bytes of one module |
+| 4 | Max total bytes linked at once |
+| 5 | Max functions linked at once |
+| 6 | Max compiles in flight |
+| 7 | Restore generation: `0` until the host first restores a state into this instance; each restore then sets it from the restored memory (below), so the same state gives the same value on every host and peer. Never `-1`. |
+
+### Rules for hosts
+
+- **Ownership.** A link belongs to the instance that asked for it. Slots,
+  limits and in-flight compiles are per instance: a worker thread's instance
+  has its own table and never sees slots installed in another. An asynchronous
+  result for an instance that no longer exists is dropped, never installed into
+  or written into another cart.
+- **Limits.** Every host accepts at least these per instance (keys 3-6 report
+  the host's actual values, never lower): one module 256 MiB (the whole total: a
+  module may be as large as everything linked at once); 256 MiB linked at
+  once; 65536 functions linked at once; 32 compiles in flight. Unlinking gives
+  bytes and functions back.
+- **Save states and rewind.** Slots are not carried across a restore. Right
+  after the host writes a state back, and before the cart runs again, it does
+  one step: every slot linked before is unlinked (calling it traps), any
+  compile in flight is dropped (its `*result` cell is never written), and the
+  restore generation (key 7) changes. The generation lives in the host, per
+  instance, never in cart memory, so a restore never brings an old value back.
+  (The JS hosts: `jitUnlinkAll()`.)
+- **The generation's value.** Every host computes it the same way, so netplay
+  peers and replays stay deterministic: FNV-1a 32 over the cart's whole linear
+  memory after the write-back, read as little-endian 32-bit words (`h =
+  2166136261`, then per word `h = (h XOR word) * 16777619 mod 2^32`); `g = h AND
+  0x7fffffff`; `0` becomes `1`; if `g` equals the current value it becomes `g +
+  1` (`2^31-1` wraps to `1`). Known answer: 64 KiB with byte `i` = `(i * 31 + 7)
+  AND 255`, current `0`, gives `1954405829`. A state saved elsewhere carries the
+  value its own memory stored, which matches only by hash collision.
+- **No silent reuse.** Slots freed by a restore are not handed out again until
+  the cart has read key 7 since that restore. Until then a slot number from
+  before the restore can only trap, never reach other code. (Slots the cart
+  unlinks itself are reusable at once.)
+- **The off switch.** A host may let its user turn runtime code generation off
+  (`jit: false`, `WASMCART_JIT=0`). It is a breaking setting, so it is loud: the
+  cart sees `-1` from every link and `1` from key 1, and on the cart's first JIT
+  call the user is told, where they are looking (window, page, tool output),
+  that the setting is off, so a misbehaving cart is blamed on the switch.
+
+### Rules for engines
+
+- Behave the same with and without it: generated code computes exactly what
+  the interpreter would (wasm arithmetic, floats included, is deterministic).
+  Prove it by running your test suite with everything compiled.
+- On `-1`, keep interpreting. If you cannot run without it, stop with a message
+  that says so.
+- Detect restores with key 7. Read it once at start and store it; read it
+  again at every frame or dispatch entry, before calling any slot. When it
+  differs, forget every slot number and every pending `*result` cell (a
+  restore drops compiles in flight, so a cell left at `-2` never settles),
+  store the new value, and re-link lazily as functions get hot again.
+
+### Notes
+
+- **No new authority.** Generated code can import nothing the cart does not
+  already export, so it has exactly the cart's capabilities. No cart is
+  trusted more than another: no allowlists, signatures or engine tiers.
+- **CSP.** A web page whose CSP lacks `'wasm-unsafe-eval'` cannot compile any
+  wasm, the cart included, so there is no half-working state.
+
+## Keyboard Input
+
+Opt-in by setting `WC_FLAG_KEYBOARD` in `wc_info_t.flags`. Both shared-memory state and event callbacks. **The flag is the only gate** (see Manifest below).
+
+### Shared memory (host writes every frame)
+
+```c
+// 256-bit bitmask - one bit per keycode
+// Cart sets wc_info_t.keys_ptr to a uint8_t[32] buffer
+uint8_t wc_keys[32];  // 32 bytes
+
+// Test if key is down:
+// wc_keys[keycode >> 3] & (1 << (keycode & 7))
+```
+
+### Cart exports (host calls into cart - all optional)
+
+```c
+void wc_kb_on_down(uint8_t keycode, uint8_t modifiers);
+void wc_kb_on_up(uint8_t keycode, uint8_t modifiers);
+```
+
+### Modifier bitmask
+
+```c
+#define WC_MOD_SHIFT  0x01
+#define WC_MOD_CTRL   0x02
+#define WC_MOD_ALT    0x04
+#define WC_MOD_META   0x08
+```
+
+### Keycodes (USB HID scancodes)
+
+```c
+// Letters (0x04–0x1D)
+#define WC_KEY_A  0x04
+#define WC_KEY_B  0x05
+#define WC_KEY_C  0x06
+#define WC_KEY_D  0x07
+#define WC_KEY_E  0x08
+#define WC_KEY_F  0x09
+#define WC_KEY_G  0x0A
+#define WC_KEY_H  0x0B
+#define WC_KEY_I  0x0C
+#define WC_KEY_J  0x0D
+#define WC_KEY_K  0x0E
+#define WC_KEY_L  0x0F
+#define WC_KEY_M  0x10
+#define WC_KEY_N  0x11
+#define WC_KEY_O  0x12
+#define WC_KEY_P  0x13
+#define WC_KEY_Q  0x14
+#define WC_KEY_R  0x15
+#define WC_KEY_S  0x16
+#define WC_KEY_T  0x17
+#define WC_KEY_U  0x18
+#define WC_KEY_V  0x19
+#define WC_KEY_W  0x1A
+#define WC_KEY_X  0x1B
+#define WC_KEY_Y  0x1C
+#define WC_KEY_Z  0x1D
+
+// Numbers (0x1E–0x27)
+#define WC_KEY_1  0x1E
+#define WC_KEY_2  0x1F
+#define WC_KEY_3  0x20
+#define WC_KEY_4  0x21
+#define WC_KEY_5  0x22
+#define WC_KEY_6  0x23
+#define WC_KEY_7  0x24
+#define WC_KEY_8  0x25
+#define WC_KEY_9  0x26
+#define WC_KEY_0  0x27
+
+// Common keys
+#define WC_KEY_ENTER      0x28
+#define WC_KEY_ESCAPE     0x29
+#define WC_KEY_BACKSPACE  0x2A
+#define WC_KEY_TAB        0x2B
+#define WC_KEY_SPACE      0x2C
+
+// Punctuation
+#define WC_KEY_MINUS      0x2D
+#define WC_KEY_EQUAL      0x2E
+#define WC_KEY_LBRACKET   0x2F
+#define WC_KEY_RBRACKET   0x30
+#define WC_KEY_BACKSLASH  0x31
+#define WC_KEY_SEMICOLON  0x33
+#define WC_KEY_QUOTE      0x34
+#define WC_KEY_GRAVE      0x35
+#define WC_KEY_COMMA      0x36
+#define WC_KEY_PERIOD     0x37
+#define WC_KEY_SLASH      0x38
+
+// Function keys (0x3A–0x45)
+#define WC_KEY_F1   0x3A
+#define WC_KEY_F2   0x3B
+#define WC_KEY_F3   0x3C
+#define WC_KEY_F4   0x3D
+#define WC_KEY_F5   0x3E
+#define WC_KEY_F6   0x3F
+#define WC_KEY_F7   0x40
+#define WC_KEY_F8   0x41
+#define WC_KEY_F9   0x42
+#define WC_KEY_F10  0x43
+#define WC_KEY_F11  0x44
+#define WC_KEY_F12  0x45
+
+// Navigation
+#define WC_KEY_INSERT     0x49
+#define WC_KEY_HOME       0x4A
+#define WC_KEY_PAGEUP     0x4B
+#define WC_KEY_DELETE     0x4C
+#define WC_KEY_END        0x4D
+#define WC_KEY_PAGEDOWN   0x4E
+
+// Arrows
+#define WC_KEY_RIGHT      0x4F
+#define WC_KEY_LEFT       0x50
+#define WC_KEY_DOWN       0x51
+#define WC_KEY_UP         0x52
+
+// Numpad
+#define WC_KEY_NUMLOCK    0x53
+#define WC_KEY_KP_DIVIDE  0x54
+#define WC_KEY_KP_MULTIPLY 0x55
+#define WC_KEY_KP_MINUS   0x56
+#define WC_KEY_KP_PLUS    0x57
+#define WC_KEY_KP_ENTER   0x58
+#define WC_KEY_KP_1       0x59
+#define WC_KEY_KP_2       0x5A
+#define WC_KEY_KP_3       0x5B
+#define WC_KEY_KP_4       0x5C
+#define WC_KEY_KP_5       0x5D
+#define WC_KEY_KP_6       0x5E
+#define WC_KEY_KP_7       0x5F
+#define WC_KEY_KP_8       0x60
+#define WC_KEY_KP_9       0x61
+#define WC_KEY_KP_0       0x62
+#define WC_KEY_KP_PERIOD  0x63
+
+// Modifiers (0xE0–0xE7)
+#define WC_KEY_LCTRL   0xE0
+#define WC_KEY_LSHIFT  0xE1
+#define WC_KEY_LALT    0xE2
+#define WC_KEY_LMETA   0xE3
+#define WC_KEY_RCTRL   0xE4
+#define WC_KEY_RSHIFT  0xE5
+#define WC_KEY_RALT    0xE6
+#define WC_KEY_RMETA   0xE7
+```
+
+All keycodes follow USB HID Usage Tables. SDL provides these natively. Browser `KeyboardEvent.code` requires a static lookup table to convert (well-documented 1:1 mapping).
+
+### Notes
+- Host delivers events before `wc_render()`
+- State bitmask is always up to date regardless of whether cart exports callbacks
+- When the cart sets `WC_FLAG_KEYBOARD`, the host does not map keyboard keys to gamepad
+
+---
+
+## Running a cart's engine natively (WC_NATIVE_HOST)
+
+Some engines (wasmcart-lua) are C that happens to be compiled to wasm. Such
+an engine can also be built with a normal toolchain and linked against a
+host in the same address space -- useful where a wasm runtime is expensive
+to ship: an Android APK drops from ~64 MB to ~6 MB, since the JS engine is
+nearly all of the difference.
+
+This is a build target, not a change to the ABI. Under `WC_NATIVE_HOST`:
+
+- The `wc_*` imports in `wasmcart.h` are declared `extern` rather than
+  stubbed, so the host links real implementations. (The plain non-wasm
+  branch is a set of no-op stubs -- correct for a cart built without a
+  host, silently wrong for a host that must supply them.)
+- `wc_info_t`'s region pointers cannot be used: they are `uint32_t` offsets
+  into wasm linear memory, which is exact under wasm and lossy on a 64-bit
+  target. An engine exposes the real addresses another way instead
+  (wasmcart-lua: `wc_native_regions()` in `wc_native.h`).
+- Likewise the debug descriptor in `wc_cart.h`, whose `name`/`addr` fields
+  are the same 32-bit offsets: `(uint32_t)(uintptr_t)&x` is neither
+  lossless nor a compile-time constant on a 64-bit target, so a native
+  form holding real pointers is emitted instead.
+
+The wasm build is unaffected -- byte-identical output, same exports, same
+struct layouts -- and a cart cannot tell the difference.
+
+**This trades away the sandbox.** Native engine code has whatever authority
+the process has; nothing below still applies to it. That is acceptable for
+first-party carts you build and ship yourself, and NOT acceptable for
+running untrusted carts, which is what the wasm path is for.
+
+## Security Model
+
+A cart is a plain WebAssembly module with **no ambient authority**. It has no
+syscalls, no filesystem, no network, no clock beyond what the host hands it, and no
+way to reach anything outside its own module memory except through the imports the
+host provides. Everything a cart can touch is mediated by the host and validated
+before it acts. This is what makes running an untrusted cart safe.
+
+This is the guarantee game consoles had and general-purpose computers gave up. A
+console cartridge could only do what the console's hardware let it do; a modern
+game you download is arbitrary code running with your full user privileges, free to
+read your home directory or open a socket. A `.wasc` is a cartridge again: the
+security boundary is the import table, and the import table is a closed set.
+
+### The import table is the whole attack surface
+
+A cart can only call what the host passes it. There is no dynamic linking, no
+`dlopen`, no eval, and no way to obtain a function the host did not hand over.
+Auditing a wasmcart host therefore means auditing one list, and that list is short:
+
+- **Cart services** - `wc_log`, `wc_debug_mark`, `wc_frame_yield`, `wc_pad_name`,
+  `wc_pad_has_rumble`, `wc_pad_rumble`, `wc_pad_rumble_stop`
+- **Assets (read-only, path-validated)** - `wc_asset_size`, `wc_load_asset`,
+  `wc_asset_prefetch`, `wc_asset_prefetch_cancel`
+- **Network (opt-in, allowlisted)** - the `wc_peer_*` family
+- **Runtime code generation** - `wc_jit_link`, `wc_jit_unlink`, `wc_jit_config`: a
+  linked module imports only the cart's own exports, never a host function
+- **GPU** - the `gl` module, and for WebGPU carts the frozen emdawnwebgpu
+  set (see WebGPU). Every WebGPU call is validated by the implementation the
+  host runs on (Dawn, or the browser's), the same validation a browser applies
+  to untrusted pages; GPU memory a cart allocates is one more resource a host
+  must bound itself.
+- **Toolchain shims** - a small set of emscripten/WASI symbols that compilers emit
+  unconditionally
+
+The toolchain shims are the subtle part, because their *names* imply capabilities
+the host does not actually grant. They are deliberately inert:
+
+| Symbol | Behaviour | Consequence |
+|--------|-----------|-------------|
+| `path_open`, `fd_prestat_*` | **not provided at all** | a cart has no way to *name* a host file |
+| `fd_read`, `fd_seek` | return `0` | no input, no seeking |
+| `fd_write` | routed to the host log | stdout/stderr become log lines, never files |
+| `environ_get`, `environ_sizes_get` | return `0` | no environment variables |
+| `__syscall_getcwd` | returns `-1` | no filesystem position |
+| `proc_exit` | no-op | a cart cannot terminate the host |
+
+The absence of `path_open` is the load-bearing one. Filesystem sandboxes usually
+work by permitting `open()` and then filtering the path, which fails whenever the
+filter and the OS disagree about what a path means. Here the operation does not
+exist, so there is no filter to outwit.
+
+### Threads
+
+Threaded carts are supported (`wasi.thread-spawn` plus a shared `WebAssembly.Memory`),
+and they do not widen the boundary. Spawned threads run the *same* module with the
+*same* import table, so a worker thread has exactly the authority the main thread
+has. A cart that imports `thread-spawn` must also export `wasi_thread_start`; the
+host rejects the mismatched pair rather than instantiating a module it cannot drive.
+
+### What a malicious cart can still do
+
+Being honest about the limits matters as much as the guarantees. Within its
+sandbox a cart may:
+
+- **Burn CPU or hang.** Nothing in the ABI bounds how long `wc_render()` runs. A
+  host that needs to stay responsive must enforce its own timeout.
+- **Exhaust memory,** up to the `maximum` its module declares.
+- **Render or play anything,** including hostile visuals or audio.
+- **Talk to allowlisted hosts,** if the packager declared any, and exfiltrate
+  whatever it can reach - which is only its own state, since it can read nothing else.
+
+What it cannot do is reach *outside* itself: no host files, no unlisted hosts, no
+environment, no other processes, no persistence the host did not choose to write.
+
+### Filesystem and assets
+
+Carts have **no filesystem access.** There is no `open`, `read`, `write`, `stat`,
+directory listing, or any path-based I/O available to a cart - those imports simply
+do not exist.
+
+The only files a cart can read are **its own bundled assets**, and only through the
+asset API:
+
+- `wc_asset_size(path, len)` and `wc_load_asset(path, len, dest, maxSize)` resolve
+  paths **against the cart's own asset bundle only** (the `assets/` entries inside
+  its `.wasc`, or the dev-mode directory). A cart cannot name a file outside that
+  scope.
+- The host **validates every requested path** and rejects: absolute paths (`/...`,
+  `\...`), Windows drive letters (`C:`), parent-directory traversal (`..`), null
+  bytes, and backslashes. A rejected or unknown path returns `-1`; there is no way
+  for it to resolve to a host file.
+- A cart therefore cannot read the user's files, other carts' assets, or anything
+  on the host - its entire readable world is the assets it shipped with.
+
+### Cart directories
+
+A cart need not be packed. A **cart directory** is the unzipped form of a
+`.wasc`: `manifest.json` (optional), the entry wasm, and the asset tree under
+the asset prefix. Hosts that can read a directory load it directly (dev mode).
+A web host can load one **served over HTTP**, which lets a cart start before
+its assets are downloaded:
+
+- The asset ABI stays synchronous. A web host MAY satisfy `wc_asset_size` and
+  `wc_load_asset` by fetching `<dir>/<prefix>/<path>` on first use and
+  suspending the cart until the bytes arrive, with JavaScript Promise
+  Integration (JSPI). The cart sees an ordinary call that returns its bytes;
+  ported engines that read files deep inside their own code need no change.
+  A fetch inside `wc_render` stalls that frame, as a slow disk would.
+  A host that sets `WC_HOST_FLAG_ASSET_PREFETCH` lets a cart ask for the
+  files it will need before it reads them (see Asset prefetch); a lazily
+  loaded cart that does so never suspends on a read it predicted.
+- While a cart is suspended the host MUST NOT call into it again (a frame, an
+  input callback, a lifecycle callback): its C stack is live in linear
+  memory. Such a host's frame call is asynchronous, and calls queue.
+- A `404` is a missing asset (`-1`), as in an archive. Path validation is
+  unchanged.
+- HTTP cannot list a directory, so `_filelist.txt` comes from the manifest's
+  optional `files` list (see Manifest), or is missing (`-1`) without one.
+  When `files` is present a host MAY treat it as complete and answer a path
+  not on it with `-1` without a request: engines probe search paths file by
+  file, and on a network every probe is a round trip.
+- A web host without JSPI cannot suspend a cart on a fetch. It MAY download
+  every file in `files` before starting the cart; with no `files` either it
+  cannot know what to fetch and MUST fail the load with a message saying so
+  (never start a cart whose asset reads will all fail).
+
+`CartHostWeb` implements this: `load(url)` of a directory URL (one not ending
+in `.wasc`/`.wasm`), and `await runFrame()`, which returns a promise only
+for a lazily loaded cart.
+
+### Saving is host-managed
+
+Carts do **not** write files to save progress. Persistence is entirely the host's
+responsibility, through a fixed shared-memory region:
+
+- The cart declares a save region via `wc_info_t.save_ptr` / `save_size` (a plain
+  byte blob in the cart's own memory).
+- **The host owns storage.** Before `wc_init()`, the host loads any existing save
+  bytes into that region so the cart can read them at startup. After a frame (or on
+  demand), the host reads the region back and persists it however it sees fit
+  (a file, browser storage, a libretro SRAM/save-state, a database - the cart never
+  knows or cares).
+- The cart never chooses *where* or *whether* data is stored; it only reads and
+  writes its own in-memory save blob. This keeps saving safe (no filesystem write
+  authority) and portable (the same cart saves correctly on every host).
+
+Because the host owns persistence, the host also owns **durability**. A host that
+persists saves SHOULD do so on every ordinary exit path, not only a graceful one:
+Ctrl-C (`SIGINT`) and `kill` (`SIGTERM`) are normal ways to stop a game, and a
+save that survives only a clean shutdown will lose player progress in practice.
+
+A host writing an all-zero save region SHOULD distinguish two cases that look
+identical byte-for-byte: a cart that has *never* saved (skip the write, so a
+`.sav` is not created merely by running the cart) versus a player who *cleared*
+their data (write it, or the previous save silently resurrects on next load).
+
+### Networking
+
+1. **No cart-initiated networking by default** - omit `net` from the manifest
+   and `wc_peer_open` always fails
+2. **Domain allowlist** - cart-opened connections (`wc_peer_open`) only to
+   `net.domains` entries, and only with `WC_FLAG_NET_PEER` set
+3. **No raw sockets** - no TCP, no UDP, no localhost, no IP addresses
+4. **Host enforces** - cart can't bypass; imports validate before acting
+5. **Graceful degradation** - offline hosts provide stub imports returning -1
+6. **Host-registered peers are the host's choice** - a transport the host
+   hands the cart via `addPeer()` needs no manifest grant (the host already
+   chose it), but still requires the cart's `WC_FLAG_NET_PEER`
+7. **No DNS resolution** - cart can't enumerate network
+
+### Summary
+
+| Capability | Cart access |
+|------------|-------------|
+| Host filesystem | none |
+| Own bundled assets | read-only, path-validated, via `wc_load_asset` |
+| Save data | in-memory blob only; host owns persistence |
+| Network | cart-opened: none unless `net.domains` allows it; host-registered peers: the host's own choice, gated by the cart's `WC_FLAG_NET_PEER` |
+| Syscalls / clock / RNG | none except what the host explicitly imports |
+| Environment / cwd / process control | none (`environ_*` return 0, `proc_exit` is a no-op) |
+| Threads | supported, and confined to the same import table as the main thread |
+| CPU / memory | **not** bounded by the ABI - the host must impose its own limits |

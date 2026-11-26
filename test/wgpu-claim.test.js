@@ -1,0 +1,218 @@
+// WebGPU textures, samplers and GPU memory over a long run, on the Node host
+// (SPEC.md, "WebGPU"; docs/webgpu.md, "A frame loop must yield").
+//
+// Fixtures (sources beside them in test/fixtures):
+//   wgputex.wasc   nine texture / sampler cases, checked by the cart itself
+//                  (tex.pass) and here from the host's readback
+//   wgpuvram.wasc  creates and releases ~1.3 MiB of GPU objects per frame
+//   wgpurelease.wasc  uses textures and buffers after releasing them (through
+//                  a kept view, bind group or render bundle, or before submit)
+//
+// GPU memory is read from the kernel's per-client DRM accounting
+// (/proc/self/fdinfo, drm-memory-vram / drm-total-*), Linux only; elsewhere,
+// or on a software adapter with no DRM client, the plateau test is skipped.
+// WASMCART_VRAM_FRAMES sets its length (default 6000, under two seconds on a GPU).
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { CartHost } from '../index.js';
+import { plateauProblem } from './helpers/gpu-growth.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const fixture = name => path.join(HERE, 'fixtures', name);
+// The plateau test never runs on a display GPU: it asks the host for the low-power
+// adapter (the same as WASMCART_WGPU_POWER=low-power, which the host honours too).
+const LOW_POWER = { adapterOptions: { powerPreference: 'low-power' } };
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+// The cart's expected cell centres (wgputex.c's table)
+const CELLS = [
+  [255, 0, 0], [128, 0, 255], [128, 128, 0], [0, 255, 0], [255, 255, 0],
+  [0, 0, 255], [20, 200, 40], [200, 20, 180], [51, 102, 204],
+];
+const TOL = [1, 1, 3, 1, 1, 1, 1, 1, 1];
+
+function pixel(frame, x, y) {
+  const i = (y * frame.width + x) * 4;
+  return [...frame.data.slice(i, i + 4)];
+}
+
+/** This process's GPU memory in bytes (VRAM plus GTT), or null where the kernel does not say. */
+export function processGpuBytes(pid = 'self') {
+  let fds;
+  try { fds = readdirSync(`/proc/${pid}/fdinfo`); } catch { return null; }
+  const clients = new Map();
+  for (const fd of fds) {
+    let text;
+    try { text = readFileSync(`/proc/${pid}/fdinfo/${fd}`, 'utf8'); } catch { continue; }
+    const id = /drm-client-id:\s*(\d+)/.exec(text);
+    if (!id) continue;
+    let bytes = 0;
+    for (const m of text.matchAll(/drm-(?:memory|total)-(vram|gtt):\s*(\d+)\s*(KiB|MiB)?/g)) {
+      bytes += Number(m[2]) * (m[3] === 'MiB' ? 1 << 20 : m[3] === 'KiB' ? 1024 : 1);
+    }
+    clients.set(id[1], Math.max(clients.get(id[1]) || 0, bytes));
+  }
+  if (!clients.size) return null;
+  return [...clients.values()].reduce((a, b) => a + b, 0);
+}
+
+test('textures and samplers: nearest, linear, repeat, clamp, mirror, explicit mips and a rendered texture', async () => {
+  const host = new CartHost();
+  await host.load(fixture('wgputex.wasc'));
+  try {
+    assert.equal(host.usesWgpu, true);
+    // a software adapter (lavapipe, CI) answers the map later: keep yielding
+    for (let i = 0; i < 400 && host.readDebugValue('tex.done').value === 0; i++) { host.runFrame(); await new Promise((r) => setTimeout(r, 5)); }
+    assert.equal(host.readDebugValue('tex.done').value, 1, 'the cart\'s own readback arrived');
+    assert.equal(host.readDebugValue('tex.errors').value, 0, 'no validation or out-of-memory errors');
+    assert.equal(host.readDebugValue('tex.pass').value, 0x1ff,
+      `every cell matched in the cart's check (bits: ${host.readDebugValue('tex.pass').value.toString(2)})`);
+    const frame = await host.readGpuFrame();
+    assert.equal(frame.width, 288);
+    assert.equal(frame.height, 32);
+    CELLS.forEach((want, c) => {
+      const got = pixel(frame, c * 32 + 16, 16);
+      for (let k = 0; k < 3; k++) {
+        assert.ok(Math.abs(got[k] - want[k]) <= TOL[c], `cell ${c}: got ${got.slice(0, 3)}, want ${want}`);
+      }
+    });
+  } finally {
+    host.destroy();
+  }
+});
+
+// The host destroys a released texture or buffer once nothing live uses it
+// (src/wgpu/release.js): each quadrant goes black, or the frame raises a
+// validation error, if one is destroyed too early.
+test('released textures and buffers stay usable through a kept view, bind group or bundle, and are destroyed once unused', async () => {
+  const host = new CartHost();
+  await host.load(fixture('wgpurelease.wasc'));
+  try {
+    const quads = (f) => [[16, 16], [48, 16], [16, 48], [48, 48]].map(([x, y]) => pixel(f, x, y).slice(0, 3));
+    for (let i = 0; i < 20; i++) { host.runFrame(); await tick(); }
+    const before = quads(await host.readGpuFrame());
+    const destroyedBefore = host._wgpu.released.destroyed;
+    for (let i = 0; i < 20; i++) { host.runFrame(); await tick(); }
+    const after = quads(await host.readGpuFrame());
+    const destroyedAfter = host._wgpu.released.destroyed;
+    await tick();
+    assert.equal(host.readDebugValue('rel.frames').value, 40);
+    assert.equal(host.readDebugValue('rel.errors').value, 0, 'no validation errors: nothing in use was destroyed');
+    assert.deepEqual(before, [[255, 0, 255], [0, 255, 0], [255, 255, 255], [255, 255, 0]],
+      'kept bind group, kept view, kept bundle, and released-before-submit all draw');
+    assert.deepEqual(after, [[0, 0, 0], [0, 0, 0], [0, 0, 0], [255, 255, 0]], 'the cart stopped drawing the three it released at frame 30');
+    // per frame: the bottom-right texture and two uniform buffers
+    assert.ok(destroyedBefore >= 20 * 3, `released per-frame objects are destroyed (${destroyedBefore} by frame 20)`);
+    // frames 21-40, plus at frame 30 the kept group's texture and buffer,
+    // the bundle's, and the kept view's texture
+    assert.ok(destroyedAfter - destroyedBefore >= 20 * 2 + 5, `the kept objects' textures and buffers are destroyed once released (${destroyedAfter - destroyedBefore} more)`);
+  } finally {
+    host.destroy();
+  }
+});
+
+// Losing the host's device (docs/webgpu.md, "Errors and device loss"): the
+// host stops calling wc_render and reports it once, instead of a black frame
+// forever. Forced here by destroying the host's device from outside the cart.
+test('losing the host\'s device stops the cart and is reported once (gpuLost, onGpuLost)', async () => {
+  const host = new CartHost();
+  const reports = [];
+  await host.load(fixture('wgpurelease.wasc'), { onGpuLost: (info) => reports.push(info) });
+  try {
+    for (let i = 0; i < 5; i++) { host.runFrame(); await tick(); }
+    assert.equal(host.gpuLost, null);
+    host.getGpuDevice().destroy();
+    // the loss arrives a few event-loop turns later (device.lost)
+    for (let i = 0; i < 100 && !host.gpuLost; i++) { host.runFrame(); await tick(); }
+    assert.equal(host.gpuLost?.reason, 'destroyed');
+    const frames = host.readDebugValue('rel.frames').value;
+    for (let i = 0; i < 10; i++) { host.runFrame(); await tick(); }
+    assert.equal(host.readDebugValue('rel.frames').value, frames, 'wc_render is no longer called');
+    assert.equal(reports.length, 1, 'onGpuLost is called once');
+    assert.equal(reports[0], host.gpuLost);
+  } finally {
+    host.destroy();
+  }
+  await tick();
+  assert.equal(reports.length, 1, 'the host destroying its own device at teardown is not a loss');
+  const quiet = new CartHost();
+  let called = false;
+  await quiet.load(fixture('wgpurelease.wasc'), { onGpuLost: () => { called = true; } });
+  quiet.runFrame(); await tick();
+  quiet.destroy();
+  for (let i = 0; i < 3; i++) await tick();
+  assert.equal(called, false);
+  assert.equal(quiet.gpuLost, null);
+});
+
+// Runs wherever the kernel accounts GPU memory per process. The accounting is
+// this process's own, so other processes on the GPU do not move it.
+test('GPU memory levels off over thousands of frames when the loop yields between frames', async (t) => {
+  if (processGpuBytes() === null) {
+    // a WebGPU device must exist before a DRM client shows; probe with the cart
+    const probe = new CartHost();
+    await probe.load(fixture('wgpuvram.wasc'), LOW_POWER);
+    probe.runFrame(); await tick();
+    const seen = processGpuBytes();
+    probe.destroy();
+    if (seen === null) return t.skip('no per-process GPU memory accounting here (not Linux, or a software adapter)');
+  }
+  const frames = Number(process.env.WASMCART_VRAM_FRAMES || 6000);
+  const host = new CartHost();
+  await host.load(fixture('wgpuvram.wasc'), LOW_POWER);
+  try {
+    const samples = [];
+    for (let i = 1; i <= frames; i++) {
+      host.runFrame();
+      await tick(); // the macrotask turn the host contract asks for
+      if (i % 250 === 0) samples.push({ frame: i, mib: processGpuBytes() / (1 << 20) });
+    }
+    assert.equal(host.readDebugValue('vram.frames').value, frames);
+    assert.equal(host.readDebugValue('vram.errors').value, 0);
+    const frame = await host.readGpuFrame();
+    const want = [[200, 40, 40], [40, 200, 40], [40, 40, 200], [200, 200, 40]][host.readDebugValue('vram.colour').value];
+    assert.deepEqual(pixel(frame, 32, 32).slice(0, 3), want, 'the last frame drew this frame\'s texture');
+    // Driver and Dawn pools grow for the first several hundred frames and on
+    // some GPUs step again much later, so the check is a growth rate over the
+    // last 40% of the run, not a level (test/helpers/gpu-growth.js): a leak is
+    // ~1.3 MiB a frame, a late pool step ~0.03.
+    t.diagnostic(`GPU memory (MiB) by frame: ${samples.map(s => `${s.frame}:${s.mib.toFixed(0)}`).join(' ')}`);
+    const problem = plateauProblem(samples);
+    assert.equal(problem, null, problem ?? '');
+  } finally {
+    host.destroy();
+  }
+});
+
+test('edges: a second device with its own callbacks, uncaptured errors, device loss, a resized surface', async (t) => {
+  // The floor: the cart asks for 8192-texel textures to get a device above the
+  // host's, and a core host device already has them, so it would be handed the
+  // host's device (as the SPEC says) and destroy it.
+  const host = new CartHost();
+  await host.load(fixture('wgpuedges.wasc'), { adapterOptions: { featureLevel: 'compatibility' } });
+  try {
+    const v = (name) => { const r = host.readDebugValue(name); return r.values ?? r.value; };
+    for (let i = 0; i < 9; i++) { host.runFrame(); await tick(); }
+    const green = await host.readGpuFrame();
+    for (let i = 0; i < 6; i++) { host.runFrame(); await tick(); }
+    const blue = await host.readGpuFrame();
+    const seen = { adapter: v('edge.adapter'), device: v('edge.device'), separate: v('edge.separate'),
+      uncaptured: v('edge.uncaptured'), lost: v('edge.lost'), size: [...v('edge.size')], info: [host.getInfo().width, host.getInfo().height],
+      before: [green.width, green.height, ...pixel(green, 4, 4).slice(0, 3)], after: [blue.width, blue.height, ...pixel(blue, 4, 4).slice(0, 3)] };
+    t.diagnostic(JSON.stringify(seen));
+    assert.equal(seen.adapter, 1, 'wgpuInstanceRequestAdapter answers between frames');
+    assert.equal(seen.device, 1, 'a device above the floor is granted where the hardware allows');
+    assert.equal(seen.separate, 1, 'it is a separate device from the host\'s');
+    assert.equal(seen.uncaptured, 1, 'an error outside any scope reaches the requesting device\'s uncaptured-error callback');
+    assert.equal(seen.lost, 2, 'destroying it delivers device-lost with WGPUDeviceLostReason_Destroyed');
+    assert.deepEqual(seen.before, [128, 96, 0, 255, 0]);
+    assert.deepEqual(seen.after, [160, 120, 0, 0, 255], 'reconfiguring the surface resizes the frame the host reads');
+    assert.deepEqual(seen.info, [160, 120], 'and wc_info_t\'s new size is adopted');
+  } finally {
+    host.destroy();
+  }
+});

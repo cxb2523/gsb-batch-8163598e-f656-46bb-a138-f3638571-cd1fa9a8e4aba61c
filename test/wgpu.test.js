@@ -1,0 +1,328 @@
+// WebGPU capability (SPEC.md, "WebGPU") on the Node host, through webgpu-node.
+//
+// Fixtures (sources beside them in test/fixtures):
+//   wgpucart.wasc     host device, #canvas surface, a compute result read
+//                     with mapAsync, and 32 MB of memory growth on frame 3
+//   dualgpu.wasc      imports gl AND WebGPU; green on WebGPU, red on GL
+//   dualgpu_bad.wasc  same, but calls GL whatever the host selected
+//   gpuapi2.wasc      declares gpu_api 2 with no WebGPU imports
+//   gpuapi3.wasc      declares the reserved gpu_api 3
+//   wgpufake.wasc     imports a WebGPU function no glue provides
+//   wasicart.wasc     wgpucart built with wasi-sdk (threads) via wgpu-wasi/
+//   wgpucart031.wasc  wgpucart built without wc_alloc (only Emscripten's
+//                     malloc/free/memalign): stops with the allocator error
+//
+// wgpucart and wasicart export a counting wc_alloc/wc_free
+// (fixtures/alloc_count.h): t_allocs(1) counts the adapter-info read,
+// t_allocs(2) the mapped-range read, t_allocs(0) everything else.
+//
+// Pixels are read the way a host must: readGpuFrame() for WebGPU, the GL
+// redirect FBO for GL.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import v8 from 'node:v8';
+import vm from 'node:vm';
+import { CartHost } from '../index.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const fixture = name => path.join(HERE, 'fixtures', name);
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+function pixel(frame, x, y) {
+  const i = (y * frame.width + x) * 4;
+  return [...frame.data.slice(i, i + 4)];
+}
+
+// The glue's allocations in the cart went through its wc_alloc/wc_free.
+function assertGlueAllocs(ex) {
+  assert.equal(ex.wgpucart_adapter_info_ok(), 1, 'wgpuDeviceGetAdapterInfo succeeded');
+  assert.ok(ex.t_allocs(1) >= 1, 'adapter info strings were allocated with wc_alloc');
+  assert.ok(ex.t_allocs(2) >= 1, 'the mapped range was allocated with wc_alloc');
+  assert.ok(ex.t_allocs(0) >= 1, 'the error-scope message was allocated with wc_alloc');
+  assert.ok(ex.t_frees() >= 2, 'the mapped range (at unmap) and the callback message were freed with wc_free');
+}
+
+// The pass's calls went straight to Dawn (native-dawn's wasmImports), none
+// back to the glue: across memory growth (wgpucart) and in shared memory
+// (wasicart), the frame above is what they drew.
+function assertDirectCalls(host) {
+  const calls = host._wgpu.nativeImports;
+  assert.ok(calls, 'webgpu-node\'s GPU gets the direct imports');
+  assert.ok(calls.native > 0, 'pass calls were served directly');
+  assert.equal(calls.fallback, 0, 'none needed the glue');
+}
+
+function glPixel(host, x, y) {
+  const gl = host.getGlContext();
+  const out = new Uint8Array(4);
+  host.withRenderedFrame(() => {
+    gl.readPixels(x, host.getInfo().height - 1 - y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, out);
+  });
+  return [...out];
+}
+
+test('a WebGPU cart renders on the host device, gets async results between frames, and survives memory growth', async () => {
+  const host = new CartHost();
+  await host.load(fixture('wgpucart.wasc'));
+  try {
+    assert.equal(host.usesWgpu, true);
+    assert.equal(host.usesGL, false);
+    assert.equal(host.getInfo().gpuApi, 2);
+    const ex = host.instance.exports;
+    assert.equal(ex.wgpucart_host_flags() & 0x02, 0x02, 'host-info flags carry WC_HOST_FLAG_GPU_WGPU');
+
+    const before = host.memory.buffer.byteLength;
+    // (a time limit, not a frame count: the result arrives when the GPU finishes, and a busy GPU takes more frames)
+    const mapDeadline = Date.now() + 10000;
+    while (ex.wgpucart_result() < 0 && Date.now() < mapDeadline) { host.runFrame(); await tick(); }
+    assert.equal(ex.wgpucart_result(), 42, 'the compute shader result arrived through mapAsync');
+    assert.equal(ex.wgpucart_mapped_during_render(), 0, 'no callback ran inside wc_render');
+    for (let i = 0; i < 10 && ex.wgpucart_scope_error() < 0; i++) { host.runFrame(); await tick(); }
+    assert.equal(ex.wgpucart_scope_error(), 2, 'an error scope caught the validation error (WGPUErrorType_Validation)');
+    assertGlueAllocs(ex);
+    for (let i = 0; i < 4; i++) { host.runFrame(); await tick(); }
+    assert.ok(host.memory.buffer.byteLength > before, 'the cart grew its memory (32 MB malloc on frame 3)');
+
+    const frame = await host.readGpuFrame();
+    assert.equal(frame.width, 256);
+    assert.equal(frame.height, 192);
+    assert.deepEqual(pixel(frame, 128, 110), [255, 128, 64, 255], 'triangle');
+    assert.deepEqual(pixel(frame, 2, 2), [42, 0, 255, 255], 'background carries the compute result');
+    assertDirectCalls(host);
+  } finally {
+    host.destroy();
+  }
+});
+
+test('a destroyed WebGPU cart is collected with its device, objects and Dawn threads', async () => {
+  // Native code held the session three ways: native-dawn's references to the
+  // glue functions it falls back to, Dawn's device error handler (the glue's),
+  // and object wrappers Dawn keeps whose release-tracker entries reached the
+  // glue's Module. Each load kept its GPU instance, device and four threads.
+  v8.setFlagsFromString('--expose-gc');
+  const gc = vm.runInNewContext('gc');
+  let collected = 0;
+  const registry = new FinalizationRegistry(() => { collected++; });
+  // Linux exposes threads through procfs; macOS's ps lists one row per
+  // thread with -M. Keep the leak assertion active on both release hosts.
+  const threads = () => process.platform === 'darwin'
+    ? execFileSync('/bin/ps', ['-M', '-p', String(process.pid), '-o', 'pid='], { encoding: 'utf8' }).trim().split('\n').length
+    : fs.readdirSync('/proc/self/task').length;
+  const cycle = async (i) => {
+    const host = new CartHost();
+    await host.load(fixture('wgpucart.wasc'), { adapterOptions: { powerPreference: 'low-power' } });
+    assert.ok(host.usesWgpu);
+    for (let f = 0; f < 3; f++) host.runFrame([]);
+    await host.destroy();
+    registry.register(host, i);
+  };
+  const settle = async () => { for (let i = 0; i < 10; i++) { gc(); await new Promise(r => setTimeout(r, 30)); } };
+  await cycle(0);
+  await settle();
+  const before = threads();
+  for (let i = 1; i < 4; i++) await cycle(i);
+  await settle();
+  assert.equal(collected, 4, 'every destroyed host was collected');
+  assert.equal(threads(), before, 'no Dawn threads were left behind');
+});
+
+test('a wasi-sdk cart (wasip1-threads, workers that never call WebGPU) runs on WebGPU', async () => {
+  // wasicart.wasc: wgpucart.c built with wasi-sdk through wgpu-wasi/, plus two
+  // pthread workers doing CPU work. The error-scope message travels on the
+  // cart's stack, so it also checks wgpu-wasi's stack helpers.
+  const host = new CartHost();
+  await host.load(fixture('wasicart.wasc'));
+  try {
+    assert.equal(host.usesWgpu, true);
+    assert.equal(host.isThreaded, true);
+    const ex = host.instance.exports;
+    // Workers start as Node worker threads, which takes real time: pace the
+    // frames (the cart polls its workers' done flags; it never blocks).
+    for (let i = 0; i < 200 && !(ex.wgpucart_result() >= 0 && ex.wgpucart_scope_error() >= 0 && ex.wasicart_workers_ok()); i++) {
+      host.runFrame();
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(ex.wgpucart_result(), 42, 'compute result through mapAsync');
+    assert.equal(ex.wgpucart_mapped_during_render(), 0);
+    assert.equal(ex.wgpucart_scope_error(), 2, 'validation error caught by the scope');
+    assert.equal(ex.wasicart_scope_msg_ok(), 1, 'error message intact (in a wc_alloc block for the callback)');
+    assertGlueAllocs(ex);
+    assert.equal(ex.wasicart_workers_ok(), 1, 'both workers finished their sums');
+    host.runFrame();
+    const frame = await host.readGpuFrame();
+    assert.deepEqual(pixel(frame, 128, 110), [255, 128, 64, 255]);
+    assert.deepEqual(pixel(frame, 2, 2), [42, 0, 255, 255]);
+    assertDirectCalls(host);
+  } finally {
+    host.destroy();
+  }
+});
+
+test('two WebGPU carts in one process each get their own device and canvas', async () => {
+  const a = new CartHost();
+  const b = new CartHost();
+  await a.load(fixture('wgpucart.wasc'));
+  await b.load(fixture('dualgpu.wasc'));
+  try {
+    assert.notEqual(a.getGpuDevice(), b.getGpuDevice());
+    for (let i = 0; i < 10; i++) { a.runFrame(); b.runFrame(); await tick(); }
+    assert.deepEqual(pixel(await a.readGpuFrame(), 128, 110), [255, 128, 64, 255]);
+    const fb = await b.readGpuFrame();
+    assert.equal(fb.width, 128);
+    assert.deepEqual(pixel(fb, 5, 5), [0, 255, 0, 255]);
+  } finally {
+    a.destroy();
+    b.destroy();
+  }
+});
+
+test('a dual cart runs on WebGPU where the host has it', async () => {
+  const host = new CartHost();
+  await host.load(fixture('dualgpu.wasc'));
+  try {
+    assert.equal(host.usesWgpu, true);
+    assert.equal(host.instance.exports.dualgpu_uses_wgpu(), 1);
+    host.runFrame();
+    assert.deepEqual(pixel(await host.readGpuFrame(), 64, 48), [0, 255, 0, 255]);
+  } finally {
+    host.destroy();
+  }
+});
+
+test('the same dual cart runs on GL where the host has no WebGPU', async () => {
+  const host = new CartHost();
+  await host.load(fixture('dualgpu.wasc'), { wgpu: false });
+  try {
+    assert.equal(host.usesWgpu, false);
+    assert.equal(host.usesGL, true);
+    assert.equal(host.instance.exports.dualgpu_uses_wgpu(), 0);
+    host.runFrame();
+    assert.deepEqual(glPixel(host, 64, 48), [255, 0, 0, 255]);
+  } finally {
+    host.destroy();
+  }
+});
+
+test('a dual cart that calls the API the host did not select fails loudly, naming the call', async () => {
+  const host = new CartHost();
+  await host.load(fixture('dualgpu_bad.wasc'));
+  try {
+    assert.equal(host.usesWgpu, true);
+    assert.throws(() => host.runFrame(), /called glClear, but this host selected WebGPU/);
+  } finally {
+    host.destroy();
+  }
+});
+
+test('a WebGPU-only cart is refused, with the reason, by a host that cannot provide WebGPU', async () => {
+  const host = new CartHost();
+  await assert.rejects(host.load(fixture('wgpucart.wasc'), { wgpu: false }),
+    /this cart is a WebGPU cart, but this host cannot provide WebGPU: the embedder disabled it/);
+});
+
+test('gpu_api values a cart does not back are refused at load', async () => {
+  await assert.rejects(new CartHost().load(fixture('gpuapi2.wasc')), /declares gpu_api 2 \(WebGPU\) but imports no WebGPU functions/);
+  await assert.rejects(new CartHost().load(fixture('gpuapi3.wasc')), /declares gpu_api 3, which this host does not support/);
+});
+
+test('a WebGPU function the glue lacks is a load error naming it, never a stub', async () => {
+  await assert.rejects(new CartHost().load(fixture('wgpufake.wasc')), /does not provide: wgpuDeviceDoesNotExistYet/);
+});
+
+test('the embedder or WASMCART_WGPU_POWER picks the GPU, and the host says which it got', async () => {
+  // On a two-GPU machine powerPreference is what separates them (low-power =
+  // the integrated GPU); a caller that must not touch one asserts on this.
+  const host = new CartHost();
+  await host.load(fixture('wgpucart.wasc'), { adapterOptions: { powerPreference: 'low-power' } });
+  try {
+    const a = host.getGpuAdapterInfo();
+    assert.equal(a.powerPreference, 'low-power');
+    assert.ok(a.vendor || a.device || a.description, 'the adapter names itself');
+  } finally {
+    host.destroy();
+  }
+  assert.equal(new CartHost().getGpuAdapterInfo(), null, 'no WebGPU cart, no adapter');
+
+  process.env.WASMCART_WGPU_POWER = 'high-performance';
+  const viaEnv = new CartHost();
+  try {
+    await viaEnv.load(fixture('wgpucart.wasc'));
+    assert.equal(viaEnv.getGpuAdapterInfo().powerPreference, 'high-performance');
+    viaEnv.destroy();
+    process.env.WASMCART_WGPU_POWER = 'fastest';
+    await assert.rejects(new CartHost().load(fixture('wgpucart.wasc')), /WASMCART_WGPU_POWER=fastest: expected low-power or high-performance/);
+  } finally {
+    delete process.env.WASMCART_WGPU_POWER;
+  }
+});
+
+test('a host device is core WebGPU where the adapter has it, compatibility mode where it does not or when forced', async () => {
+  const isCore = host => host.getGpuDevice().features.has('core-features-and-limits');
+  const run = async (options) => {
+    const host = new CartHost();
+    await host.load(fixture('wgpucart.wasc'), options);
+    try { return { level: host.getGpuAdapterInfo().featureLevel, core: isCore(host) }; } finally { host.destroy(); }
+  };
+  assert.deepEqual(await run({}), { level: 'core', core: true });
+
+  // The controls: on each of these a core device would be wrong.
+  assert.deepEqual(await run({ adapterOptions: { featureLevel: 'compatibility' } }), { level: 'compatibility', core: false });
+  process.env.WASMCART_WGPU_FEATURE_LEVEL = 'compatibility';
+  try {
+    assert.deepEqual(await run({}), { level: 'compatibility', core: false });
+    process.env.WASMCART_WGPU_FEATURE_LEVEL = 'best';
+    await assert.rejects(new CartHost().load(fixture('wgpucart.wasc')), /WASMCART_WGPU_FEATURE_LEVEL=best: expected core or compatibility/);
+  } finally {
+    delete process.env.WASMCART_WGPU_FEATURE_LEVEL;
+  }
+
+  // A GPU with no core adapter: the host asks again, and the cart runs.
+  const { createGPU, globals } = await import('webgpu-node');
+  const real = createGPU();
+  const asked = [];
+  const noCore = { requestAdapter: o => { asked.push(o?.featureLevel); return o?.featureLevel === 'core' ? Promise.resolve(null) : real.requestAdapter(o); },
+    getPreferredCanvasFormat: () => real.getPreferredCanvasFormat(), get wgslLanguageFeatures() { return real.wgslLanguageFeatures; } };
+  assert.deepEqual(await run({ gpu: noCore, gpuGlobals: globals }), { level: 'compatibility', core: false });
+  assert.deepEqual(asked.slice(0, 2), ['core', 'compatibility']);
+  // Forced to core, there is no such adapter: refused, not quietly downgraded.
+  await assert.rejects(new CartHost().load(fixture('wgpucart.wasc'), { gpu: noCore, gpuGlobals: globals, adapterOptions: { featureLevel: 'core' } }), /no WebGPU adapter/);
+});
+
+test('a WebGPU cart with malloc but no wc_alloc stops with the clear error, its malloc never used', async () => {
+  const host = new CartHost();
+  try {
+    // its compute result is read through a mapped range, which needs cart memory
+    await assert.rejects(async () => {
+      await host.load(fixture('wgpucart031.wasc'));
+      for (let i = 0; i < 20; i++) { host.runFrame(); await tick(); }
+    }, e => e.name === 'CartMemoryError' && e.code === 'missing'
+      && /WebGPU .* must write into the cart's memory, but the cart does not export wc_alloc\/wc_free/.test(e.message));
+  } finally {
+    await host.destroy();
+  }
+});
+
+test('a WebGPU glue allocation that gets a bad pointer stops the cart with the bounds error', async () => {
+  const host = new CartHost();
+  try {
+    await host.load(fixture('wgpucart.wasc'));
+    const ex = host.instance.exports;
+    ex.t_alloc_mode(1); // wc_alloc now returns 0xFFFFFFF0
+    let err = null;
+    for (let i = 0; i < 20 && !err; i++) {
+      try { host.runFrame(); } catch (e) { err = e; }
+      await tick();
+    }
+    assert.ok(err, 'the cart stopped');
+    assert.equal(err.name, 'CartMemoryError');
+    assert.match(err.message, /WebGPU .*wc_alloc\(\d+, 16\) returned 0xfffffff0, which is outside its \d+-byte memory/);
+    assert.notEqual(ex.wgpucart_result(), 42, 'the mapped range never reached the cart');
+  } finally {
+    await host.destroy();
+  }
+});
