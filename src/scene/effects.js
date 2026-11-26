@@ -1286,19 +1286,88 @@ for(const [code,entry] of Object.entries(regionalAssociations)){
  associations[code]={kind:'传统主治区域示意',source:entry.source,targets,note:'传统资料选录关联：'+targets.map(t=>t[0]).join('、')+'。动态线用于展示区域关联，不代表神经、血管或已证实的生理作用路径；完整描述见资料来源。'};
 }
 
-export function createEffects(scene,container){
- const group=new T.Group();scene.add(group);let paths=[],labels=[],shaders=[],paused=false,enabled=true;const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;let elapsed=0,lastTime=null;
- const glowCanvas=document.createElement('canvas');glowCanvas.width=glowCanvas.height=64;
- const gctx=glowCanvas.getContext('2d');
- if(gctx){
-  const g=gctx.createRadialGradient(32,32,0,32,32,32);
-  g.addColorStop(0,'rgba(255,255,255,1)');
-  g.addColorStop(.28,'rgba(110,242,222,0.88)');
-  g.addColorStop(.65,'rgba(110,242,222,0.22)');
-  g.addColorStop(1,'rgba(110,242,222,0)');
-  gctx.fillStyle=g;gctx.fillRect(0,0,64,64);
+// Minimal DOM element used only when createEffects runs in a DOM-less Node
+// test environment. The browser always uses the real document.
+class HeadlessElement{
+ constructor(tagName='span'){
+  this.tagName=String(tagName).toUpperCase();
+  this.children=[];this.childNodes=[];this.style={};this.dataset={};
+  this.hidden=false;this.className='';this.innerHTML='';this.textContent='';
+  this.parentNode=null;this.parentElement=null;
  }
- const glowTex=new T.CanvasTexture(glowCanvas);
+ appendChild(child){child.parentNode=this;child.parentElement=this;this.children.push(child);this.childNodes.push(child);return child;}
+ removeChild(child){
+  const i=this.children.indexOf(child);
+  if(i>=0){this.children.splice(i,1);this.childNodes.splice(i,1);child.parentNode=null;child.parentElement=null;}
+  return child;
+ }
+ remove(){if(this.parentNode&&this.parentNode.removeChild)this.parentNode.removeChild(this);}
+ setAttribute(){}getAttribute(){return null;}addEventListener(){}removeEventListener(){}
+}
+
+function resolveDocument(){
+ try{
+  if(typeof globalThis!=='undefined'&&globalThis.document&&globalThis.document.createElement)return globalThis.document;
+ }catch{/* ignore */}
+ if(typeof document!=='undefined'&&document.createElement)return document; // eslint-disable-line no-undef
+ return null;
+}
+
+function createLabelElement(doc){
+ if(doc&&typeof doc.createElement==='function')return doc.createElement('span');
+ return new HeadlessElement('span');
+}
+
+function prefersReducedMotion(){
+ try{
+  const mq=typeof globalThis.matchMedia==='function'?globalThis.matchMedia('(prefers-reduced-motion: reduce)')
+   :(typeof matchMedia==='function'?matchMedia('(prefers-reduced-motion: reduce)'):null); // eslint-disable-line no-undef
+  return !!mq?.matches;
+ }catch{return false;}
+}
+
+// Shared radial glow sprite texture. Uses a canvas in the browser and a data
+// texture in headless tests, so createEffects never requires a WebGL context.
+function createGlowTexture(){
+ const doc=resolveDocument();
+ if(doc){
+  try{
+   const glowCanvas=doc.createElement('canvas');
+   glowCanvas.width=glowCanvas.height=64;
+   const gctx=glowCanvas.getContext?glowCanvas.getContext('2d'):null;
+   if(gctx){
+    const g=gctx.createRadialGradient(32,32,0,32,32,32);
+    g.addColorStop(0,'rgba(255,255,255,1)');
+    g.addColorStop(.28,'rgba(110,242,222,0.88)');
+    g.addColorStop(.65,'rgba(110,242,222,0.22)');
+    g.addColorStop(1,'rgba(110,242,222,0)');
+    gctx.fillStyle=g;gctx.fillRect(0,0,64,64);
+   }
+   return new T.CanvasTexture(glowCanvas);
+  }catch{/* fall through to data texture */}
+ }
+ const size=64,data=new Uint8Array(size*size*4);
+ for(let y=0;y<size;y++){
+  for(let x=0;x<size;x++){
+   const dx=(x+0.5-size/2)/(size/2),dy=(y+0.5-size/2)/(size/2);
+   const d=Math.min(1,Math.sqrt(dx*dx+dy*dy));
+   let a=0;
+   if(d<.28)a=1-(d/.28)*.12;
+   else if(d<.65)a=.88*(1-(d-.28)/.37)+.22*((d-.28)/.37);
+   else a=.22*Math.max(0,1-(d-.65)/.35);
+   const i=(y*size+x)*4;
+   data[i]=110;data[i+1]=242;data[i+2]=222;data[i+3]=Math.round(a*255);
+  }
+ }
+ const tex=new T.DataTexture(data,size,size,T.RGBAFormat);
+ tex.needsUpdate=true;
+ return tex;
+}
+
+export function createEffects(scene,container){
+ const doc=resolveDocument();
+ const group=new T.Group();scene.add(group);let paths=[],labels=[],shaders=[],paused=false,enabled=true;const reduced=prefersReducedMotion();let elapsed=0,lastTime=null;
+ const glowTex=createGlowTexture();
  const flowVert=`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`;
  const flowFrag=`
   uniform float uTime;
@@ -1313,9 +1382,45 @@ export function createEffects(scene,container){
    float alpha=0.38+0.56*wave;
    gl_FragColor=vec4(col,alpha);
   }`;
- function clear(){for(const l of labels)l.remove();labels=[];shaders=[];group.traverse(o=>{o.geometry?.dispose();if(o.material&&o.material.map!==glowTex)o.material.dispose();});group.clear();paths=[];}
+ // Releases every object created by show(): DOM labels, tube/ring geometries
+ // and ALL materials (including sprite materials). The shared glowTex is owned
+ // by the layer and intentionally survives clear(); dispose() releases it.
+ function clear(){
+  for(const l of labels){
+   try{l.remove?.();}catch{/* already detached */}
+   // Compatibility for minimal fake containers used in unit tests whose
+   // labels do not implement a DOM-like remove().
+   if(l.parentNode===container&&typeof container.removeChild==='function'){
+    try{container.removeChild(l);}catch{/* already removed */}
+   }
+  }
+  labels=[];
+  shaders=[];
+  group.traverse(o=>{
+   // Sprite geometry is a module-level shared quad in three; never dispose it.
+   if(o.geometry&&!o.isSprite&&typeof o.geometry.dispose==='function')o.geometry.dispose();
+   const mats=Array.isArray(o.material)?o.material:(o.material?[o.material]:[]);
+   for(const mat of mats){
+    // Materials are per show() run; always release them. Their maps all point
+    // at the shared glowTex, which must not be disposed here.
+    if(typeof mat.dispose==='function')mat.dispose();
+   }
+  });
+  group.clear();
+  paths=[];
+ }
+ // Full layer teardown: clear transient objects and release the shared texture.
+ function dispose(){
+  clear();
+  if(glowTex&&typeof glowTex.dispose==='function')glowTex.dispose();
+  if(group.parent&&typeof group.parent.remove==='function')group.parent.remove(group);
+ }
  function show(point,start,side=1){
-  clear();const info=associations[point.code];if(!info||!start)return;
+  clear();
+  // A newly shown point always starts in the flowing state, matching first use.
+  paused=false;
+  const info=point?associations[point.code]:null;
+  if(!info||!start)return;
   info.targets.forEach(([name,raw],i)=>{
    const end=new T.Vector3(...raw);end.x*=side;
    const middle=start.clone().lerp(end,.5);
@@ -1350,7 +1455,7 @@ export function createEffects(scene,container){
    const coreGlow=new T.Sprite(new T.SpriteMaterial({map:glowTex,color:0x6ef2de,transparent:true,opacity:.52,depthTest:false,blending:T.AdditiveBlending}));
    coreGlow.scale.set(.32,.32,1);
    haloGroup.add(innerRing,outerRing,coreGlow);group.add(haloGroup);
-   const label=document.createElement('span');label.className='effect-label';
+   const label=createLabelElement(doc);label.className='effect-label';
    label.innerHTML=`<i class="effect-dot"></i><span>${name}</span>`;
    container.appendChild(label);labels.push(label);
    paths.push({curve,start,end,beads,halo:haloGroup,innerRing,outerRing,label,index:i});
@@ -1410,5 +1515,5 @@ export function createEffects(scene,container){
   }
   return leaders;
  }
- return {show,clear,update,setEnabled(v){enabled=v;group.visible=v;for(const l of labels)l.hidden=!v;},setPaused(v){paused=v;},get active(){return paths.length>0;}};
+ return {show,clear,dispose,update,get group(){return group;},setEnabled(v){enabled=v;group.visible=v;for(const l of labels)l.hidden=!v;},setPaused(v){paused=v;},get active(){return paths.length>0;},get pathCount(){return paths.length;}};
 }

@@ -1,7 +1,15 @@
 import {createHuman, nearestSurface} from './scene/human-model.js';
 import {associations, createEffects} from './scene/effects.js';
-import {channels, catalog} from './data/catalog.js';
-import {initialPoints, extraPoints} from './data/points.js';
+import {channels} from './data/catalog.js';
+import {atlasPoints as data, mappedPoints as mapped} from './data/atlas-data.js';
+import {
+  pointMatchesFilters,
+  reconcileSelectedId,
+  pickActiveMarker,
+  selectQiSegments,
+  normalizeSide,
+  VIEW_SIDE
+} from './state/atlas-state.js';
 import * as T from 'three';
 import {OrbitControls} from './vendor/OrbitControls.js';
 
@@ -51,50 +59,20 @@ const specialPoints = {
   'EX-HN3': '经外奇穴', 'EX-HN5': '经外奇穴'
 };
 
-// Learning emphasis selected for this atlas, not a clinical importance ranking.
-const keyCodes = new Set([
-  'GV20','EX-HN3','EX-HN5','GB20','LI20','CV17','CV12','CV6','CV4',
-  'GV14','BL23','LI4','LI11','LU7','PC6','PC8','HT7','ST36','SP6',
-  'SP9','GB34','KI3','KI1','LR3','BL40'
-]);
-
-const mapped = [...initialPoints];
-for (const row of extraPoints) {
-  const [code, name, pinyin, region, x, y, z, location, view] = row;
-  const channel = channels.find(c => code.startsWith(c.code));
-  mapped.push({
-    code, name, pinyin, region,
-    pos: [x, y, z], location, view,
-    meridian: channel?.name || '经外奇穴',
-    bilateral: !['GV', 'CV'].includes(channel?.code)
-  });
-}
-mapped.find(p => p.code === 'LI4').region = '手部';
-mapped.find(p => p.code === 'LR3').region = '足部';
-
-const data = [
-  ...mapped,
-  ...catalog
-    .filter(p => !mapped.some(m => m.code === p.code))
-    .map(p => ({
-      ...p,
-      region: '未建模',
-      pinyin: p.code,
-      location: '已收录穴名、国际标准编码与所属经脉；此穴位暂未配置简化三维坐标。',
-      bilateral: !['GV', 'CV'].includes(p.channel)
-    }))
-].map((p, id) => ({
-  ...p,
-  id,
-  modeled: !!p.pos,
-  important: keyCodes.has(p.code),
-  order: parseInt(p.code.match(/\d+$/)?.[0] || 0)
-}));
+// Learning emphasis flags and the assembled point dataset live in
+// src/data/atlas-data.js so the exact runtime dataset is unit-testable.
 
 let effectLayer = null, effectPaused = false;
-let selected = 12, region = '全部', query = '', channelFilter = '全部', scope = 'model'; // Default 合谷 (LI4) or 百会
-// Keep default 百会/迎香 or 合谷? Let's check index 12 -> 合谷, index 3 -> 迎香. Let's default to 合谷 (id of LI4) so user immediately sees glowing curves + light needle!
-selected = data.find(p => p.code === 'LI4')?.id ?? 3;
+// Single view-state source for filter / selection / observation-side linkage.
+const view = {
+  scope: 'model', // Default 三维穴位 tab
+  region: '全部',
+  channel: '全部',
+  query: '',
+  side: VIEW_SIDE.LEFT
+};
+// Default selection: 合谷 (LI4) so the opening scene shows curves + light needle.
+let selected = data.find(p => p.code === 'LI4')?.id ?? 3;
 
 let scene, camera, renderer, controls, humanMesh, wireMesh, compassMesh, haloRingMesh, ambientParticles;
 let markers = [], meridianSegments = [], activeQiParticles = [], body = [], auto = false;
@@ -145,56 +123,79 @@ if ($('#shichenText')) {
   };
 }
 
-const normalize = s =>
-  s.toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f\s-]/g, '')
-    .replace(/^sj/, 'te')
-    .replace(/^du/, 'gv')
-    .replace(/^ren/, 'cv');
+// The filter predicate is the single tested implementation shared with the
+// Node linkage tests. `view` is passed by reference so every caller observes
+// the current scope/region/channel/query state.
+const visible = p => pointMatchesFilters(p, view);
 
-const visible = p =>
-  (scope === 'catalog' || p.modeled) &&
-  (scope === 'catalog' || region === '全部' || p.region === region) &&
-  (channelFilter === '全部' || p.meridian === channelFilter) &&
-  (!query || normalize(p.name + p.code + p.pinyin + p.meridian + (p.code === 'GV26' ? '人中' : '')).includes(normalize(query)));
-
-const siblings = () =>
-  data
-    .filter(p => p.meridian === data[selected].meridian && (scope === 'catalog' || p.modeled))
+const siblings = () => {
+  if (selected == null || !data[selected]) return [];
+  const meridian = data[selected].meridian;
+  return data
+    .filter(p => p.meridian === meridian && (view.scope === 'catalog' || p.modeled))
     .sort((a, b) => a.order - b.order);
+};
 
 function syncMeridianPills() {
   $$('#meridianPills button').forEach(b => {
-    b.classList.toggle('active', b.dataset.channel === channelFilter);
+    b.classList.toggle('active', b.dataset.channel === view.channel);
   });
   if ($('#channelBadgeMini')) {
-    $('#channelBadgeMini').textContent = channelFilter === '全部' ? '全部' : (channelMeta[channelFilter]?.short || channelFilter);
+    $('#channelBadgeMini').textContent = view.channel === '全部' ? '全部' : (channelMeta[view.channel]?.short || view.channel);
   }
   const filterBadge = $('#activeFilterBadge');
   if (filterBadge) {
     const parts = [];
-    if (channelFilter !== '全部') parts.push(channelMeta[channelFilter]?.short || channelFilter);
-    if (region !== '全部' && scope === 'model') parts.push(region);
-    if (query) parts.push(`“${query}”`);
+    if (view.channel !== '全部') parts.push(channelMeta[view.channel]?.short || view.channel);
+    if (view.region !== '全部' && view.scope === 'model') parts.push(view.region);
+    if (view.query) parts.push(`“${view.query}”`);
     filterBadge.hidden = parts.length === 0;
     filterBadge.textContent = '筛选：' + parts.join(' · ');
   }
 }
 
-function setChannelFilter(val) {
-  channelFilter = val;
-  syncMeridianPills();
+// Single entry point for every filter change. It reconciles the selection
+// (auto-follow first visible / null on empty), re-renders the list and forces
+// all scene representations to evaluate against the same view state.
+function applyFilterChange({focusFirst = false} = {}) {
+  const before = selected;
+  selected = reconcileSelectedId(data, view, selected);
+  const selectionChanged = before !== selected;
+
+  syncRegionButtons();
+  syncScopeButtons();
   list();
+
+  if (selected == null) {
+    renderEmptySelection();
+  } else if (selectionChanged) {
+    renderSelectionDetails();
+    rebuildActiveQiParticles();
+    updateEffects(false);
+    if (focusFirst && camera && data[selected].modeled) focusPoint();
+  }
+  // Even when the selection survives, the marker/line visibility pass in the
+  // render loop plus an immediate overlay sync below updates the scene.
+  syncSceneOverlaysNow();
+  return selected;
+}
+
+function setChannelFilter(val) {
+  view.channel = val;
+  applyFilterChange();
 }
 
 function list() {
   const filtered = data.filter(visible).sort((a, b) => (a.meridian === b.meridian ? a.order - b.order : 0));
   $('#count').textContent = `共 ${filtered.length} 穴`;
+  const emptyMarkup =
+    view.scope === 'catalog'
+      ? '<p class="muted empty-state" data-empty-state style="padding:14px 4px">没有匹配的穴位。试试更换经脉或搜索词，或<a href="#" data-empty-reset>重置全部筛选</a>。</p>'
+      : '<p class="muted empty-state" data-empty-state style="padding:14px 4px">当前筛选条件下没有可显示的三维穴位。试试重置筛选，或切换至「完整目录」。 <a href="#" data-empty-reset>重置筛选 ↺</a></p>';
   $('#list').innerHTML = filtered.length
     ? filtered
         .map(
-          p => `<button class="point-row ${p.id === selected ? 'active' : ''}" data-id="${p.id}">
+          p => `<button class="point-row ${p.id === selected ? 'active' : ''}" data-id="${p.id}" aria-label="${p.name} ${p.code}">
             <span>
               <b>
                 <i class="row-dot" style="background:${colors[p.meridian]};color:${colors[p.meridian]}"></i>
@@ -208,13 +209,17 @@ function list() {
           </button>`
         )
         .join('')
-    : '<p class="muted" style="padding:14px 4px">没有匹配的穴位。试试重置筛选，或切换至「完整目录」。</p>';
+    : emptyMarkup;
 
-  $('#list').querySelectorAll('button').forEach(b => (b.onclick = () => select(+b.dataset.id, true)));
-  $('#stageCount').textContent = `${data.filter(p => p.modeled && visible(p)).length} 个 3D 穴位`;
+  $('#list').querySelectorAll('button.point-row').forEach(b => (b.onclick = () => select(+b.dataset.id, true)));
+  const emptyReset = $('#list [data-empty-reset]');
+  if (emptyReset) emptyReset.onclick = e => { e.preventDefault(); resetAllFilters(); };
+  const modeledCount = data.filter(p => p.modeled && visible(p)).length;
+  $('#stageCount').textContent = `${modeledCount} 个 3D 穴位`;
+  $('#stageCount').classList.toggle('is-empty', modeledCount === 0);
 
-  const c = channels.find(c => c.name === channelFilter);
-  const meta = channelMeta[channelFilter];
+  const c = channels.find(c => c.name === view.channel);
+  const meta = channelMeta[view.channel];
   const metaEl = $('#channelMeta');
   if (c && meta) {
     metaEl.hidden = false;
@@ -231,14 +236,16 @@ function rebuildActiveQiParticles() {
   if (!scene || !dotTex) return;
   for (const qp of activeQiParticles) {
     scene.remove(qp.sprite);
+    // Each particle owns its SpriteMaterial; the shared sprite quad geometry
+    // and shared dotTex must not be disposed here.
     qp.sprite.material.dispose();
   }
   activeQiParticles = [];
-  const activeMeridian = data[selected]?.meridian;
-  const activeSide = Number($('#sideChoice').value);
-  const segs = meridianSegments.filter(
-    s => s.meridian === activeMeridian && (!s.bilateral || s.side === activeSide || channelFilter === activeMeridian)
-  );
+  const activeMeridian = selected == null ? null : data[selected]?.meridian;
+  // Strict active-side scoping: switching sides fully rebuilds the set, so no
+  // particle from the previous side can survive. Central segments are included
+  // on both sides by selectQiSegments.
+  const segs = selectQiSegments(meridianSegments, activeMeridian, view.side);
   segs.forEach((seg, idx) => {
     for (let k = 0; k < 2; k++) {
       const sp = new T.Sprite(
@@ -258,13 +265,28 @@ function rebuildActiveQiParticles() {
   });
 }
 
-function select(id, turn = false) {
-  selected = id;
+function resetEffectPlayback() {
+  effectPaused = false;
+  const btn = $('#pauseEffects');
+  if (btn) btn.textContent = '暂停流动';
+  effectLayer?.setPaused?.(false);
+}
+
+// Fills the right-hand dossier for the current `selected` id. Assumes a valid
+// selected point; renderEmptySelection handles the null state.
+function renderSelectionDetails() {
+  const id = selected;
   const p = data[id];
-  for (const key of ['code', 'name', 'pinyin', 'meridian', 'location']) {
-    $('#' + key).textContent = p[key];
+  if (!p) {
+    renderEmptySelection();
+    return;
   }
+  $('#code').textContent = p.code;
+  $('#name').textContent = p.name;
+  $('#pinyin').textContent = p.pinyin;
+  $('#location').textContent = p.location;
   const mColor = colors[p.meridian] || '#6ef2de';
+  $('#meridian').textContent = p.meridian;
   $('#meridian').style.borderColor = mColor + '66';
   $('#meridian').style.color = mColor;
 
@@ -296,7 +318,7 @@ function select(id, turn = false) {
   const c = channels.find(c => c.name === p.meridian);
   $('#routeInfo').textContent = c ? `循行方向：${c.route}` : '不归属于十四经脉的经验选录奇穴。';
   if ($('#shichenDetail')) {
-    $('#shichenDetail').innerHTML = `<span>子午流注：<b>${meta.shichen}</b></span><span>属性：<b>${meta.element}</b></span>`;
+    $('#shichenDetail').innerHTML = `<span>子午流注：<b>${meta.shichen || '—'}</b></span><span>属性：<b>${meta.element}</b></span>`;
   }
   $('#channelTotal').textContent = c
     ? `本经 ${c.names.length} 穴 · 3D ${mapped.filter(x => x.meridian === c.name).length} 穴`
@@ -304,9 +326,9 @@ function select(id, turn = false) {
 
   const sib = siblings();
   const i = sib.findIndex(x => x.id === id);
-  $('#neighborIndex').textContent = `${i + 1} / ${sib.length}`;
+  $('#neighborIndex').textContent = `${Math.max(0, i + 1)} / ${sib.length}`;
   if ($('#meridianProgress i')) {
-    const pct = sib.length > 0 ? Math.max(8, ((i + 1) / sib.length) * 100) : 100;
+    const pct = sib.length > 0 ? Math.max(8, ((Math.max(0, i) + 1) / sib.length) * 100) : 100;
     $('#meridianProgress i').style.width = `${pct.toFixed(1)}%`;
   }
   $('#previous').disabled = i <= 0;
@@ -318,14 +340,126 @@ function select(id, turn = false) {
   $('#nearby').querySelectorAll('button').forEach(b => (b.onclick = () => select(+b.dataset.id, true)));
 
   $$('#effectExamples button').forEach(b => b.classList.toggle('active', b.dataset.code === p.code));
+}
+
+// Explicit empty state: no point passes the filters. Every selection-bound 3D
+// indicator (needle, reticle, qi particles, association flow) is hidden/cleared.
+function renderEmptySelection() {
+  selected = null;
+  $('#code').textContent = '—';
+  $('#name').textContent = '无匹配穴位';
+  $('#pinyin').textContent = 'No matching acupoint';
+  $('#location').textContent = '当前经脉、部位与搜索词组合下没有可展示的穴位。请调整筛选条件或重置筛选。';
+  const meridianEl = $('#meridian');
+  if (meridianEl) {
+    meridianEl.textContent = '筛选结果为空';
+    meridianEl.style.borderColor = 'rgba(140,160,170,0.35)';
+    meridianEl.style.color = 'var(--muted, #8fa3ad)';
+  }
+  if ($('#elementBadge')) $('#elementBadge').textContent = '';
+  if ($('#bilateralBadge')) $('#bilateralBadge').textContent = '';
+  const spEl = $('#specialBadge');
+  if (spEl) spEl.hidden = true;
+  const status = $('#modelStatus');
+  if (status) {
+    status.textContent = '○ 无可见穴位';
+    status.classList.remove('important');
+  }
+  const focusBtn = $('#focus');
+  if (focusBtn) {
+    focusBtn.disabled = true;
+    focusBtn.innerHTML = '<span>当前没有可聚焦的三维穴位</span>';
+  }
+  $('#tip').textContent = '左侧列表与三维场景使用同一套筛选条件；出现可见穴位后会自动选中第一个。';
+  $('#routeInfo').textContent = '';
+  if ($('#shichenDetail')) $('#shichenDetail').innerHTML = '';
+  $('#channelTotal').textContent = '';
+  $('#neighborIndex').textContent = '0 / 0';
+  if ($('#meridianProgress i')) $('#meridianProgress i').style.width = '0%';
+  $('#previous').disabled = true;
+  $('#next').disabled = true;
+  $('#nearby').innerHTML = '';
+  $$('#effectExamples button').forEach(b => b.classList.remove('active'));
+
+  // Hide needle + target rings immediately (render loop would also hide them).
+  if (reticleGroup) reticleGroup.visible = false;
+  rebuildActiveQiParticles();
+  updateEffects(false);
+  const sceneEmpty = $('#sceneEmptyHint');
+  if (sceneEmpty) sceneEmpty.hidden = false;
+}
+
+function select(id, turn = false) {
+  if (id == null || !data[id]) {
+    selected = null;
+    list();
+    renderEmptySelection();
+    syncSceneOverlaysNow();
+    return;
+  }
+  selected = id;
+  resetEffectPlayback();
+  renderSelectionDetails();
 
   list();
   const activeRow = $('#list .point-row.active');
   if (activeRow) activeRow.scrollIntoView({block: 'nearest', behavior: 'smooth'});
 
   rebuildActiveQiParticles();
-  if (turn && camera && p.modeled) focusPoint();
-  updateEffects(turn && !p.modeled);
+  if (turn && camera && data[id].modeled) focusPoint();
+  updateEffects(turn && !data[id].modeled);
+  const sceneEmpty = $('#sceneEmptyHint');
+  if (sceneEmpty) sceneEmpty.hidden = true;
+  syncSceneOverlaysNow();
+}
+
+// Immediate visibility/label/reticle reconciliation outside the rAF label
+// throttle, so a just-hidden point cannot leave a visible label, stale SVG
+// leader or an old-side needle/target before the next rendered frame.
+function syncSceneOverlaysNow() {
+  if (typeof document === 'undefined') return;
+  for (const m of markers) {
+    m.mesh.visible = visible(m.p);
+    if (!m.mesh.visible || (m.p.bilateral && m.side !== view.side)) m.label.hidden = true;
+  }
+  // Snap the needle + target rings to the side-correct marker right away; the
+  // animation loop keeps pulsing/orienting them afterwards.
+  if (reticleGroup) {
+    const active = pickActiveMarker(markers, selected, view.side);
+    if (active && active.mesh.visible && visible(active.p)) {
+      reticleGroup.visible = true;
+      reticleGroup.position.copy(active.mesh.position);
+      if (active.normal) {
+        reticleGroup.quaternion.setFromUnitVectors(new T.Vector3(0, 0, 1), active.normal);
+      }
+    } else {
+      reticleGroup.visible = false;
+    }
+  }
+  const svg = $('#leaderLines');
+  if (svg) svg.innerHTML = '';
+  const sceneEmpty = $('#sceneEmptyHint');
+  if (sceneEmpty) sceneEmpty.hidden = selected != null;
+}
+
+function syncRegionButtons() {
+  $$('#regions button').forEach(x => x.classList.toggle('active', x.textContent === view.region));
+}
+
+function syncScopeButtons() {
+  $$('#scope button').forEach(x => x.classList.toggle('active', x.dataset.scope === view.scope));
+  const regionSection = $('#regionSection');
+  if (regionSection) regionSection.hidden = view.scope === 'catalog';
+}
+
+function resetAllFilters() {
+  view.region = '全部';
+  view.query = '';
+  view.channel = '全部';
+  const search = $('#search');
+  if (search) search.value = '';
+  syncRegionButtons();
+  applyFilterChange();
 }
 
 // 初始化解剖区域矩阵
@@ -335,14 +469,14 @@ $('#regions').innerHTML = ['全部', '头颈', '躯干', '背部', '上肢', '�
 
 $('#regions').querySelectorAll('button').forEach(b => {
   b.onclick = () => {
-    region = b.textContent;
-    $('#regions').querySelectorAll('button').forEach(x => x.classList.toggle('active', x === b));
-    list();
+    view.region = b.textContent;
+    syncRegionButtons();
+    applyFilterChange();
     if (camera) {
-      if (region === '背部') setView('back');
-      else if (region === '头颈') setView('head');
-      else if (region === '足部') setView('foot');
-      else if (region === '手部') setView('hand');
+      if (view.region === '背部') setView('back');
+      else if (view.region === '头颈') setView('head');
+      else if (view.region === '足部') setView('foot');
+      else if (view.region === '手部') setView('hand');
       else setView('front');
     }
   };
@@ -361,28 +495,31 @@ $('#meridianPills').querySelectorAll('button').forEach(b => {
 });
 
 $('#search').oninput = e => {
-  query = e.target.value.trim();
-  list();
+  view.query = e.target.value.trim();
+  applyFilterChange();
 };
 
 $('#scope').querySelectorAll('button').forEach(b => {
   b.onclick = () => {
-    scope = b.dataset.scope;
-    $('#scope').querySelectorAll('button').forEach(x => x.classList.toggle('active', x === b));
-    $('#regionSection').hidden = scope === 'catalog';
-    select(selected);
+    view.scope = b.dataset.scope;
+    syncScopeButtons();
+    // Scope changes which points are eligible; reconcile and fully re-render.
+    applyFilterChange();
   };
 });
 
 $('#clear').onclick = () => {
-  region = '全部';
-  query = '';
-  channelFilter = '全部';
-  $('#search').value = '';
-  $('#regions').querySelectorAll('button').forEach(b => b.classList.toggle('active', b.textContent === '全部'));
-  list();
+  resetAllFilters();
   setView('front');
 };
+
+const sceneEmptyReset = document.querySelector('[data-scene-empty-reset]');
+if (sceneEmptyReset) {
+  sceneEmptyReset.onclick = e => {
+    e.preventDefault();
+    resetAllFilters();
+  };
+}
 
 $('#previous').onclick = () => {
   const a = siblings(), i = a.findIndex(p => p.id === selected);
@@ -396,10 +533,15 @@ $('#next').onclick = () => {
 $('#summaryCounts').textContent = `${mapped.length} 个三维空间穴位 · ${mapped.filter(p => associations[p.code]).length} 个动态关联流光`;
 $('#footerCount').textContent = `收录 361 正经穴 + 2 奇穴 · ${mapped.length} 个 3D 空间点位`;
 
-$('#sideChoice').onchange = () => {
+$('#sideChoice').onchange = e => {
+  view.side = normalizeSide(e.target.value);
+  // Rebuild side-scoped qi particles, re-anchor needle/reticle via the render
+  // loop and rebuild association flows from the new side marker. Rebuilding
+  // through show()/clear() guarantees no previous-side objects remain.
   rebuildActiveQiParticles();
-  if (data[selected].modeled) focusPoint();
+  if (selected != null && data[selected]?.modeled) focusPoint();
   updateEffects(true);
+  syncSceneOverlaysNow();
 };
 
 // 经典关联穴位快捷按钮
@@ -418,8 +560,13 @@ $('#effectExamples').querySelectorAll('button').forEach(b => {
 });
 
 function updateEffects(fit = false) {
-  const p = data[selected], info = associations[p.code];
-  $('#effectSummary').textContent = info ? info.note : '此穴位暂未收录可视化部位关联，当前不绘制三维流光连线。';
+  const p = selected == null ? null : data[selected];
+  const info = p ? associations[p.code] : null;
+  $('#effectSummary').textContent = info
+    ? info.note
+    : selected == null
+      ? '当前筛选结果为空，没有可展示的关联流光。'
+      : '此穴位暂未收录可视化部位关联，当前不绘制三维流光连线。';
   $('#effectKind').textContent = info ? info.kind : '暂无关联';
   $('#effectTargets').textContent = info ? '关联区域：' + info.targets.map(t => t[0]).join(' · ') : '暂未配置区域连线';
   $('#effectSource').hidden = !info;
@@ -427,9 +574,17 @@ function updateEffects(fit = false) {
   $('#pauseEffects').disabled = !info;
   $('#fitEffects').disabled = !info;
   if (!effectLayer) return;
-  const side = Number($('#sideChoice').value);
-  const mark = markers.find(m => m.p.id === selected && (m.side === side || !m.p.bilateral));
-  effectLayer.show(p, mark?.mesh.position.clone(), side);
+  if (!p || !info) {
+    // Clears any flow tubes / halos / labels left by the previous selection,
+    // including when the filter result is empty.
+    effectLayer.clear();
+    return;
+  }
+  const mark = pickActiveMarker(markers, p.id, view.side);
+  // Rebuild from the side-correct marker position. show() first disposes the
+  // previous run, so side switches never retain old-side tubes or labels.
+  effectLayer.show(p, mark?.mesh.position.clone(), view.side);
+  effectLayer.setPaused(effectPaused);
   effectLayer.setEnabled($('#showEffects').checked);
   if (info && fit && $('#showEffects').checked) frameEffects();
 }
@@ -447,12 +602,12 @@ function flyTo(targetPos, camPos, duration = 680) {
 }
 
 function frameEffects() {
-  if (!camera || !associations[data[selected].code]) return;
+  if (!camera || selected == null || !associations[data[selected].code]) return;
   auto = false;
   $('#rotate').classList.remove('active');
   const p = data[selected], info = associations[p.code];
   const rear = p.pos?.[2] < 0 && info.targets.every(t => t[1][2] < 0);
-  const side = Number($('#sideChoice').value);
+  const side = view.side;
   flyTo(new T.Vector3(0, 3.86, 0), new T.Vector3(side * 1.4, 4.35, rear ? -12.9 : 12.9));
   $$('[data-view]').forEach(b => b.classList.remove('active'));
 }
@@ -469,9 +624,9 @@ $('#pauseEffects').onclick = () => {
 $('#fitEffects').onclick = frameEffects;
 
 function focusPoint() {
-  if (!camera || !data[selected].modeled) return;
-  const side = Number($('#sideChoice').value);
-  const mark = markers.find(m => m.p.id === selected && (m.side === side || !m.p.bilateral));
+  if (!camera || selected == null || !data[selected]?.modeled) return;
+  const side = view.side;
+  const mark = pickActiveMarker(markers, selected, side);
   if (!mark) return;
   auto = false;
   $('#rotate').classList.remove('active');
@@ -487,7 +642,7 @@ function setView(v) {
   if (!camera) return;
   auto = false;
   $('#rotate').classList.remove('active');
-  const side = Number($('#sideChoice').value);
+  const side = view.side;
   const d = 12.6;
   let target = new T.Vector3(0, 3.86, 0);
   let cam = new T.Vector3(0, 4.28, d);
@@ -1255,8 +1410,8 @@ try {
     if (ambientParticles) ambientParticles.rotation.y = -time * 0.00007;
 
     const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
-    const activeSide = Number($('#sideChoice').value);
-    const selectedPoint = data[selected];
+    const activeSide = view.side;
+    const selectedPoint = selected == null ? null : data[selected];
     let selectedMarker = null;
 
     for (const m of markers) {
@@ -1317,7 +1472,8 @@ try {
       const ordered = [...markers].sort((a, b) => {
         const selDiff = (b.p.id === selected) - (a.p.id === selected);
         if (selDiff) return selDiff;
-        const merDiff = (b.p.meridian === selectedPoint.meridian) - (a.p.meridian === selectedPoint.meridian);
+        const merDiff =
+          (b.p.meridian === selectedPoint?.meridian) - (a.p.meridian === selectedPoint?.meridian);
         if (merDiff) return merDiff;
         return Number(b.p.important) - Number(a.p.important);
       });
@@ -1454,7 +1610,48 @@ if (immersiveButton) {
     } else if (e.key === 'ArrowLeft') {
       $('#previous').click();
     } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
       $('#next').click();
     }
   });
+}
+
+// Inspection hook for automated linkage checks / debugging. Read-only by
+// default but also exposes the same actions the UI controls use.
+if (typeof window !== 'undefined') {
+  window.__atlas = {
+    view,
+    data,
+    get selected() {
+      return selected;
+    },
+    get markers() {
+      return markers;
+    },
+    get meridianSegments() {
+      return meridianSegments;
+    },
+    get qiParticles() {
+      return activeQiParticles;
+    },
+    get reticle() {
+      return reticleGroup;
+    },
+    get effectLayer() {
+      return effectLayer;
+    },
+    get scene() {
+      return scene;
+    },
+    visible,
+    select,
+    setChannelFilter,
+    applyFilterChange,
+    // Test helper: number of children inside the effects group.
+    effectObjectCount() {
+      if (!scene) return 0;
+      const g = scene.children.find(c => c.isGroup && c !== reticleGroup);
+      return g ? g.children.length : 0;
+    }
+  };
 }
