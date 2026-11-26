@@ -27,6 +27,8 @@ const
 	shareapi = {},
 	str = {},
 
+	// Played sets only ever store song IDs as strings, scoped to the active
+	// random-continuation candidate set (full library vs. filtered results)
 	played = [],
 	playedFiltered = [],
 	songs = [],
@@ -642,7 +644,7 @@ function dropItem(e) {
 	if (to.tagName != 'LI') to = to.parentNode;
 	log('Drag ['+ drag.textContent +'] to place of ['+ to.textContent +']');
 	cls(to, 'over', REM);
-	const indexfrom = e.dataTransfer.getData('text');
+	const indexfrom = +e.dataTransfer.getData('text');
 	const indexto = getIndex(to);
 	if (indexto != indexfrom) moveItem(drag, to, indexfrom, indexto);
 	if (cfg.index != -1) cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
@@ -667,17 +669,53 @@ function moveItem(drag, to, indexfrom, indexto) {
 function removeItem(e) {
 	e.preventDefault();
 	e.stopPropagation();
-	const index = getIndex(drag);
+	const index = +getIndex(drag);
+	if (index < 0 || index >= cfg.playlist.length) return endDrag();
 	const playing = index == cfg.index;
 	const [removed] = cfg.playlist.splice(index, 1);
 	dom.playlist.removeChild(dom.playlist.childNodes[index]);
-	if (cfg.index != -1 && index <= cfg.index)
+
+	// Keep the cursor on the same logical position: removing an item below it
+	// leaves it untouched; removing the playing item or one above it shifts it.
+	// When the playing item is removed, its successor moves into its slot, so
+	// the cursor must stay at `index` instead of stepping back over it.
+	if (cfg.index != -1 && !playing && index < cfg.index)
 		cfg.index--;
-	if (cfg.index != -1 && !playing)
-		cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
+	cfg.index = Math.min(cfg.index, cfg.playlist.length - 1);
+
+	// Drop the removed song from every played set, so it can be picked again
+	// and no played entry references a song that left the playlist
+	const removedId = songIdByPath(removed.path);
+	if (removedId != null) {
+		unmarkPlayed(played, [removedId]);
+		unmarkPlayed(playedFiltered, [removedId]);
+	}
+
 	endDrag();
 	resizePlaylist();
 	undimSong(removed.path);
+
+	if (cfg.playlist.length == 0) {	// Last item removed: reset the cursor
+		cfg.index = -1;
+		audio[0].prepped = audio[1].prepped = false;
+		stop();
+		return;
+	}
+
+	if (playing) {	// Highlight, cursor and continuation all land on the successor
+		audio[0].prepped = audio[1].prepped = false;
+		cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
+		play(cfg.index);
+	} else if (cfg.index != -1)
+		cls(dom.playlist.childNodes[cfg.index], 'playing', ADD);
+}
+
+// Find the current library id for a playlist item by path, if it still exists
+function songIdByPath(path) {
+	for (var i = 0; i < songs.length; i++)
+		if (songs[i].path == path)
+			return songs[i].id.toString();
+	return null;
 }
 
 function getIndex(li) {
@@ -833,8 +871,11 @@ function prepNext() {
 	} else if (cfg.after != 'stopplayback') {
 		log('prepNext from library');
 		if (cfg.after == 'randomfiltered' || cfg.after == 'randomlibrary') {
-			load(getRandom(), true);
+			const random = getRandom();
+			if (random == null) return;	// No eligible candidates: stop safely
+			load(random, true);
 		} else if (cfg.after == 'playlibrary')	{
+			if (songs.length == 0) return;
 			if (cfg.index == -1) return load(songs[0].id, true);
 			const path = cfg.playlist[cfg.index].path;
 			var next = -1;
@@ -855,30 +896,66 @@ function prepNext() {
 	}
 }
 
+// The played set matching the currently active random-continuation mode
+function activePlayed() {
+	return cfg.after == 'randomfiltered' ? playedFiltered : played;
+}
+
+// Keep a played set in the same scope as its candidate set after it changed.
+// Rebuilds in place (a reverse splice loop would skip adjacent entries).
+function prunePlayed(list, candidates) {
+	const keep = candidates.map(String);
+	const retained = list.filter(id => keep.includes(id.toString()));
+	list.length = 0;
+	retained.forEach(id => list.push(id));
+}
+
+// Remove specific ids from a played set (e.g. when a playlist item is deleted)
+function unmarkPlayed(list, ids) {
+	const drop = ids.map(String);
+	const retained = list.filter(id => !drop.includes(id.toString()));
+	list.length = 0;
+	retained.forEach(id => list.push(id));
+}
+
+function markPlayed(id) {
+	id = id.toString();
+	const list = activePlayed();
+	if (!list.includes(id)) {
+		list.push(id);
+		log('Add id '+ id +' to played');
+	}
+}
+
 function getRandom(e = false) {
-	var next = null;
-	do {
-		const count = cfg.after == 'randomfiltered' ? songsFiltered.length : songs.length;
-		if ((cfg.after == 'randomfiltered' ? playedFiltered.length : played.length) == count)
-			clearPlayed(cfg.after);
+	const filtered = cfg.after == 'randomfiltered',
+		candidates = filtered ? songsFiltered : songs.map(s => s.id.toString()),
+		playedList = filtered ? playedFiltered : played;
 
-		next = ~~((Math.random() * count));
+	if (candidates.length == 0) {
+		log('No songs available for random selection', true);
+		return e ? undefined : null;
+	}
 
-		if (cfg.after == 'randomfiltered') {
-			next = songsFiltered[next];	// songsFiltered is an array of id's from songs
-			if (playedFiltered.includes(next.toString()))
-				next = null;
-		} else if (played.includes(next.toString()))
-			next = null;
+	// Reset the played set when every candidate has had its turn, then try
+	// one more round. If no eligible candidate remains (e.g. all artists are
+	// skipped), give up instead of looping forever.
+	for (var attempt = 0; attempt < 2; attempt++) {
+		if (attempt == 1) clearPlayed(cfg.after);
+		var next = pickRandom(candidates, playedList);
+		if (next != null) break;
+		if (playedList.length < candidates.length) break;	// Nothing new to try
+	}
 
-		if (next != null && artistSkipped(songs[next].path)) {
-			if (cfg.after == 'randomfiltered')
-				playedFiltered.push(next);
-			played.push(next);
-			log('Artist of '+ songs[next].path +' is skipped.', true)
-			next = null;
-		}
-	} while (next == null);
+	if (next == null) {
+		log('Random selection exhausted: no eligible songs left', true);
+		return e ? undefined : null;
+	}
+
+	next = next.toString();
+	// Record the pick immediately, in the active scope, so selection and
+	// enqueueing can never drift apart (markPlayed dedupes for add())
+	markPlayed(next);
 	if (e) {	// Enqueue random song
 		e.preventDefault();
 		const nfo = getSongInfo(songs[next].path);
@@ -887,18 +964,38 @@ function getRandom(e = false) {
 	} else return songs[next].id;
 }
 
+// Bounded random pick from candidates, skipping played songs and skipped
+// artists. Skipped-artist songs count as consumed, so they are only
+// reconsidered after the played set is reset.
+function pickRandom(candidates, playedList) {
+	var remaining = candidates.slice();
+	while (remaining.length) {
+		const pos = ~~(Math.random() * remaining.length),
+			id = remaining.splice(pos, 1)[0].toString();
+		if (playedList.includes(id)) continue;
+		if (artistSkipped(songs[id].path)) {
+			playedList.push(id);
+			log('Artist of '+ songs[id].path +' is skipped.', true);
+			continue;
+		}
+		return id;
+	}
+	return null;
+}
+
 function clearPlayed(action) {
 	var msg = 'Clearing played';
-	if (action == 'randomfiltered') {
+	if (action == 'randomfiltered' || action == 'reload') {
 		playedFiltered.length = 0;
-		msg += 'Filtered[]: all songs from the filtered library have been played.'
-	} else {
-		played.length = 0;
-		if (action == 'reload')
-			msg += '[]: user reloaded library.';
-		else
-			msg += '[]: all songs have been played.';
+		msg += ' Filtered[]:';
 	}
+	if (action != 'randomfiltered') {
+		played.length = 0;
+		msg += ' []:';
+	}
+	msg += action == 'reload'
+		? ' user reloaded library.'
+		: ' all songs from the '+ (action == 'randomfiltered' ? 'filtered ' : '') +'library have been played.';
 	log(msg, true);
 }
 
@@ -917,9 +1014,15 @@ function load(id, addtoplaylist = false) {
 	if (addtoplaylist == 'next') add(id, true);
 	else if (addtoplaylist) add(id);
 
+	const index = addtoplaylist ? cfg.index + 1 : id;
+	if (index < 0 || index >= cfg.playlist.length) {
+		log('load: playlist index '+ index +' out of bounds, nothing to load', true);
+		return;
+	}
+
 	const a = audio[+!track];
 	a.prepped = true;
-	a.index = addtoplaylist ? cfg.index + 1 : id;
+	a.index = index;
 	log('a.index = '+ a.index);
 	a.autoplay = false;
 	a.canplaythrough = false;
@@ -1157,6 +1260,7 @@ function getPlaylistCopy() {
 }
 
 function add(id, next = false) {
+	id = +id;
 	const s = {
 		'path': songs[id].path,
 		'cover': songs[id].cover
@@ -1188,12 +1292,8 @@ function add(id, next = false) {
 
 	resizePlaylist();
 	log('Add to playlist (#'+ i +'): '+ s.path);
-	if (!played.includes(id)) {
-		played.push(id);
-		if (cfg.after == 'randomfiltered')
-			playedFiltered.push(id);
-		log('Add id '+ id +' to played');
-	}
+	// Only the active random-continuation scope tracks this song as played
+	markPlayed(songs[id].id);
 }
 
 function playNext(ended = false) {
@@ -1209,6 +1309,10 @@ function playNext(ended = false) {
 		log('PlayNext: not prepped');
 		prepNext();
 		stop();
+	}
+	if (!audio[+!track].prepped) {	// No eligible song to continue with: stop safely
+		log('PlayNext: nothing to continue with, stopping', true);
+		return;
 	}
 	if (audio[+!track].index && (!cfg.playlist[audio[+!track].index] || esc(root + cfg.playlist[audio[+!track].index].path) != audio[+!track].getAttribute('src'))) {
 		log('PlayNext: last minute adjustment to playlist detected, prepping next track', true);
@@ -1309,9 +1413,13 @@ function toggle(e) {
 				const tip = dom.filtertip || dom.randomfiltered.appendChild(dom.filtertip = document.createElement('b'));
 				cls(dom.filtertip, 'filtertip', ADD);
 				tip.textContent = dom.filter.value;
-				buildFilteredLibrary();
-			} else if (dom.filtertip)
-				dom.filtertip = dom.filtertip.remove();
+				buildFilteredLibrary(dom.filter.value.trim(), true);
+			} else {
+				if (dom.filtertip)
+					dom.filtertip = dom.filtertip.remove();
+				if (button.id == 'randomlibrary')
+					prunePlayed(played, songs.map(s => s.id.toString()));
+			}
 			return;
 		case 'lock':
 			return Popup.lock();
@@ -1342,13 +1450,20 @@ function toggle(e) {
 			cls(dom.trash, 'on', cfg.removesongs ? ADD : REM);
 }
 
-function buildFilteredLibrary(terms = dom.filter.value.trim()) {
+function buildFilteredLibrary(terms = dom.filter.value.trim(), keepPlayed = false) {
 	const termsArray = terms.toLowerCase().split(' ');
-	playedFiltered.length = songsFiltered.length = 0;
+	songsFiltered.length = 0;
 
 	for (var s in songs)
 		if (matchTerms(songs[s].path.toLowerCase(), termsArray))
-			songsFiltered.push(songs[s].id);
+			songsFiltered.push(songs[s].id.toString());
+
+	if (keepPlayed)
+		// Filter terms changed: keep only played entries still in the new
+		// candidate set, so the played set stays in scope without resetting
+		prunePlayed(playedFiltered, songsFiltered);
+	else
+		playedFiltered.length = 0;
 }
 
 function toggleLock() {
@@ -1437,6 +1552,8 @@ function clearPlaylist() {
 	cfg.playlist.length = 0;
 	cfg.index = -1;
 	dom.playlist.innerHTML = '';
+	// A fresh playlist starts a fresh random-continuation cycle
+	played.length = playedFiltered.length = 0;
 	resizePlaylist();
 	if (cfg.removesongs) dom.removesongs.click();
 	ffor(tree, function(f) {
@@ -1517,6 +1634,13 @@ function filter(instant = false) {	// Gets event from oninput
 	if (results) {
 		currentFilter = terms;
 		if (!instant) keyNav(null, 'down');
+	}
+
+	// Keep the random-filtered candidate set and its played set in scope with
+	// the new filter terms while "Random from filtered" is active
+	if (cfg.after == 'randomfiltered') {
+		if (dom.filtertip) dom.filtertip.textContent = terms;
+		buildFilteredLibrary(terms, true);
 	}
 }
 
