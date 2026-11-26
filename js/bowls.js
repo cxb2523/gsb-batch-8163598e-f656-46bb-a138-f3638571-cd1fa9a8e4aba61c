@@ -47,10 +47,44 @@ let bus, dryGain, wetGain, master, analyser;
 let bowls = [];
 const voices = {}; // index -> { held, ringUntil, ... }
 const ringing = new Map(); // index -> { t0, tau, sustain }
-let bath = null; // { end, timer, tick }
+let bath = null; // active sound-bath session, see startBath()
+let bathId = 0;
+const bathStats = {
+  starts: 0,
+  stops: 0,
+  naturalEnds: 0,
+  autoStrikes: 0,
+  autoCancelled: 0,
+};
 let animId = 0;
+let initDone = false; // true once the page's bind() has run
 
 const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- clock
+
+// Every delayed thing in the app -- the bath's countdown and its scheduled
+// strikes -- goes through this clock. A test can install a controllable one
+// and drive time by hand, with no real waiting.
+const realClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (id) => clearInterval(id),
+  requestAnimationFrame: (fn) => requestAnimationFrame(fn),
+  cancelAnimationFrame: (id) => cancelAnimationFrame(id),
+};
+let clock = realClock;
+
+// Scheduling picks bowls and delays at random. A test pins this down so the
+// same run always produces the same schedule.
+let random = () => Math.random();
+
+// Voices are made by this backend: Web Audio in the page, a silent recorder
+// in tests, so the lifecycle can be checked without an audio device.
+let synth = null; // null means "use the Web Audio backend"
+let animationEnabled = true; // tests turn the frame loop off
 
 // ---------------------------------------------------------------- tuning
 
@@ -201,7 +235,12 @@ const makeVoice = (freq, { sing = false, strength = 1 } = {}) => {
   return {
     t0,
     tau: PARTIALS[0].tau,
+    sing,
+    freq,
+    released: false,
     release() {
+      if (this.released) return;
+      this.released = true;
       const t = AC.currentTime;
       out.gain.cancelScheduledValues(t);
       out.gain.setTargetAtTime(0, t, 1.3);
@@ -210,30 +249,65 @@ const makeVoice = (freq, { sing = false, strength = 1 } = {}) => {
   };
 };
 
+// The Web Audio backend: a synthetic bowl voice made from the live context.
+const webAudioSynth = {
+  ready: () => !!ensureAudio(),
+  now: () => (AC ? AC.currentTime : 0),
+  voice: (freq, opts) => makeVoice(freq, opts),
+};
+
+// The backend used for a single voice. In tests it is a silent recorder; in
+// the page it is Web Audio. Either way the returned shape is the same, so the
+// voice lifecycle code below never has to know which one is in use.
+const makeVoiceFor = (freq, opts) => (synth || webAudioSynth).voice(freq, opts);
+
 // ---------------------------------------------------------------- playing
 
-const strike = (i, strength = 1) => {
-  if (!ensureAudio()) return;
-  const b = bowls[i];
-  makeVoice(b.freq, { strength });
-  ringing.set(i, { t0: AC.currentTime, tau: PARTIALS[0].tau, sustain: false });
+// True when a voice can be made: either a backend has been injected (tests),
+// or the Web Audio context came up.
+const backendReady = () =>
+  synth ? (typeof synth.ready === "function" ? !!synth.ready() : true) : !!ensureAudio();
+
+const strike = (i, strength = 1, source = "manual") => {
+  if (!backendReady() || !bowls[i]) return false;
+  makeVoiceFor(bowls[i].freq, { strength });
+  ringing.set(i, { t0: nowOf(), tau: PARTIALS[0].tau, sustain: false });
+  if (source === "bath") bathStats.autoStrikes++;
   startAnim();
+  return true;
 };
 
 const singStart = (i) => {
-  if (!ensureAudio() || voices[i]) return;
-  voices[i] = makeVoice(bowls[i].freq, { sing: true });
-  ringing.set(i, { t0: AC.currentTime, tau: 1e9, sustain: true, swell: AC.currentTime });
+  if (!backendReady() || voices[i] || !bowls[i]) return false;
+  const t = nowOf();
+  voices[i] = makeVoiceFor(bowls[i].freq, { sing: true });
+  ringing.set(i, { t0: t, tau: 1e9, sustain: true, swell: t });
   startAnim();
+  return true;
 };
 
 const singStop = (i) => {
   const v = voices[i];
-  if (!v) return;
-  v.release();
+  if (!v) return false;
+  v.release(); // the voice keeps its own frequency, even after a retune
   delete voices[i];
-  ringing.set(i, { t0: AC.currentTime, tau: 1.3, sustain: false, from: ringing.get(i)?.level || 0.8 });
+  const t = nowOf();
+  ringing.set(i, {
+    t0: t,
+    tau: 1.3,
+    sustain: false,
+    from: ringing.get(i)?.level || 0.8,
+  });
+  return true;
 };
+
+// Release every sustained voice, e.g. before a retune rebuilds the bowls.
+// Each voice was made at the old frequency, so it fades out at that pitch.
+const releaseAllVoices = () => {
+  Object.keys(voices).forEach((i) => singStop(+i));
+};
+
+const nowOf = () => (synth ? synth.now() : AC ? AC.currentTime : 0);
 
 // ---------------------------------------------------------------- visuals
 
@@ -243,12 +317,13 @@ const levelOf = (r, now) => {
 };
 
 const startAnim = () => {
-  if (!animId) animId = requestAnimationFrame(frame);
+  if (!animationEnabled || animId) return;
+  animId = clock.requestAnimationFrame(frame);
 };
 
 const frame = () => {
   animId = 0;
-  const now = AC ? AC.currentTime : 0;
+  const now = nowOf();
   document.querySelectorAll(".bowl").forEach((el, i) => {
     const r = ringing.get(i);
     if (!r) return;
@@ -264,7 +339,7 @@ const frame = () => {
     }
   });
   drawSpectrum();
-  if (ringing.size || (bath && bath.end)) animId = requestAnimationFrame(frame);
+  if (ringing.size || (bath && bath.end)) animId = clock.requestAnimationFrame(frame);
   else drawSpectrum(true);
 };
 
@@ -327,48 +402,141 @@ const drawSpectrum = (idle = false) => {
 
 const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
-const scheduleBath = () => {
-  if (!bath) return;
-  const i = (() => {
-    let n;
-    do n = Math.floor(Math.random() * bowls.length);
-    while (n === bath.last && bowls.length > 1);
-    return n;
-  })();
-  bath.last = i;
-  strike(i, 0.6 + Math.random() * 0.4);
-  if (Math.random() < 0.25) setTimeout(() => bath && strike((i + 2) % bowls.length, 0.5), 700);
-  bath.timer = setTimeout(scheduleBath, 3500 + Math.random() * 5500);
+// A bath session owns every delayed strike it schedules. They are all kept in
+// one set so that stopping the bath cancels them together, and each timer is
+// stamped with the session id so one that fires late can never touch a newer
+// session.
+const bathTimers = new Set();
+
+const trackTimer = (key) => {
+  bathTimers.add(key);
+  return key;
+};
+
+const clearBathTimers = () => {
+  let cancelled = 0;
+  for (const key of bathTimers) {
+    clock.clearTimeout(key);
+    cancelled++;
+  }
+  bathTimers.clear();
+  return cancelled;
+};
+
+// Queue one automatic strike for the active session. A zero delay strikes
+// immediately (it has already happened, so there is nothing to cancel); any
+// positive delay is a cancellable timer.
+const scheduleAuto = (delay, bowlIndex, strength) => {
+  if (!bath) return null;
+  const id = bath.id;
+  if (delay <= 0) {
+    strike(bowlIndex, strength, "bath");
+    return null;
+  }
+  let key;
+  key = clock.setTimeout(() => {
+    bathTimers.delete(key);
+    if (!bath || bath.id !== id) return; // stopped or replaced
+    if (clock.now() >= bath.end) return; // never strike past the end
+    strike(bowlIndex, strength, "bath");
+  }, delay);
+  return trackTimer(key);
+};
+
+const nextBowl = () => {
+  let n;
+  do n = Math.floor(random() * bowls.length);
+  while (n === bath.last && bowls.length > 1);
+  return n;
+};
+
+// One step of the bath: strike a bowl, occasionally echo on another, then
+// plan the next step -- but only if it lands before the end, so no timer is
+// left queued that could never legitimately fire.
+const bathStep = () => {
+  if (!bath || clock.now() >= bath.end) return;
+  const b = bath;
+  const id = b.id;
+  const i = nextBowl();
+  b.last = i;
+  scheduleAuto(0, i, 0.6 + random() * 0.4);
+  if (random() < 0.25) scheduleAuto(700, (i + 2) % bowls.length, 0.5);
+  const gap = 3500 + random() * 5500;
+  if (clock.now() + gap < b.end) {
+    let key;
+    key = clock.setTimeout(() => {
+      bathTimers.delete(key);
+      b.stepTimer = null;
+      if (!bath || bath.id !== id) return;
+      if (clock.now() >= bath.end) return;
+      bathStep();
+    }, gap);
+    b.stepTimer = trackTimer(key);
+  } else {
+    b.stepTimer = null;
+  }
 };
 
 const updateBathLeft = () => {
   const el = $("bath-left");
   if (!bath) {
-    el.textContent = "";
+    if (el) el.textContent = "";
+    return 0;
+  }
+  const left = Math.max(0, (bath.end - clock.now()) / 1000);
+  if (el) el.textContent = fmtTime(left) + " left";
+  return left;
+};
+
+// The countdown's tick: refresh the readout, and if time is up, end the bath.
+const bathTick = () => {
+  if (!bath) return;
+  if (clock.now() >= bath.end) {
+    endBath("natural");
     return;
   }
-  const left = Math.max(0, (bath.end - Date.now()) / 1000);
-  el.textContent = fmtTime(left) + " left";
-  if (left <= 0) stopBath();
+  updateBathLeft();
 };
+
+// The single exit of a bath. Manual stop and countdown expiry both come here;
+// the `bath` null check makes it idempotent, so the end is counted once and
+// two paths can't each fire a stop.
+const endBath = (reason) => {
+  const b = bath;
+  if (!b) return false;
+  bath = null;
+  const cancelled = clearBathTimers();
+  if (b.tick != null) clock.clearInterval(b.tick);
+  bathStats.stops++;
+  if (reason === "natural") bathStats.naturalEnds++;
+  bathStats.autoCancelled += cancelled;
+  const btn = $("bath-btn");
+  if (btn) btn.textContent = "Start sound bath";
+  updateBathLeft();
+  return true;
+};
+
+const stopBath = () => endBath("manual");
 
 const startBath = () => {
-  if (!ensureAudio()) return;
-  bath = { end: Date.now() + settings.bath * 60000, last: -1 };
-  bath.tick = setInterval(updateBathLeft, 500);
-  $("bath-btn").textContent = "Stop sound bath";
-  scheduleBath();
+  if (!backendReady()) return false;
+  if (bath) return false; // already running: never stack two sessions
+  bathStats.starts++;
+  const id = ++bathId;
+  bath = {
+    id,
+    end: clock.now() + settings.bath * 60000,
+    last: -1,
+    tick: null,
+    stepTimer: null,
+  };
+  bath.tick = clock.setInterval(bathTick, 500);
+  const btn = $("bath-btn");
+  if (btn) btn.textContent = "Stop sound bath";
   updateBathLeft();
+  bathStep();
   startAnim();
-};
-
-const stopBath = () => {
-  if (!bath) return;
-  clearTimeout(bath.timer);
-  clearInterval(bath.tick);
-  bath = null;
-  $("bath-btn").textContent = "Start sound bath";
-  updateBathLeft();
+  return true;
 };
 
 const toggleBath = () => (bath ? stopBath() : startBath());
@@ -461,7 +629,10 @@ const setSetting = (key, value) => {
   settings[key] = value;
   save();
   if (["set", "octave", "pitch"].includes(key)) {
-    Object.keys(voices).forEach((i) => singStop(i));
+    // A held voice was made at the old tuning. Releasing it before the bowls
+    // are rebuilt lets it fade out at its original frequency, rather than
+    // jumping pitch or being cut off.
+    releaseAllVoices();
     buildBowls();
     renderBowls();
   }
@@ -500,7 +671,13 @@ const bind = () => {
     if (!el) return;
     const i = +el.dataset.i;
     if (settings.mode === "sing") {
-      el.setPointerCapture?.(e.pointerId);
+      // Pointer capture can be refused for a stale pointer; singing must not
+      // depend on it.
+      try {
+        el.setPointerCapture?.(e.pointerId);
+      } catch {
+        // ignore: capture is a nicety, not a requirement
+      }
       singStart(i);
     } else {
       strike(i);
@@ -537,4 +714,88 @@ const initBowls = () => {
   renderControls();
   bind();
   drawSpectrum(true);
+  initDone = true;
 };
+
+// ------------------------------------------------------------------ test hooks
+
+// A small, explicit surface for js/bath-lifecycle.test.js (or the browser
+// console). It swaps the clock, the random source and the voice backend, and
+// exposes only what the lifecycle tests need. The test file removes it after
+// it runs; the page never uses it.
+const testHooks = {
+  install({ newClock, newRandom, newSynth } = {}) {
+    // Drop any frame queued by the real clock before switching over.
+    if (animId) {
+      (clock.cancelAnimationFrame || cancelAnimationFrame)(animId);
+      animId = 0;
+    }
+    if (newClock) clock = newClock;
+    if (newRandom) random = newRandom;
+    if (newSynth) synth = newSynth;
+    animationEnabled = false;
+  },
+  restore() {
+    if (animId) {
+      (clock.cancelAnimationFrame || cancelAnimationFrame)(animId);
+      animId = 0;
+    }
+    clock = realClock;
+    random = () => Math.random();
+    synth = null;
+    animationEnabled = true;
+  },
+  state() {
+    return {
+      bath,
+      bathTimers: bathTimers.size,
+      voices: Object.keys(voices).length,
+      voiceKeys: Object.keys(voices).map(Number),
+      ringing: ringing.size,
+      bowls: bowls.length,
+      bowlFreqs: bowls.map((b) => b.freq),
+      stats: { ...bathStats },
+      buttonText: $("bath-btn")?.textContent ?? null,
+      leftText: $("bath-left")?.textContent ?? null,
+      settings: { ...settings },
+    };
+  },
+  strike: (i, strength) => strike(i, strength, "manual"),
+  startBath,
+  stopBath,
+  toggleBath,
+  setSetting,
+  singStart,
+  singStop,
+  releaseAllVoices,
+  buildBowls,
+  renderBowls,
+  renderControls,
+  drawSpectrum,
+  resetStats() {
+    bathStats.starts = 0;
+    bathStats.stops = 0;
+    bathStats.naturalEnds = 0;
+    bathStats.autoStrikes = 0;
+    bathStats.autoCancelled = 0;
+  },
+  // Tear a running session down without counting it as a stop, so each test
+  // starts from a clean slate.
+  reset() {
+    const b = bath;
+    bath = null;
+    clearBathTimers();
+    if (b && b.tick != null) clock.clearInterval(b.tick);
+    releaseAllVoices();
+    ringing.clear();
+    testHooks.resetStats();
+    const btn = $("bath-btn");
+    if (btn) btn.textContent = "Start sound bath";
+    const left = $("bath-left");
+    if (left) left.textContent = "";
+  },
+  clockIsInjected: () => clock !== realClock,
+  isInitialized: () => initDone,
+};
+
+if (typeof window !== "undefined") window.bowlsTestHooks = testHooks;

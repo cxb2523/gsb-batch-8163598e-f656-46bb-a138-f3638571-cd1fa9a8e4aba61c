@@ -30,6 +30,10 @@ The pages are plain HTML, CSS and JavaScript with the Web Audio API, with no dep
 - Three color themes (dark, light and blue) are shared with my other projects.
 - Your tuning, volume and other settings are kept in the browser's local storage.
 
+## Lifecycle checks
+
+[js/bath-lifecycle.test.js](js/bath-lifecycle.test.js) verifies the sound bath against hand-held playing: that stopping the bath cancels every automatic strike still queued, that the countdown stops the bath exactly once, that rapid start/stop leaves no stray timers, and that retuning releases a held "Sing" voice at its old pitch. It runs in the browser with a fake clock and a silent voice backend, so it needs no audio device and no real waiting. Open the page with `?bath-test` in the URL (or paste the file into the console) to run it; the PASS/FAIL report is printed to the console and to a panel at the bottom of the page.
+
 
 ## Open Source
 

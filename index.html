@@ -53,6 +53,14 @@
           navigator.serviceWorker.register("sw.js"),
         );
       }
+      // The sound-bath lifecycle checks (js/bath-lifecycle.test.js) are a
+      // local verification tool, not part of normal use. Load them by adding
+      // ?bath-test to the URL, or by pasting the file in the console.
+      if (/[?&]bath-test\b/.test(location.search)) {
+        const s = document.createElement("script");
+        s.src = "js/bath-lifecycle.test.js";
+        document.head.appendChild(s);
+      }
     </script>
   </head>
 
