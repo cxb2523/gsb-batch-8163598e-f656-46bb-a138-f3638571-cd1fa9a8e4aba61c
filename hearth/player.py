@@ -69,6 +69,38 @@ def fade_pair(progress: float, seconds: int) -> tuple[float, float]:
     return math.cos(angle), math.sin(angle)
 
 
+def combined_gain(base_volume: float, track_gain: float = 1.0,
+                  fade_factor: float = 1.0) -> float:
+    """The ONE gain chain every output volume passes through.
+
+    ``user master volume × preamp (already folded into base_volume) ×
+    current-track loudness gain × crossfade factor`` — one product, one
+    clamp to the device's 0..1 ceiling. Fade ramps, loudness
+    normalization, volume drags and preamp tweaks all call this, so no
+    participant can overwrite another: each only changes its own factor
+    and the whole chain is recomputed at the single output exit.
+    """
+    try:
+        base = float(base_volume)
+    except (TypeError, ValueError):
+        base = 0.0
+    try:
+        track = float(track_gain)
+    except (TypeError, ValueError):
+        track = 1.0
+    try:
+        fade = float(fade_factor)
+    except (TypeError, ValueError):
+        fade = 1.0
+    if not math.isfinite(base):
+        base = 0.0
+    if not math.isfinite(track):
+        track = 1.0
+    if not math.isfinite(fade):
+        fade = 1.0
+    return max(0.0, min(1.0, base * track * fade))
+
+
 class MediaHandle:
     """The sliver of a media player a crossfade twin needs.
 
@@ -229,7 +261,12 @@ class CrossfadeController:
         self.current: MediaHandle | None = None   # live primary (ramp-out leg)
         self.shadow: MediaHandle | None = None    # primed next track
         self.primed_track: object | None = None   # Track the shadow carries
-        self.base_volume: float = 0.8   # the core's master volume, kept synced
+        self.base_volume: float = 0.8   # master volume × preamp, kept synced
+        # Per-leg loudness-normalization gain (linear). The shadow ramps
+        # in carrying the NEXT track's own normalization instead of being
+        # scaled by master volume alone; the outgoing leg keeps its own.
+        self.current_gain: float = 1.0
+        self.shadow_gain: float = 1.0
         self.progress: float = 0.0
         self._steps = 0
         self._ticked = 0
@@ -254,6 +291,8 @@ class CrossfadeController:
         self.progress = 0.0
         self._ticked = 0
         self._promoted = False
+        self.current_gain = 1.0
+        self.shadow_gain = 1.0
         if current is not None:
             self.current = current
 
@@ -267,6 +306,7 @@ class CrossfadeController:
         self._promoted = False
         self._ticked = 0
         self.progress = 0.0
+        self.shadow_gain = 1.0
         return True
 
     def end_of_media(self) -> bool:
@@ -302,11 +342,7 @@ class CrossfadeController:
         self._ticked += 1
         progress = min(1.0, self._ticked / self._steps)
         self.progress = progress
-        cur_f, nxt_f = fade_pair(progress, self.seconds)
-        if self.current is not None:
-            self.current.set_volume(self.base_volume * cur_f)
-        if self.shadow is not None:
-            self.shadow.set_volume(self.base_volume * nxt_f)
+        self._apply_ramp_volumes(progress)
         if progress >= 1.0 and not self._promoted:
             self._promoted = True   # exactly once, however many ticks land
             self.state = self.DONE
@@ -314,6 +350,33 @@ class CrossfadeController:
                 self.on_promote()
             return True
         return False
+
+    def _apply_ramp_volumes(self, progress: float) -> None:
+        """Push both legs through the single combined-gain chain.
+
+        Each leg multiplies the shared master (volume × preamp) by its
+        OWN track's loudness gain and its fade factor, so a volume or
+        preamp change mid-ramp rescales both without erasing either the
+        ramp or the normalization.
+        """
+        cur_f, nxt_f = fade_pair(progress, self.seconds)
+        if self.current is not None:
+            self.current.set_volume(
+                combined_gain(self.base_volume, self.current_gain, cur_f))
+        if self.shadow is not None:
+            self.shadow.set_volume(
+                combined_gain(self.base_volume, self.shadow_gain, nxt_f))
+
+    def refresh_volumes(self) -> None:
+        """Re-push the chain at the current progress.
+
+        The core calls this whenever master volume or preamp changes
+        while a ramp is in flight: neither the fade position nor the
+        per-track gains are touched, only the shared factor is renewed.
+        """
+        if self.state != self.CROSSFADING:
+            return
+        self._apply_ramp_volumes(self.progress)
 
     def set_seconds(self, seconds: int) -> None:
         self.seconds = max(0, int(seconds))
@@ -492,6 +555,11 @@ class PlaybackCore(QObject):
         self.autoplay: bool = config.AUTOPLAY_DEFAULT
         self._volume = 0.8
         self._preamp_db = 0.0   # the Sound Forge bench's live knob
+        # Linear loudness-normalization gain of the CURRENT track
+        # (10**(gain_db/20); 1.0 = no correction). Held as state instead
+        # of being written straight onto the device, so volume/preamp and
+        # normalization all recompute one shared product at the same exit.
+        self._loudness_gain: float = 1.0
         self._rate = 1.0
         self._player = None
         self._audio_out = None
@@ -536,6 +604,7 @@ class PlaybackCore(QObject):
         self._xf_promoted_id: str | None = None   # absorbs the app's resolve echo
         self._xf_preresolved: tuple[str, str] | None = None   # (current, next) asked for
         self._xf_primed_loudness: float | None = None
+        self._xf_primed_gain: float = 1.0   # next track's linear norm gain
         self._xf_promoting = False   # re-entrancy brake around the promotion
         self._xf_promoted_handle: MediaHandle | None = None   # keeps the promoted wrapper alive
         # Tests swap this for a fake factory; production builds Qt twins.
@@ -556,7 +625,7 @@ class PlaybackCore(QObject):
             from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
             self._audio_out = QAudioOutput()
-            self._audio_out.setVolume(self._volume)
+            self._audio_out.setVolume(self._combined_output_gain())
             self._player = QMediaPlayer(self)
             self._player.setAudioOutput(self._audio_out)
             self._connect_backend()
@@ -844,6 +913,9 @@ class PlaybackCore(QObject):
         handle.set_rate(self._rate)
         handle.set_volume(0.0)
         self._xf_primed_loudness = loudness_db
+        # Remember the next track's OWN normalization so the shadow can
+        # ramp in already carrying it rather than at bare master volume.
+        self._xf_primed_gain = self._normalization_linear(loudness_db)
         if not ctl.prime(handle, track):   # lost a race: give the handle back
             handle.stop()
 
@@ -911,6 +983,11 @@ class PlaybackCore(QObject):
         if track is None or nxt is None or nxt.video_id != track.video_id:
             ctl.adopt(ctl.current)   # the queue moved on since priming
             return False
+        # Hand the ramp both legs' normalization: the outgoing primary
+        # keeps its current gain, the shadow brings the next track's own.
+        ctl.base_volume = self.effective_volume()
+        ctl.current_gain = self._loudness_gain
+        ctl.shadow_gain = self._xf_primed_gain
         if not ctl.end_of_media():
             return False
         self._xf_start_timer()
@@ -970,6 +1047,11 @@ class PlaybackCore(QObject):
             self._playing = True   # the shadow is audibly rolling
             self._poll.start()
             self.state_changed.emit(True)
+            # The new primary keeps the next track's normalization as
+            # HELD state and re-emits the full chain at its single exit,
+            # so the output equals the normalized target rather than
+            # whatever the ramp's final frame happened to write.
+            self._loudness_gain = self._xf_primed_gain
             self.apply_normalization(self._xf_primed_loudness)
             duration = max(0, int(shadow.duration_ms))
             if duration:
@@ -984,6 +1066,8 @@ class PlaybackCore(QObject):
             ctl.state = CrossfadeController.IDLE
             ctl.progress = 0.0
             ctl.current = _LiveBackendHandle(self)
+            self._xf_primed_loudness = None
+            self._xf_primed_gain = 1.0
             self._xf_maybe_preresolve()
         finally:
             self._xf_promoting = False
@@ -994,13 +1078,35 @@ class PlaybackCore(QObject):
         self._volume = max(0.0, min(1.0, float(value)))
         self._apply_output_volume()
 
+    def _combined_output_gain(self) -> float:
+        """The full chain for the live primary: master × preamp × loudness.
+
+        Every factor is held state; this only multiplies and clamps, so a
+        change to any one input never overwrites the others.
+        """
+        return combined_gain(self.effective_volume(), self._loudness_gain)
+
     def _apply_output_volume(self) -> None:
-        """Master volume × preamp → the output device (and the ramp)."""
-        effective = self.effective_volume()
+        """The single output exit for the whole gain chain.
+
+        Master volume × preamp × current-track loudness gain reaches the
+        device here; while a crossfade ramp runs the controller owns both
+        legs and the same chain is re-pushed per leg (each with its own
+        loudness gain and fade factor), so a volume or preamp tweak
+        mid-fade rescales the ramp instead of fighting it.
+        """
+        ctl = self._xf
+        if ctl is not None and ctl.state == CrossfadeController.CROSSFADING:
+            ctl.base_volume = self.effective_volume()
+            ctl.refresh_volumes()
+            return
+        effective = self._combined_output_gain()
         if self._audio_out is not None:
             self._audio_out.setVolume(effective)
-        if self._xf is not None:
-            self._xf.base_volume = effective   # keep the ramp scaled to master
+        if ctl is not None:
+            # Keep a primed/idle ramp scaled to master; a future ramp's
+            # base is always the current volume × preamp.
+            ctl.base_volume = effective
 
     def effective_volume(self) -> float:
         """What actually reaches the device: user volume shaped by preamp."""
@@ -1065,13 +1171,30 @@ class PlaybackCore(QObject):
         if self._player is not None:
             self._player.setPosition(int(position_ms))
 
+    @staticmethod
+    def _normalization_linear(loudness_db: float | None) -> float:
+        """The track's loudness correction as a linear amplitude factor."""
+        from .sound_shape import db_to_linear
+        from .stream import normalization_gain
+
+        return db_to_linear(normalization_gain(loudness_db))
+
     def apply_normalization(self, loudness_db: float | None) -> float:
-        """Scale audio output by the track's loudness gain (returns gain dB)."""
+        """Fold the track's loudness gain into the unified chain.
+
+        Stores the correction as HELD state (so it survives a later
+        volume/preamp change instead of being overwritten) and re-emits
+        the full chain at the single output exit. Returns the gain in dB.
+        """
         from .stream import normalization_gain
 
         gain = normalization_gain(loudness_db)
-        if self._audio_out is not None and gain != 0.0:
-            self._audio_out.setVolume(self._volume * (10 ** (gain / 20)))
+        self._loudness_gain = self._normalization_linear(loudness_db)
+        # While a ramp runs the controller owns the output; do not fight
+        # it — the next promotion re-applies this exact state.
+        ctl = self._xf
+        if ctl is None or ctl.state != CrossfadeController.CROSSFADING:
+            self._apply_output_volume()
         return gain
 
     # --- sleep timer with gentle fade ---

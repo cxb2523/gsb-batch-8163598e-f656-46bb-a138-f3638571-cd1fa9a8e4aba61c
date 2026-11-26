@@ -15,6 +15,7 @@ from hearth.models import Track
 from hearth.player import (
     CrossfadeController,
     PlaybackCore,
+    combined_gain,
     fade_pair,
 )
 
@@ -24,6 +25,20 @@ from .test_models import make_track
 
 def tracks(n) -> list[Track]:
     return [make_track(video_id=f"t{i}", title=f"Song {i}") for i in range(n)]
+
+
+class FakeAudioOut:
+    """Records the absolute volume written to the output device."""
+
+    def __init__(self):
+        self.volumes: list[float] = []
+
+    def setVolume(self, value: float) -> None:  # Qt's method name
+        self.volumes.append(round(float(value), 6))
+
+    @property
+    def last(self) -> float:
+        return self.volumes[-1]
 
 
 class FakeHandle:
@@ -43,6 +58,10 @@ class FakeHandle:
         self.stopped = 0
         self.loaded: list[str] = []
         self.rates: list[float] = []
+        # When a handle is promoted the core adopts its `.audio` as the
+        # live output; a fresh fake output lets tests read back the
+        # post-promotion device volume.
+        self.audio = FakeAudioOut()
 
     def load(self, url: str) -> None:
         self.loaded.append(url)
@@ -208,7 +227,7 @@ def enabled(qapp, monkeypatch):
     return qapp
 
 
-def make_primed_core(seconds: int = 2):
+def make_primed_core(seconds: int = 2, loudness_db: float | None = None):
     """A flag-on core with the queue rolling and the next track primed."""
     core = PlaybackCore()
     shadows: list[FakeHandle] = []
@@ -222,7 +241,8 @@ def make_primed_core(seconds: int = 2):
     core.start_queue(tracks(3))
     core._playing = True
     core._xf_maybe_preresolve()           # asks the app to resolve t1
-    core.prime_shadow(tracks(3)[1], "https://example.com/t1")
+    core.prime_shadow(tracks(3)[1], "https://example.com/t1",
+                      loudness_db=loudness_db)
     return core, shadows
 
 
@@ -405,6 +425,172 @@ def test_set_crossfade_clamps_and_zero_disables(enabled):
     assert core.crossfade_seconds == 0
     assert core._xf.state == CrossfadeController.IDLE    # primed shadow dropped
     assert shadow.stopped == 1
+
+
+# --- unified gain chain: fade × normalization × volume × preamp ---
+
+
+def test_combined_gain_is_one_product_clamped_0_1():
+    assert combined_gain(0.8, 1.0, 1.0) == pytest.approx(0.8)
+    assert combined_gain(0.8, 0.5, 0.25) == pytest.approx(0.1)
+    # a hot normalization can't push the device past unity
+    assert combined_gain(0.8, 4.0, 1.0) == 1.0
+    assert combined_gain(0.0, 1.0, 1.0) == 0.0
+    # junk factors never raise: base falls to 0, the rest to unity
+    assert combined_gain("nope", "x", None) == 0.0
+
+
+def test_controller_shadow_fades_in_with_its_own_loudness_gain():
+    ctl = CrossfadeController(2, tick_ms=100)
+    current, shadow = FakeHandle(), FakeHandle()
+    ctl.adopt(current)
+    ctl.base_volume = 0.8
+    ctl.prime(shadow, "next-track")
+    # gains are armed at engage time (the core copies each leg's held
+    # normalization in), so assign them after priming, like production does
+    ctl.current_gain = 1.0
+    ctl.shadow_gain = 0.5            # the next track needs cutting
+    ctl.end_of_media()
+    for _ in range(20):
+        ctl.tick()
+    # every shadow frame is master × ITS OWN gain × fade factor, never
+    # bare master — and the ramp still reaches the normalized target.
+    # end_of_media wrote the initial 0.0 at index 0, so tick N lands at
+    # list index N; tick 10 (progress 0.5) is the equal-power midpoint.
+    _, nxt_f = fade_pair(0.5, 2)
+    assert shadow.volumes[10] == pytest.approx(
+        combined_gain(0.8, 0.5, nxt_f), abs=1e-6)
+    assert shadow.volumes[-1] == pytest.approx(0.4)
+    assert current.volumes[-1] == pytest.approx(0.0)
+
+
+def test_volume_change_mid_fade_rescales_both_legs_without_reset(enabled):
+    core, shadows = make_primed_core()
+    core.set_volume(0.8)
+    core._on_end_of_media()                      # engage the ramp
+    shadow = shadows[0]
+    for _ in range(5):                           # partway through...
+        core._xf_tick()
+    progress = core._xf.progress
+    assert 0.0 < progress < 1.0
+    core.set_volume(0.4)                         # user drags master mid-fade
+    ctl = core._xf
+    assert ctl.state == CrossfadeController.CROSSFADING
+    assert ctl.progress == pytest.approx(progress)   # the ramp position survives
+    _, nxt_f = fade_pair(progress, ctl.seconds)
+    # the just-pushed frame follows the NEW master through the same chain
+    assert shadow.volumes[-1] == pytest.approx(
+        combined_gain(0.4, ctl.shadow_gain, nxt_f), abs=1e-6)
+    for _ in range(15):                          # ramp still finishes once
+        core._xf_tick()
+    assert ctl.state == CrossfadeController.IDLE
+    assert core.engine.current.video_id == "t1"  # exactly one advance
+
+
+def test_preamp_change_mid_fade_flows_through_the_same_exit(enabled):
+    from hearth.sound_shape import db_to_linear
+
+    core, shadows = make_primed_core()
+    core.set_volume(0.8)
+    core.set_preamp(0.0)
+    core._on_end_of_media()
+    shadow = shadows[0]
+    for _ in range(6):
+        core._xf_tick()
+    progress = core._xf.progress
+    core.set_preamp(-6.0)                        # preamp tweak mid-ramp
+    ctl = core._xf
+    assert ctl.progress == pytest.approx(progress)
+    master = core.effective_volume()
+    assert master == pytest.approx(0.8 * db_to_linear(-6.0))
+    _, nxt_f = fade_pair(progress, ctl.seconds)
+    assert shadow.volumes[-1] == pytest.approx(
+        combined_gain(master, ctl.shadow_gain, nxt_f), abs=1e-6)
+    for _ in range(14):
+        core._xf_tick()
+    assert core.engine.current.video_id == "t1"
+
+
+def test_promoted_primary_output_equals_new_track_target(enabled):
+    # A quiet next track gets a +6 dB normalization (gain ~2.0 linear,
+    # under the ceiling at master 0.4 so no clamp hides the result).
+    from hearth.sound_shape import db_to_linear
+
+    core, shadows = make_primed_core(loudness_db=-22.0)
+    core.set_volume(0.4)
+    target_gain = core._xf_primed_gain
+    assert target_gain == pytest.approx(db_to_linear(6.0), rel=1e-6)
+    core._on_end_of_media()
+    for _ in range(20):
+        core._xf_tick()                          # promotion lands inside
+    shadow = shadows[0]
+    assert core._player is shadow
+    assert core.engine.current.video_id == "t1"
+    # the new primary's device output is the normalized TARGET, not the
+    # ramp's stale final frame
+    target = combined_gain(core.effective_volume(), target_gain, 1.0)
+    assert shadow.audio.last == pytest.approx(target)
+    assert core._loudness_gain == pytest.approx(target_gain)
+
+
+def test_normalization_still_applies_with_crossfade_off(enabled):
+    from hearth.stream import normalization_gain
+
+    core = PlaybackCore()
+    core.set_crossfade(0)                        # seconds 0: legacy path
+    assert core._xf is not None and core._xf.seconds == 0
+    core.start_queue(tracks(2))
+    gain_db = normalization_gain(-22.0)          # +6 dB → ~1.995 linear
+    returned = core.apply_normalization(-22.0)
+    assert returned == pytest.approx(gain_db)
+    assert core._loudness_gain == pytest.approx(10 ** (6.0 / 20), rel=1e-9)
+    # no output device exists headless until a backend is built; the
+    # held chain is the same product the device would receive
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(core.effective_volume(), core._loudness_gain))
+    # a later volume change KEEPS the normalization instead of wiping it
+    core.set_volume(0.5)
+    assert core._loudness_gain == pytest.approx(10 ** (6.0 / 20), rel=1e-9)
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(0.5, core._loudness_gain))   # just under the ceiling
+    core.set_volume(1.0)
+    assert core._combined_output_gain() == pytest.approx(1.0)  # ceiling-clamped
+    core.set_volume(0.25)
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(0.25, core._loudness_gain))
+
+
+def test_sleep_fade_is_not_swallowed_by_normalization_chain(enabled):
+    # The sleep timer drives the USER volume down; the held loudness
+    # gain must stay intact while the audible output still fades away.
+    core, _shadows = make_primed_core()
+    core.apply_normalization(-22.0)              # +6 dB held gain
+    held = core._loudness_gain
+    core.set_volume(0.8)
+    core._begin_fade()
+    core._fade_tick()                            # one step toward silence
+    assert core._loudness_gain == pytest.approx(held)
+    assert core.volume < 0.8                     # the sleep fade is audible
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(core.effective_volume(), held))
+
+
+def test_normalization_after_volume_change_is_not_overwritten(enabled):
+    # The original bug class: normalization wrote the device directly
+    # and a later volume change (or vice-versa) erased it. Both inputs
+    # are now held state behind one product.
+    core = PlaybackCore()
+    core.set_volume(0.5)
+    core.apply_normalization(-18.0)              # +2 dB → ~1.259 linear
+    gain = core._loudness_gain
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(core.effective_volume(), gain))
+    core.set_volume(0.25)                        # must keep the gain factor
+    assert core._loudness_gain == pytest.approx(gain)
+    core.set_preamp(-3.0)                        # and survive a preamp tweak
+    assert core._loudness_gain == pytest.approx(gain)
+    assert core._combined_output_gain() == pytest.approx(
+        combined_gain(core.effective_volume(), gain))
 
 
 # --- UI: the crossfade row on Now Playing + app settings roundtrip ---
