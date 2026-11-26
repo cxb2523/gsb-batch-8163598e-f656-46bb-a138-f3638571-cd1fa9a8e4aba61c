@@ -24,9 +24,10 @@ const DTS = [
 ];
 
 test("the type definitions compile, and every @ts-expect-error still errors", () => {
-  const tsc = join(root, "node_modules", ".bin", "tsc");
+  const tscCli = join(root, "node_modules", "typescript", "bin", "tsc");
   try {
-    execFileSync(tsc, [
+    execFileSync(process.execPath, [
+      tscCli,
       "--noEmit", "--strict",
       "--moduleResolution", "bundler", "--module", "esnext",
       "--target", "es2022", "--lib", "es2022,dom",

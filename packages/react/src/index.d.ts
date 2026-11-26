@@ -1,10 +1,10 @@
-import type { CueName, Settings, PlayOptions, PlayEvent } from "@foleyjs/core";
+import type { CueName, Settings, PlayOptions, PlayEvent, PlayHandle } from "@foleyjs/core";
 
 type OnFn = ((event: "play", cb: (e: PlayEvent) => void) => () => void) &
   ((event: "unlock", cb: () => void) => () => void);
 
 export interface FoleyHandle {
-  play: (name: CueName, opts?: PlayOptions) => void;
+  play: (name: CueName, opts?: PlayOptions) => PlayHandle | undefined;
   set: (opts: Partial<Settings>) => void;
   get: () => Settings;
   toWav: (name: CueName) => Promise<Blob>;

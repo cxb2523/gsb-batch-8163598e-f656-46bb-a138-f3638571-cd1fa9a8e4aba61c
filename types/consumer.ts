@@ -26,9 +26,18 @@ o("unlock", () => {})();
 function callLater(fn: (name: "tick") => void): void { fn("tick"); }
 callLater(p);
 
+const reactLoop = p("loading", { loop: true });
+reactLoop?.pause();
+reactLoop?.resume();
+reactLoop?.stop();
+
 const handle = play("loading", { loop: true });
 if (handle) {
-  const { stop } = handle;   /* PlayHandle.stop must detach too */
+  const { pause, resume, stop } = handle;   /* every PlayHandle member must detach too */
+  pause();
+  pause();
+  resume();
+  resume();
   stop();
 }
 

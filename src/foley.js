@@ -11,7 +11,7 @@ export const version = "2.9.0";
 const T = {
   ctx: null, master: null, limiter: null, analyser: null, dry: null, verb: null, wet: null,
   settings: { volume: 0.7, transpose: 0, space: 0.22, muted: false, hover: true, theme: "default", duck: 1, localize: 0 },
-  _scale: 1, _cool: {}, _noise: null, _unlocked: false, _bus: null, _sendBus: null,
+  _scale: 1, _cool: {}, _noise: null, _unlocked: false, _bus: null, _sendBus: null, _voices: null,
 
   applyGain() {
     if (!this.ctx) return;
@@ -21,7 +21,9 @@ const T = {
 
   ensure() {
     if (this.ctx) { if (this.ctx.state === "suspended") this.ctx.resume(); return; }
-    const AC = window.AudioContext || window.webkitAudioContext;
+    const host = typeof window !== "undefined" ? window : globalThis;
+    const AC = host.AudioContext || host.webkitAudioContext ||
+      globalThis.AudioContext || globalThis.webkitAudioContext;
     const ctx = new AC();
     this.ctx = ctx;
     this.master = ctx.createGain();
@@ -124,9 +126,17 @@ function sanitizeTransform(c) {
 export const themes = Object.freeze(Object.keys(THEMES));
 
 /* ---------------- synth voices ---------------- */
+function trackVoice(node) {
+  const voices = T._voices;
+  if (!voices || !node) return;
+  voices.add(node);
+  try { node.onended = () => voices.delete(node); } catch (e) { /* non-writable mock node */ }
+}
+
 function tone(o) {
   const th = theme, ctx = T.ctx, t0 = o.t0;
   const osc = ctx.createOscillator();
+  trackVoice(osc);
   osc.type = (th.wave && th.wave[o.type || "sine"]) || o.type || "sine";
   const f = T.pitch(o.f, o.semis) * th.pitch;
   osc.frequency.setValueAtTime(f, t0);
@@ -155,6 +165,7 @@ function tone(o) {
 function noise(o) {
   const th = theme, ctx = T.ctx, t0 = o.t0;
   const src = ctx.createBufferSource();
+  trackVoice(src);
   src.buffer = T.noiseBuf();
   src.loop = true;
   const fl = ctx.createBiquadFilter();
@@ -465,6 +476,10 @@ export function unlock() { T.ensure(); }
 /** The engine's AnalyserNode (2048-point), or null before the first unlock. For scopes and meters. */
 export function getAnalyser() { return T.analyser; }
 
+/* Live loop controllers. set({ muted }) has to pause them through the same
+   lifecycle as visibility changes; one-shots are deliberately not registered. */
+const loopControllers = new Set();
+
 /** Update engine settings: volume (0-1), transpose (semitones), space (0-1 reverb),
     muted, hover, theme, duck (0-1), localize (0-1 stereo spread for bind()'s cues). */
 export function set(opts) {
@@ -476,7 +491,11 @@ export function set(opts) {
     T.settings.space = opts.space;
     if (T.ctx) T.wet.gain.setTargetAtTime(opts.space, T.ctx.currentTime, 0.02);
   }
-  if (opts.muted != null) { T.settings.muted = opts.muted; T.applyGain(); }
+  if (opts.muted != null) {
+    T.settings.muted = opts.muted;
+    T.applyGain();
+    for (const controller of loopControllers) controller.setMuted(!!opts.muted);
+  }
   if (opts.transpose != null) T.settings.transpose = opts.transpose;
   if (opts.hover != null) T.settings.hover = opts.hover;
   if (opts.theme != null) {
@@ -562,7 +581,7 @@ function loopAudible() {
 /* shared performance path: cooldown, humanization, loop, stop handle, emit */
 function perform(key, spec, opts, emitName, emitFamily) {
   const nowMs = performance.now();
-  if (nowMs - (T._cool[key] || 0) < 60) return;
+  if (T._cool[key] != null && nowMs - T._cool[key] < 60) return;
   T._cool[key] = nowMs;
   T.ensure();
   opts = opts || {};
@@ -591,18 +610,30 @@ function perform(key, spec, opts, emitName, emitFamily) {
      do. A tail that swings with the source reads as the walls moving, not the button. */
   const sendBus = ctx.createGain(); sendBus.connect(T.verb);
 
+  const voices = new Set();
+  let stopped = false;
+  const periodMs = opts.loop
+    ? Math.max(80, (((opts.every != null ? opts.every : specDuration(spec)) + 0.06) * 1000))
+    : 0;
+  let nextAt = Date.now() + periodMs;
+
   function once() {
+    const startedAt = Date.now();
     const t0 = ctx.currentTime + 0.015;
     const prevT = T.settings.transpose;
     /* humanization: +/-30 cents and +/-8% level per performance - whole cue shifts together */
     const drift = Math.random() * 0.6 - 0.3;
     T.settings.transpose = prevT + (opts.pitch || 0) + drift;
     T._scale = (opts.volume != null ? opts.volume : 1) * (0.92 + Math.random() * 0.16);
-    T._bus = bus; T._sendBus = sendBus;
-    runSpec(spec, t0);
-    T._bus = null; T._sendBus = null;
-    T._scale = 1;
-    T.settings.transpose = prevT;
+    T._bus = bus; T._sendBus = sendBus; T._voices = voices;
+    try {
+      runSpec(spec, t0);
+    } finally {
+      T._bus = null; T._sendBus = null; T._voices = null;
+      T._scale = 1;
+      T.settings.transpose = prevT;
+      nextAt = startedAt + periodMs;
+    }
   }
   once();
 
@@ -613,23 +644,166 @@ function perform(key, spec, opts, emitName, emitFamily) {
   }
   emit("play", { name: emitName, family: emitFamily });
 
-  let stopped = false;
+  if (!opts.loop) {
+    return {
+      pause: () => {},
+      resume: () => {},
+      stop() {
+        if (stopped) return;
+        stopped = true;
+        const t = ctx.currentTime;
+        bus.gain.setTargetAtTime(0, t, 0.02);
+        sendBus.gain.setTargetAtTime(0, t, 0.02);
+        setTimeout(() => { try { bus.disconnect(); sendBus.disconnect(); if (place) place.disconnect(); } catch (e) { /* already gone */ } }, 300);
+      },
+    };
+  }
+
+  let manualPaused = false;
+  let hiddenPaused = typeof document !== "undefined" && !!document.hidden;
+  let mutedPaused = !!T.settings.muted;
+  let suspended = false;
+  let phaseRemaining = periodMs;
+
+  function blocked() { return manualPaused || hiddenPaused || mutedPaused; }
+
+  function clearScheduledTimer() {
+    if (iv !== null) { clearInterval(iv); iv = null; }
+  }
+
+  function capturePhase() {
+    if (iv !== null) phaseRemaining = Math.max(0, nextAt - Date.now());
+  }
+
+  function stopScheduledVoices() {
+    for (const voice of voices) {
+      try { voice.stop(); } catch (e) { /* already stopped by the audio clock */ }
+    }
+    voices.clear();
+  }
+
+  function setBusLevel(value, tau) {
+    try { bus.gain.setTargetAtTime(value, ctx.currentTime, tau); } catch (e) { /* mock node */ }
+    try { sendBus.gain.setTargetAtTime(value, ctx.currentTime, tau); } catch (e) { /* mock node */ }
+  }
+
+  function silenceBuses() {
+    /* Zero both dry and reverb sends immediately, then stop sources that were
+       already scheduled. Clearing the timer alone leaves the current repetition
+       audible, which is the background-tab bug this lifecycle replaces. */
+    setBusLevel(0, 0.005);
+    stopScheduledVoices();
+  }
+
+  function startInterval() {
+    if (stopped || blocked() || iv !== null) return;
+    iv = setInterval(() => { if (loopAudible()) once(); }, periodMs);
+    nextAt = Date.now() + periodMs;
+  }
+
+  function armAfterPause() {
+    if (stopped || blocked()) return;
+    clearScheduledTimer();
+    const delay = Math.max(0, Math.round(phaseRemaining));
+    nextAt = Date.now() + delay;
+    /* A one-shot interval preserves the unelapsed part of the old period.
+       After it fires, replace it with the regular-period interval. */
+    const phaseId = setInterval(() => {
+      clearInterval(phaseId);
+      if (iv === phaseId) iv = null;
+      if (stopped || blocked()) return;
+      once();
+      startInterval();
+    }, delay);
+    iv = phaseId;
+  }
+
+  function refreshLifecycle() {
+    if (stopped) return;
+    if (blocked()) {
+      if (!suspended) {
+        suspended = true;
+        capturePhase();
+        clearScheduledTimer();
+        silenceBuses();
+      }
+    } else if (suspended) {
+      suspended = false;
+      setBusLevel(1, 0.005);
+      armAfterPause();
+    }
+  }
+
+  function onVisibilityChange() {
+    hiddenPaused = typeof document !== "undefined" && !!document.hidden;
+    refreshLifecycle();
+  }
+
+  const controller = {
+    setMuted(muted) { mutedPaused = !!muted; refreshLifecycle(); },
+  };
+  loopControllers.add(controller);
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
+
+  /* The first performance above is intentionally ungated (including for loops),
+     preserving the trigger semantics. From here on, visibility/mute/manual state
+     owns repetitions. If playback began while already blocked, freeze the interval
+     that was just created. */
+  if (blocked()) {
+    suspended = true;
+    capturePhase();
+    clearScheduledTimer();
+    silenceBuses();
+  }
+
   return {
+    pause() {
+      if (stopped) return;
+      manualPaused = true;
+      refreshLifecycle();
+    },
+    resume() {
+      if (stopped) return;
+      manualPaused = false;
+      refreshLifecycle();
+    },
     stop() {
       if (stopped) return;
       stopped = true;
-      if (iv) clearInterval(iv);
+      loopControllers.delete(controller);
+      if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      clearScheduledTimer();
+
+      /* Loop handles promise complete release when stop() returns. Zero the
+         params and stop already-scheduled voices first, then disconnect both
+         buses synchronously so no queued graph can survive the handle. */
       const t = ctx.currentTime;
-      bus.gain.setTargetAtTime(0, t, 0.02);
-      sendBus.gain.setTargetAtTime(0, t, 0.02);
-      setTimeout(() => { try { bus.disconnect(); sendBus.disconnect(); if (place) place.disconnect(); } catch (e) { /* already gone */ } }, 300);
+      try {
+        bus.gain.cancelScheduledValues(t);
+        sendBus.gain.cancelScheduledValues(t);
+        bus.gain.value = 0;
+        sendBus.gain.value = 0;
+        bus.gain.setValueAtTime(0, t);
+        sendBus.gain.setValueAtTime(0, t);
+        bus.gain.setTargetAtTime(0, t, 0.02);
+        sendBus.gain.setTargetAtTime(0, t, 0.02);
+      } catch (e) { /* mock AudioParam */ }
+      stopScheduledVoices();
+      for (const node of [bus, sendBus, place]) {
+        try { if (node) node.disconnect(); } catch (e) { /* already gone */ }
+      }
     },
   };
 }
 
 /** Play a cue by name. Options: { pitch, volume, loop, every, pan, pos }.
-    Returns a handle: { stop() }. With loop: true the cue repeats (spaced by its own
-    duration, or opts.every seconds) until stopped - for loading states.
+    Returns a handle: { pause(), resume(), stop() }. With loop: true the cue repeats
+    (spaced by its own duration, or opts.every seconds) until stopped - for loading states.
+    Pause/resume are safe no-ops for one-shots.
     pan (-1..1) places it in the stereo field; pos ([x,y,z]) places it in 3D and
     wins over pan. Both are fixed for the life of the performance. */
 export function play(name, opts) {

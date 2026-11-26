@@ -73,8 +73,9 @@ play("complete");  // a long task finishing
 
 const h = play("loading", { loop: true }); // repeats until stopped
 await work();
-h.stop();          // ~20ms fade; then play("complete")
-                   // loops go quiet while the tab is hidden, and resume on return -
+h.stop();          // stops and releases the loop; then play("complete")
+                   // loops pause automatically while the tab is hidden or muted,
+                   // and resume on return/unmute unless you called h.pause() -
                    // you do not need a visibilitychange listener for this
 set({ duck: 0.3 }); // attenuate everything while a video/call plays; duck: 1 restores
 ```

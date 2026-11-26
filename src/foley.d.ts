@@ -48,9 +48,19 @@ export interface SoundSet {
 }
 
 export interface PlayHandle {
-  /** Fade this performance out (~20ms) and, if looping, stop the loop.
-      A property, not a method: `const { stop } = play(...)` is a supported
-      pattern, and method syntax makes TypeScript's unbound-method rule object. */
+  /** Pause a looping performance and clear its scheduling timer.
+      Idempotent. A manually paused loop stays paused through visibility and
+      mute changes until `resume()` is called. No-op for one-shots and after `stop()`. */
+  pause: () => void;
+  /** Resume a loop from its position in the repetition period.
+      Idempotent; does not create a second scheduler. Visibility and mute gates
+      can keep the loop paused until those external reasons clear. No-op after `stop()`. */
+  resume: () => void;
+  /** Stop this performance. One-shots use the short ~20ms fade; loops silence
+      already-scheduled voices and release their timer, visibility listener,
+      bus, and send node immediately. A property, not a method:
+      `const { stop } = play(...)` is a supported pattern, and method syntax
+      makes TypeScript's unbound-method rule object. */
   stop: () => void;
 }
 
@@ -61,7 +71,7 @@ export interface Settings {
   transpose: number;
   /** Reverb send, 0–1. Default 0.22. */
   space: number;
-  /** Silences the whole engine when true. */
+  /** Silences the whole engine when true; also pauses active loops until unmuted. */
   muted: boolean;
   /** Whether data-foley-hover elements play on pointerenter. Default true. */
   hover: boolean;
@@ -99,7 +109,7 @@ export declare const families: Readonly<Record<FamilyName, Readonly<{ name: stri
 export declare const themes: readonly ThemeName[];
 
 /** Play a cue. Applies the per-cue 60ms cooldown and ±30-cent humanization.
-    Returns a handle whose stop() fades the performance out. */
+    Returns a handle with pause()/resume() for loops and stop() for every performance. */
 export declare function play(name: CueName, opts?: PlayOptions): PlayHandle | undefined;
 
 /** Wire every data-foley-* attribute under root (default: document). Idempotent.

@@ -16,7 +16,7 @@ Sibling to [Dolly](https://usedolly.dev) ([repo](https://github.com/eakbulut/dol
 - **7.6 kB** minified + gzipped for the whole API — 5.9 kB for the usual `bind` + `play` + `set`, since it tree-shakes; zero dependencies, one ES module
 - **Placed in space** — `pan` or 3D `pos` per play, or `set({ localize })` to pan every bound cue to where its element sits on screen
 - **Markup, not wiring** — `data-foley-*` attributes on the elements you already have; one `bind()` covers the whole page, including markup rendered later and keyboard focus, and `observe()` sounds elements that appear or change state on their own
-- **Defensive by design** — master limiter, 60ms per-cue cooldown, ±30-cent humanization; loops go quiet in background tabs; `stop()` handles, looping, and ducking built in
+- **Defensive by design** — master limiter, 60ms per-cue cooldown, ±30-cent humanization; loops pause in background tabs and when muted, with explicit `pause()`/`resume()` handles; `stop()` releases their timers and buses
 - **WAV export** — any cue, any custom design, or all 28 as an audio sprite with an offset map
 
 ## Install
@@ -48,6 +48,11 @@ set({ volume: 0.7, theme: "default" });
 
 play("success");                 // programmatic cues for things the user didn't click
 play("tick", { pitch: 4, volume: 0.3 });
+
+const loading = play("loading", { loop: true });
+loading?.pause();                // no new repetitions; tab-hidden/muted also do this
+loading?.resume();               // continue at the remaining point in the period
+loading?.stop();                 // timer and audio buses are released
 ```
 
 Browsers require a user gesture before audio can start; `bind()` installs a one-time unlock listener for you, and `play()` resumes the context automatically.
@@ -126,9 +131,9 @@ page, and most apps only want interaction sounds.
 import { play, bind, set, get, toWav, unlock, getAnalyser, on, cues, families, themes, version } from "@foleyjs/core";
 ```
 
-- **`play(name, { pitch?, volume?, loop?, every?, pan?, pos? })`** — play a cue; returns `{ stop() }`. With `loop: true` it repeats until stopped — ideal for loading states.
+- **`play(name, { pitch?, volume?, loop?, every?, pan?, pos? })`** — play a cue; returns `{ pause(), resume(), stop() }`. With `loop: true` it repeats on `every` (or the cue duration) until stopped. `pause()` clears the loop timer and silences its buses; `resume()` continues at the remaining point in the period. Both are idempotent, and both are no-ops after `stop()`. For one-shots, `pause()`/`resume()` are safe no-ops. Ideal for loading states.
 - **`bind(root?)`** — wire all `data-foley-*` attributes under `root` (default `document`). Idempotent, and delegated: markup rendered later is covered without re-binding.
-- **`set({ volume?, transpose?, space?, muted?, hover?, theme?, duck?, localize? })`** — update global settings. `duck` (0–1) temporarily attenuates everything, e.g. while a video plays. `localize` (0–1) pans every bound cue to its element's place on screen. `theme` accepts a name or a custom transform object (`{ pitch, decay, send, ... }`).
+- **`set({ volume?, transpose?, space?, muted?, hover?, theme?, duck?, localize? })`** — update global settings. `muted: true` pauses active loops (not just their next tick); unmuting resumes loops unless they were manually paused or the page is hidden. One-shots keep their lifecycle and are silenced by the master gain as before. `duck` (0–1) temporarily attenuates everything, e.g. while a video plays. `localize` (0–1) pans every bound cue to its element's place on screen. `theme` accepts a name or a custom transform object (`{ pitch, decay, send, ... }`).
 - **`observe(root?)`** — sound elements that appear, leave, or change state (`data-foley-enter` / `-exit` / `-change`) via one `MutationObserver`. Opt-in; returns a stop function.
 - **`panFor(el)`** — the pan `localize` would derive for an element, for your own `play()` calls.
 - **`get()`** — snapshot of current settings.
@@ -234,7 +239,7 @@ set({ theme: "glass" }); // "default" | "soft" | "mechanical" | "glass"
 - A **master limiter** (DynamicsCompressor as brick-wall safety) so overlapping cues never clip.
 - A **60ms per-cue cooldown** so hover storms and fast sliders stay musical instead of machine-gunning.
 - **Humanization**: each performance drifts up to ±30 cents in pitch and ±8% in level, applied to the whole cue at once — repeated ticks sound performed, not stamped.
-- **Looping cues fall silent in a background tab** and resume when it's visible again, so a forgotten `play("loading", { loop: true })` can't serenade someone from a tab they've left. One-shots still fire — a `ping` for an incoming message is the point.
+- **Looping cues have a real pause/resume lifecycle** and pause automatically when the tab is hidden or the engine is muted. Returning to the tab or unmuting resumes at the remaining point in the original period, unless your code explicitly called `pause()`; manual pauses stay manual until `resume()`. `stop()` clears the timer, removes the visibility listener, and disconnects the performance's buses. One-shots still fire in background tabs — a `ping` for an incoming message is the point.
 
 ## Framework packages
 
