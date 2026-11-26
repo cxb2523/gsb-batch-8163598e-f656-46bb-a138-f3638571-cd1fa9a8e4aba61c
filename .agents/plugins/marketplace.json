@@ -1,0 +1,21 @@
+{
+  "name": "inkworks-skill",
+  "interface": {
+    "displayName": "Inkworks"
+  },
+  "plugins": [
+    {
+      "name": "inkworks-skill",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Moh4696/inkworks-skill.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Design"
+    }
+  ]
+}

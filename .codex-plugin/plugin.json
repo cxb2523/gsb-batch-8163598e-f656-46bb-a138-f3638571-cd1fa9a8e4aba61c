@@ -1,0 +1,38 @@
+{
+  "name": "inkworks-skill",
+  "version": "1.1.0",
+  "description": "An agent skill for interactive 3D how-it-works pages in a white engineering-drawing style: ink-outlined three.js machines you can slow down, step, scrub and orbit, with numbered labels, live readouts and a cycle chart. Ships an engine and a bike pump, plus a 60 fps walkthrough-clip recorder.",
+  "author": {
+    "name": "exploraX",
+    "url": "https://x.com/exploraX_"
+  },
+  "homepage": "https://github.com/Moh4696/inkworks-skill",
+  "repository": "https://github.com/Moh4696/inkworks-skill",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "threejs",
+    "3d",
+    "explainer",
+    "interactive",
+    "mechanism",
+    "engineering",
+    "education",
+    "animation"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Inkworks",
+    "shortDescription": "Interactive 3D how-it-works pages in an engineering-drawing style.",
+    "longDescription": "An agent skill for interactive 3D how-it-works pages in a white engineering-drawing style: ink-outlined three.js machines you can slow down, step, scrub and orbit, with numbered labels, live readouts and a cycle chart. Ships an engine and a bike pump, plus a 60 fps walkthrough-clip recorder.",
+    "developerName": "exploraX",
+    "category": "Design",
+    "capabilities": [],
+    "websiteURL": "https://github.com/Moh4696/inkworks-skill",
+    "defaultPrompt": [
+      "Make an interactive 3D page that shows how a car engine works.",
+      "Build an Inkworks explainer of how a pin tumbler lock opens.",
+      "Show how a two-stroke engine works in 3D, figure layout, and record a clip."
+    ]
+  }
+}
