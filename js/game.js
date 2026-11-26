@@ -334,6 +334,16 @@ const Game = {
             InteractionManager.interact();
         }
 
+        // Advance to the next game day: settles crop growth based on
+        // today's watering and dries every watered tile.
+        if (Input.wasKeyPressed("n")) {
+            const result = World.advanceDay();
+            console.log(
+                `[Day] Advanced to day ${result.day} ` +
+                `(grown: ${result.grownCrops}, dried: ${result.wateredTiles})`
+            );
+        }
+
         if (Input.wasKeyPressed("i")) {
             InventoryUI.toggle();
         }

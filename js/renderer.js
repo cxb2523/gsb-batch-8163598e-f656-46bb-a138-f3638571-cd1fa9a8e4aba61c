@@ -82,6 +82,7 @@ const Renderer = {
 
         // Draw UI
         this.drawCoins(ctx);
+        this.drawDay(ctx);
         this.drawHotbar(ctx);
         InventoryUI.draw(ctx);
         ShopUI.draw(ctx);
@@ -192,6 +193,29 @@ const Renderer = {
             "🪙 " + Player.coins,
             20,
             20
+        );
+
+        ctx.restore();
+
+    },
+
+    // ===================================================
+    // DAY HUD
+    // ===================================================
+
+    drawDay(ctx) {
+
+        ctx.save();
+
+        ctx.fillStyle = "#F5E6C8";
+        ctx.font = "bold 18px Arial";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+
+        ctx.fillText(
+            "📅 Day " + (World.day || 1) + "   [N] Next day",
+            20,
+            54
         );
 
         ctx.restore();

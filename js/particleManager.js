@@ -70,3 +70,13 @@ const ParticleManager = {
     }
 
 };
+
+// Test/tooling bridge (Node vm / require access). No gameplay effect.
+if (typeof globalThis !== "undefined") {
+    globalThis.ParticleManager = ParticleManager;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = ParticleManager;
+    module.exports.ParticleManager = ParticleManager;
+}

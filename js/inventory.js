@@ -101,3 +101,13 @@ const Inventory = {
     }
 
 };
+
+// Test/tooling bridge (Node vm / require access). No gameplay effect.
+if (typeof globalThis !== "undefined") {
+    globalThis.Inventory = Inventory;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = Inventory;
+    module.exports.Inventory = Inventory;
+}

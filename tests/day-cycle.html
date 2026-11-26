@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Day Cycle Checks — Farm Simulator</title>
+    <style>
+      body {
+        font-family: Consolas, "Segoe UI", monospace;
+        background: #1e1e1e;
+        color: #d4d4d4;
+        margin: 0;
+        padding: 24px;
+      }
+      h1 { font-size: 18px; }
+      #summary {
+        font-size: 16px;
+        font-weight: bold;
+        margin: 12px 0 20px;
+        padding: 12px 16px;
+        border-radius: 6px;
+        display: inline-block;
+      }
+      #summary.all-pass { background: #163d1b; color: #8ce99a; }
+      #summary.has-fail { background: #4a1818; color: #ffa8a8; }
+      ul { list-style: none; padding: 0; max-width: 980px; }
+      li {
+        padding: 8px 12px;
+        margin-bottom: 6px;
+        border-radius: 4px;
+        background: #2a2a2a;
+        white-space: pre-wrap;
+      }
+      li.pass { border-left: 4px solid #51cf66; }
+      li.fail { border-left: 4px solid #ff6b6b; }
+      .mark { font-weight: bold; margin-right: 8px; }
+      .pass .mark { color: #51cf66; }
+      .fail .mark { color: #ff6b6b; }
+      .error { color: #ffa8a8; margin-top: 6px; font-size: 12px; }
+      a { color: #74c0fc; }
+      .hint { color: #999; font-size: 13px; margin-bottom: 16px; }
+    </style>
+  </head>
+  <body>
+    <h1>🌱 每日结算 / 浇水修正 — 浏览器验收样例</h1>
+    <p class="hint">
+      本页面直接加载真实的 <code>js/</code> 源码并运行
+      <code>tests/day-cycle.checks.js</code>。也可以在游戏页面
+      <code>index.html</code> 的控制台粘贴
+      <code>tests/day-cycle.console.js</code>。
+    </p>
+    <div id="summary">Running…</div>
+    <ul id="results"></ul>
+
+    <!-- Dependencies / sources, same order as index.html (subset) -->
+    <script src="../js/constants.js"></script>
+    <script src="../js/cropRegistry.js"></script>
+    <script src="../js/utils.js"></script>
+    <script src="../js/world.js"></script>
+    <script src="../js/inventory.js"></script>
+    <script src="../js/particleManager.js"></script>
+    <script src="../js/effects.js"></script>
+    <script src="../js/player.js"></script>
+
+    <script src="./day-cycle.checks.js"></script>
+    <script>
+      (function () {
+        var report = DayCycleChecks.runDayCycleChecks({
+          World: World,
+          Player: Player,
+          CropRegistry: CropRegistry,
+          ParticleManager: ParticleManager,
+          Inventory: Inventory,
+          TILE_SIZE: TILE_SIZE,
+          WORLD_ROWS: WORLD_ROWS
+        });
+
+        var summary = document.getElementById("summary");
+        summary.textContent =
+          (report.ok ? "✅ ALL PASS" : "❌ FAILURES") +
+          " — " + report.passed + "/" + report.total + " checks passed";
+        summary.className = report.ok ? "all-pass" : "has-fail";
+
+        var list = document.getElementById("results");
+        report.results.forEach(function (r) {
+          var li = document.createElement("li");
+          li.className = r.ok ? "pass" : "fail";
+
+          var line = document.createElement("div");
+          var mark = document.createElement("span");
+          mark.className = "mark";
+          mark.textContent = r.ok ? "PASS" : "FAIL";
+          line.appendChild(mark);
+          line.appendChild(document.createTextNode(r.name));
+          li.appendChild(line);
+
+          if (!r.ok && r.message) {
+            var err = document.createElement("div");
+            err.className = "error";
+            err.textContent = r.message;
+            li.appendChild(err);
+          }
+
+          list.appendChild(li);
+        });
+
+        // Also expose the report for DevTools inspection.
+        window.__dayCycleReport = report;
+        console.log("[day-cycle] report:", report);
+      })();
+    </script>
+  </body>
+</html>

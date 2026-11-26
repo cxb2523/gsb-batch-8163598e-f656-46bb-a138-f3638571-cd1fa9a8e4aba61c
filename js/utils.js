@@ -43,3 +43,18 @@ function getPlayerTile() {
     );
 
 }
+
+// Test/tooling bridge: when sources are loaded one file per Node module,
+// publish these shared helpers as globals. No gameplay effect.
+if (typeof globalThis !== "undefined") {
+
+    globalThis.getTileAt = getTileAt;
+    globalThis.getPlayerTile = getPlayerTile;
+
+}
+
+if (typeof module !== "undefined" && module.exports) {
+
+    module.exports = { getTileAt: getTileAt, getPlayerTile: getPlayerTile };
+
+}

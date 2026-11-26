@@ -24,3 +24,21 @@ const WORLD_COLS = 100;
 // ===================================================
 
 const TARGET_FPS = 60;
+
+// Test/tooling bridge: makes these file-scoped constants resolvable as
+// globals when sources are loaded one file per Node module. In the
+// browser these are already shared lexical bindings.
+if (typeof globalThis !== "undefined") {
+
+    Object.assign(globalThis, {
+
+        GAME_WIDTH,
+        GAME_HEIGHT,
+        TILE_SIZE,
+        WORLD_ROWS,
+        WORLD_COLS,
+        TARGET_FPS
+
+    });
+
+}

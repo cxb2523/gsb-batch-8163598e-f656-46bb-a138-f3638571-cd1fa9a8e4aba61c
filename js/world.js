@@ -15,6 +15,9 @@ const World = {
     farmObjects: [],
     fences: [],
 
+    // Current in-game day. Day settlement advances this by one.
+    day: 1,
+
     spawn: {
 
         x: 0,
@@ -31,6 +34,8 @@ const World = {
         this.buildings = [];
         this.farmObjects = [];
         this.fences = [];
+
+        this.day = 1;
 
         this.tiles = WorldGenerator.generate();
 
@@ -206,49 +211,127 @@ const World = {
     },
 
     // ===================================================
-    // WORLD UPDATE
+    // DAY SETTLEMENT
     // ===================================================
 
-    update(deltaTime) {
+    // Single entry point for advancing to the next in-game day.
+    //
+    // Rules:
+    //   1. A crop grows exactly one stage only when its tile was
+    //      watered during the day being settled.
+    //   2. Crops on unwatered tiles do not change.
+    //   3. Mature crops stay at their final stage (never overflow).
+    //   4. After growth is resolved, every tile dries out, so watering
+    //      is only valid for the current day.
+    //
+    // Growth is based on accumulated watered days, never on Date.now().
+    advanceDay() {
 
-        for (let row = 0; row < WORLD_ROWS; row++) {
+        let grownCrops = 0;
+        let wateredTiles = 0;
 
-            for (let col = 0; col < WORLD_COLS; col++) {
+        const rowCount = this.tiles.length;
 
-                const tile = this.tiles[row][col];
+        for (let row = 0; row < rowCount; row++) {
 
-                // Skip empty tiles
-                if (!tile.crop) {
+            const tileRow = this.tiles[row];
+
+            if (!tileRow) {
+                continue;
+            }
+
+            for (let col = 0; col < tileRow.length; col++) {
+
+                const tile = tileRow[col];
+
+                if (!tile) {
                     continue;
                 }
 
-                // Crops only grow when watered
-                if (!tile.watered) {
-                    continue;
+                // Resolve growth BEFORE clearing today's watering flag.
+                if (tile.crop && tile.watered) {
+
+                    const crop = tile.crop;
+
+                    // Count every settled day the crop had water.
+                    crop.wateredDays =
+                        (Number.isFinite(crop.wateredDays)
+                            ? crop.wateredDays
+                            : 0) + 1;
+
+                    const cropData =
+                        typeof CropRegistry !== "undefined"
+                            ? CropRegistry[crop.cropId]
+                            : null;
+
+                    const maxStage = cropData
+                        ? cropData.growthStages - 1
+                        : (Number.isInteger(crop.maxStage)
+                            ? crop.maxStage
+                            : crop.stage);
+
+                    if (crop.stage < maxStage) {
+
+                        crop.stage += 1;
+                        grownCrops += 1;
+
+                    }
+
                 }
 
-                const cropData = CropRegistry[tile.crop.cropId];
+                if (tile.watered) {
+                    wateredTiles += 1;
+                }
 
-                const elapsed =
-                    (Date.now() - tile.crop.plantedAt) / 1000;
-
-                const stage = Math.min(
-
-                    Math.floor(
-                        elapsed /
-                        (cropData.growthTime / cropData.growthStages)
-                    ),
-
-                    cropData.growthStages - 1
-
-                );
-
-                tile.crop.stage = stage;
+                // Watering only lasts for the current day.
+                tile.watered = false;
 
             }
 
         }
 
+        this.day += 1;
+
+        return {
+
+            day: this.day,
+            grownCrops: grownCrops,
+            wateredTiles: wateredTiles
+
+        };
+
+    },
+
+    // ===================================================
+    // WORLD UPDATE
+    // ===================================================
+
+    update(deltaTime) {
+
+        // Crop growth is resolved by the daily settlement
+        // (World.advanceDay), not by real elapsed time. This per-frame
+        // hook is intentionally kept (the game loop calls it) but must
+        // never overwrite crop.stage from Date.now()/deltaTime.
+
     }
 
 };
+
+// ===================================================
+// TEST / TOOLING EXPORTS
+// Mirror the global binding onto globalThis so Node vm contexts and
+// require()-based local tests can reach it. No effect on gameplay.
+// ===================================================
+
+if (typeof globalThis !== "undefined") {
+
+    globalThis.World = World;
+
+}
+
+if (typeof module !== "undefined" && module.exports) {
+
+    module.exports = World;
+    module.exports.World = World;
+
+}

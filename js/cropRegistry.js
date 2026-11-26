@@ -91,3 +91,13 @@ const CropRegistry = {
     },
   },
 };
+
+// Test/tooling bridge (Node vm / require access). No gameplay effect.
+if (typeof globalThis !== "undefined") {
+  globalThis.CropRegistry = CropRegistry;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = CropRegistry;
+  module.exports.CropRegistry = CropRegistry;
+}

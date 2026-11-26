@@ -225,9 +225,31 @@ const Player = {
     // TILE DETECTION
     // ===================================================
 
-    getFacingTile() {
+    // Grid coordinates of the tile the player is facing.
+    // Kept separate from getFacingTile() so effects can place
+    // themselves on the targeted tile even when only coordinates
+    // are needed.
+    getFacingTileCoords() {
 
-        const tilePos = getPlayerTile();
+        // Prefer the shared helper when all scripts share global scope
+        // (browser / vm). Fall back to the equivalent inline math so
+        // isolated require()-based harnesses work without utils.js.
+        let tilePos;
+
+        if (typeof getPlayerTile === "function") {
+
+            tilePos = getPlayerTile();
+
+        } else {
+
+            tilePos = World.worldToTile(
+
+                this.x + this.width / 2,
+                this.y + this.height / 2
+
+            );
+
+        }
 
         let row = tilePos.row;
         let col = tilePos.col;
@@ -251,6 +273,22 @@ const Player = {
                 break;
 
         }
+
+        return {
+
+            row: row,
+            col: col
+
+        };
+
+    },
+
+    getFacingTile() {
+
+        const target = this.getFacingTileCoords();
+
+        const row = target.row;
+        const col = target.col;
 
         if (
             row < 0 ||
@@ -290,26 +328,104 @@ const Player = {
 
         if (this.toolCooldown > 0) return;
 
-        this.toolCooldown = this.toolDelay;
-
         const tile = this.getFacingTile();
-        if (!tile) return;
 
-        if (tile.type !== "soil") return;
+        // Only tilled soil can be watered. Invalid targets must not
+        // trigger the cooldown nor spawn any particles.
+        if (!tile || tile.type !== "soil") return;
+
+        // Commit the cooldown only for a successful watering.
+        this.toolCooldown = this.toolDelay;
 
         tile.watered = true;
 
-        const worldPos = World.tileToWorld(
-            World.worldToTile(Player.x, Player.y).row,
-            World.worldToTile(Player.x, Player.y).col
-        );
+        // Spawn the splash on the WATERED tile, not at the player's feet.
+        const targetCoords = this.resolveTileCoords(tile);
+        const worldPos = World.tileToWorld(targetCoords.row, targetCoords.col);
 
-        ParticleManager.spawn(
-            worldPos.x + TILE_SIZE / 2,
-            worldPos.y + TILE_SIZE / 2,
-            "#4DA6FF",
-            6
-        );
+        if (
+            typeof ParticleManager !== "undefined" &&
+            ParticleManager &&
+            typeof ParticleManager.spawn === "function"
+        ) {
+            ParticleManager.spawn(
+                worldPos.x + TILE_SIZE / 2,
+                worldPos.y + TILE_SIZE / 2,
+                "#4DA6FF",
+                6
+            );
+        }
+    },
+
+    // Best-effort grid coordinates for a target tile. Real tiles carry
+    // row/col; synthetic test tiles may only be reachable by reference.
+    resolveTileCoords(tile) {
+
+        if (
+            tile &&
+            Number.isInteger(tile.row) &&
+            Number.isInteger(tile.col)
+        ) {
+
+            return { row: tile.row, col: tile.col };
+
+        }
+
+        try {
+
+            if (World && Array.isArray(World.tiles)) {
+
+                for (let row = 0; row < World.tiles.length; row++) {
+
+                    const tileRow = World.tiles[row];
+
+                    if (!tileRow) {
+                        continue;
+                    }
+
+                    for (let col = 0; col < tileRow.length; col++) {
+
+                        if (tileRow[col] === tile) {
+
+                            return { row: row, col: col };
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        } catch (error) { /* fall through */ }
+
+        try {
+
+            const facing = this.getFacingTileCoords();
+
+            if (
+                Number.isInteger(facing.row) &&
+                Number.isInteger(facing.col)
+            ) {
+
+                return facing;
+
+            }
+
+        } catch (error) { /* fall through */ }
+
+        try {
+
+            const playerTile = World.worldToTile(this.x, this.y);
+
+            return { row: playerTile.row, col: playerTile.col };
+
+        } catch (error) {
+
+            return { row: 0, col: 0 };
+
+        }
+
     },
 
     // ===================================================
@@ -318,18 +434,10 @@ const Player = {
 
     plantSeed(item) {
 
-        const tilePos = getPlayerTile();
+        const target = this.getFacingTileCoords();
 
-        let row = tilePos.row;
-        let col = tilePos.col;
-
-        switch (this.facing) {
-
-            case "up": row--; break;
-            case "down": row++; break;
-            case "left": col--; break;
-            case "right": col++; break;
-        }
+        const row = target.row;
+        const col = target.col;
 
         if (
             row < 0 ||
@@ -352,7 +460,11 @@ const Player = {
         tile.crop = {
             cropId: item.cropId,
             stage: 0,
-            plantedAt: Date.now()
+
+            // Growth is accumulated by watered days during
+            // World.advanceDay() settlement, not real elapsed time.
+            wateredDays: 0,
+            plantedDay: World.day || 1
         };
     },
 
@@ -375,7 +487,13 @@ const Player = {
             return;
         }
 
-        Inventory.add(cropData.harvestItem, 1);
+        if (
+            typeof Inventory !== "undefined" &&
+            Inventory &&
+            typeof Inventory.add === "function"
+        ) {
+            Inventory.add(cropData.harvestItem, 1);
+        }
 
         const tilePos = World.worldToTile(
             Player.x,
@@ -390,7 +508,15 @@ const Player = {
         const x = worldPos.x + TILE_SIZE / 2;
         const y = worldPos.y + TILE_SIZE / 2;
 
-        Effects.harvest(x, y);
+        // Guarded so headless/local test harnesses that do not load
+        // effects.js can still verify the state reset below.
+        if (
+            typeof Effects !== "undefined" &&
+            Effects &&
+            typeof Effects.harvest === "function"
+        ) {
+            Effects.harvest(x, y);
+        }
 
         tile.crop = null;
         tile.watered = false;
@@ -424,3 +550,22 @@ const Player = {
     }
 
 };
+
+// ===================================================
+// TEST / TOOLING EXPORTS
+// Mirror the global binding onto globalThis so Node vm contexts and
+// require()-based local tests can reach it. No effect on gameplay.
+// ===================================================
+
+if (typeof globalThis !== "undefined") {
+
+    globalThis.Player = Player;
+
+}
+
+if (typeof module !== "undefined" && module.exports) {
+
+    module.exports = Player;
+    module.exports.Player = Player;
+
+}

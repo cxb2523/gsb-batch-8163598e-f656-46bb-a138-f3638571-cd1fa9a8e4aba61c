@@ -1,0 +1,9 @@
+{
+  "name": "harvest-engine-farm-simulator",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Vanilla JS canvas farm simulator. Local day-cycle / watering tests use only the Node built-in test runner.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

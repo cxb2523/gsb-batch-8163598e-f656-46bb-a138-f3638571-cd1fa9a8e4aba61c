@@ -370,6 +370,46 @@ Farm Simulator serves as the flagship project, showcasing how modern engine arch
 
 ---
 
+# 🌅 Daily Settlement & Testing
+
+Crop growth is resolved by a deterministic **daily settlement**, not by
+`Date.now()` / real elapsed time.
+
+- `World.advanceDay()` is the single entry point that:
+  1. advances one growth stage for every crop whose tile was watered that day;
+  2. leaves unwatered crops unchanged;
+  3. clamps mature crops at their final stage;
+  4. dries **every** tile (`tile.watered = false`), so watering only lasts one day;
+  5. increments `World.day`.
+- In the browser game, press **`N`** to advance to the next day (the HUD shows
+  the current day). You can also run `World.advanceDay()` from DevTools.
+- `Player.waterTile()` spawns its splash particles on the **watered tile**
+  center and only starts the tool cooldown / particles for actual soil tiles.
+
+### Run the local checks
+
+Node (no dependencies, Node ≥ 18):
+
+```bash
+node --test                 # auto-discovers tests/*.test.js
+# or
+node tests/day-cycle.test.js
+```
+
+Browser:
+
+- Open [`tests/day-cycle.html`](tests/day-cycle.html) for a rendered report.
+- Or open `index.html`, then paste `tests/day-cycle.console.js` into the
+  DevTools console. It runs against an isolated 3×3 grid and restores the
+  live game state afterwards.
+
+The checks cover: two consecutive watered days increasing the stage, missing a
+watering day preventing growth, all soil drying after settlement, mature-crop
+clamping, full state clearing after harvest, and the watering particle /
+cooldown rules.
+
+---
+
 # 📜 License
 
 Licensed under the MIT License.
