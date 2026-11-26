@@ -34,7 +34,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, onUnmounted } from "vue";
 import AlertBox from "@/components/AlertBox.vue";
 import ControlBar from "@/components/ControlBar.vue";
 import NoteList from "@/components/NoteList.vue";
@@ -42,4 +42,5 @@ import { useSongStore } from "@/stores/song";
 
 const song = useSongStore();
 onMounted(async () => await song.loadSamples());
+onUnmounted(() => song.dispose());
 </script>

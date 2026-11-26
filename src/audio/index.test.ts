@@ -38,7 +38,8 @@ test("Check timing for playing tracks", () => {
   const track = new MockTrack();
 
   const player = new Player(16, 1 / 16, 0.075, 120.0, 0.025);
-  player.playTick(context, destination, [track]);
+  player.start(context, destination, [track]);
 
-  expect(track.record).toEqual([[0, 0.15]]);
+  // The opening step is scheduled one step duration after the audio clock.
+  expect(track.record).toEqual([[0, 0.25]]);
 });

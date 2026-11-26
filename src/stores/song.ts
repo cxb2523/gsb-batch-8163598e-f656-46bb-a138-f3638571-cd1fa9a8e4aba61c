@@ -6,6 +6,7 @@ import { reactive, ref } from "vue";
 class Audio {
   private _context?: AudioContext;
   private _gainNode?: GainNode;
+  private _gainConnected = false;
 
   // Browsers require an audio context to start or resume after a
   // user event. For more information, visit https://goo.gl/7K7WLu.
@@ -21,6 +22,20 @@ class Audio {
       this._gainNode = this.context().createGain();
     }
     return this._gainNode;
+  }
+
+  /**
+   * Routes the gain node to the context destination exactly once. Repeated
+   * playback toggles never stack additional connections, so gains cannot
+   * compound.
+   */
+  connectDestination(): GainNode {
+    const gainNode = this.gainNode();
+    if (!this._gainConnected) {
+      gainNode.connect(this.context().destination);
+      this._gainConnected = true;
+    }
+    return gainNode;
   }
 }
 
@@ -47,6 +62,9 @@ export const useSongStore = defineStore("song", () => {
 
   function setTempo(value: number): void {
     tempo.value = value;
+    // Only the field changes: the running scheduler reads `player.tempo` on
+    // its next lookahead tick, so subsequently scheduled steps use the new
+    // tempo without restarting the chain or retriggering the current step.
     player.value.tempo = value;
   }
 
@@ -58,10 +76,10 @@ export const useSongStore = defineStore("song", () => {
   function playNote(trackName: string): void {
     const context = audio.context();
     context.resume();
-    audio.gainNode().connect(context.destination);
+    const gainNode = audio.connectDestination();
 
     const track = tracks.filter((track) => track.name == trackName)[0];
-    track.note(audio.context(), audio.gainNode(), 0.0);
+    track.note(context, gainNode, 0.0);
   }
 
   function toggleNoteActive(trackName: string, noteIndex: number): void {
@@ -70,27 +88,34 @@ export const useSongStore = defineStore("song", () => {
   }
 
   function togglePlaying(): void {
-    if (!player.value.loop && tempo.value <= 0) {
+    if (player.value.isPlaying) {
+      player.value.pause();
+      return;
+    }
+
+    if (tempo.value <= 0) {
       alert.message = "Tempo must be a postive number";
       alert.type = "error";
       return;
     }
 
-    player.value.loop = !player.value.loop;
-    if (player.value.loop) {
-      const context = audio.context();
-      context.resume();
-      const gainNode = audio.gainNode();
+    const context = audio.context();
+    context.resume();
+    const gainNode = audio.connectDestination();
+    // `start` is a no-op while already playing, so rapid clicks cannot create
+    // a parallel scheduling chain; resuming reuses the retained step phase.
+    player.value.start(context, gainNode, tracks);
+  }
 
-      gainNode.connect(context.destination);
-      player.value.timer = context.currentTime;
-      player.value.playTick(context, gainNode, tracks);
-    }
+  /** Stops playback and releases every scheduler timer on unmount. */
+  function dispose(): void {
+    player.value.dispose();
   }
 
   return {
     alert,
     audio,
+    dispose,
     loadSamples,
     player,
     playNote,

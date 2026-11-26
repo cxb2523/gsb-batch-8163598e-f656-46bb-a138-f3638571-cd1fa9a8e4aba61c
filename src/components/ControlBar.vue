@@ -61,7 +61,7 @@ const song = useSongStore();
 const volumePrevious = ref(0);
 
 const playIcon = computed(() =>
-  song.player.loop ? "icon-[ph--pause-fill]" : "icon-[ph--play-fill]"
+  song.player.isPlaying ? "icon-[ph--pause-fill]" : "icon-[ph--play-fill]"
 );
 const volumeIcon = computed(() => {
   if (song.volume === 0) {
