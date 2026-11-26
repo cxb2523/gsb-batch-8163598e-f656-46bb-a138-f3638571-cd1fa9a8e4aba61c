@@ -212,6 +212,9 @@ export default function VoiceOrb({
         const listening = t.caller && Boolean(p.caller);
         const heard = talking ? p.voice!.read(dt) : null;
         const said = listening ? p.caller!.read(dt) : null;
+        // The source the bands come from this frame: the liquid belongs to
+        // it, and leaves with it (another state, another source, none).
+        const source = talking ? p.voice : listening ? p.caller : null;
         // The pulse fades in after the zoom and the speed-up.
         const gain = smoothstep(PULSE_FROM, PULSE_TO, cur.talk);
         const up = 1 - Math.exp(-dt * ATTACK);
@@ -251,6 +254,7 @@ export default function VoiceOrb({
           level: cur.level,
           input: cur.input,
           pull: listening,
+          source,
           think: cur.think,
           scale: cur.scale,
           dim: cur.dim,

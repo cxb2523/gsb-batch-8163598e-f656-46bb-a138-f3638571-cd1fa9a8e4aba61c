@@ -6,6 +6,7 @@
 "use client";
 
 import type { OrbParams, OrbStops } from "@/data/orb";
+import type { LevelSource } from "./audio";
 import { Fluid, type FluidState } from "./fluid";
 import { FRAGMENTS, VERTEX, type OrbShader } from "./shaders";
 
@@ -27,8 +28,13 @@ import { FRAGMENTS, VERTEX, type OrbShader } from "./shaders";
  *  - Context loss: views keep their last frame (it is in their own canvas),
  *    and everything is rebuilt and redrawn when the context comes back.
  *  - The fluid (fluid.ts): a view gets its own small liquid the first time
- *    its voice has bass, keeps it while mounted and stops stepping it once
- *    it has been quiet a while. A still frame (dt 0) never steps it.
+ *    its voice has bass, and the liquid belongs to the level source that
+ *    stirred it (`frame.source`): when the view stops reading that source —
+ *    another state, another source, none — the liquid is destroyed and
+ *    leaves the registry, so an old swirl never carries into a new voice.
+ *    A new source's first bass starts a fresh liquid from the seed. A still
+ *    frame (dt 0) never steps it, and a liquid quiet for a while settles
+ *    and stops stepping; both clocks restart with each new liquid.
  */
 
 export interface OrbFrame {
@@ -46,6 +52,12 @@ export interface OrbFrame {
   input: number;
   /** Listening: the bands are the caller's, and the liquid is pulled inward. */
   pull?: boolean;
+  /**
+   * The level source the bands are read from this frame, or null when no
+   * source drives the orb. The view's liquid belongs to it: a different
+   * source (or none) retires the liquid, the same one keeps it.
+   */
+  source?: LevelSource | null;
   think: number;
   scale: number;
   dim: number;
@@ -81,6 +93,16 @@ const FLOW_DEBUG = (() => {
   if (typeof location === "undefined") return 0;
   const flow = new URLSearchParams(location.search).get("flow");
   return flow === null ? 0 : flow === "grid" ? 2 : 1;
+})();
+
+/**
+ * Dev logging of the liquids' lifecycle, from the address: ?fluidlog logs
+ * every create and release with the running totals, so a source switch can
+ * be checked to release exactly one liquid and start exactly one.
+ */
+const FLUID_LOG = (() => {
+  if (typeof location === "undefined") return false;
+  return new URLSearchParams(location.search).has("fluidlog");
 })();
 
 /* ---------- colour ---------- */
@@ -121,7 +143,10 @@ class OrbRenderer {
   private views = new Set<OrbView>();
   /** The simulation (null where the GPU cannot run it) and each view's liquid. */
   private fluid: Fluid | null = null;
-  private liquids = new Map<OrbView, FluidState>();
+  /** A view's liquid, with the level source it belongs to. */
+  private liquids = new Map<OrbView, { state: FluidState; source: LevelSource }>();
+  /** Lifecycle counts, for the ?fluidlog dev log. */
+  private fluidStats = { created: 0, released: 0 };
   /** Bound in place of a liquid: reads as no offset and no velocity. */
   private still: WebGLTexture | null = null;
   private frameId = 0;
@@ -144,7 +169,8 @@ class OrbRenderer {
       this.lost = true;
       this.programs.clear();
       this.textures.clear();
-      // Their textures went with the context; the next voice starts afresh.
+      // Their textures went with the context; the registry must not keep
+      // entries pointing at them. The next voice starts each liquid afresh.
       this.liquids.clear();
       this.fluid = null;
       cancelAnimationFrame(this.frameId);
@@ -243,10 +269,23 @@ class OrbRenderer {
 
   unregister(view: OrbView) {
     this.views.delete(view);
-    const liquid = this.liquids.get(view);
-    if (liquid) {
-      this.fluid?.destroy(liquid);
-      this.liquids.delete(view);
+    this.release(view);
+  }
+
+  /**
+   * Give a view's liquid back: its textures and framebuffers are deleted and
+   * its entry leaves the registry, so nothing points at the dead GPU objects.
+   */
+  private release(view: OrbView) {
+    const entry = this.liquids.get(view);
+    if (!entry) return;
+    this.liquids.delete(view);
+    this.fluid?.destroy(entry.state);
+    this.fluidStats.released++;
+    if (FLUID_LOG) {
+      console.debug(
+        `[orb] liquid released (live ${this.liquids.size}, created ${this.fluidStats.created}, released ${this.fluidStats.released})`,
+      );
     }
   }
 
@@ -283,16 +322,31 @@ class OrbRenderer {
     }
   };
 
-  /** The view's liquid, stepped by `dt`; created when its voice first has bass. */
+  /**
+   * The view's liquid, stepped by `dt`. The liquid belongs to the level
+   * source the frame's bands come from: while that source keeps playing it
+   * is stepped, never rebuilt; when the view stops reading it (another
+   * state, another source, none) it is released, and the next source's
+   * first bass starts a fresh one from the seed.
+   */
   private liquid(view: OrbView, f: OrbFrame, dt: number): FluidState | null {
-    if (!this.fluid || f.params.fluid <= 0) return null;
-    let liquid = this.liquids.get(view) ?? null;
-    if (!liquid && dt > 0 && f.bands[0] > 0.02) {
-      liquid = this.fluid.createState(f.seed);
-      this.liquids.set(view, liquid);
+    const source = f.source ?? null;
+    const held = this.liquids.get(view);
+    if (held && held.source !== source) this.release(view);
+    if (!this.fluid || f.params.fluid <= 0 || !source) return null;
+    let entry = this.liquids.get(view) ?? null;
+    if (!entry && dt > 0 && f.bands[0] > 0.02) {
+      entry = { state: this.fluid.createState(f.seed), source };
+      this.liquids.set(view, entry);
+      this.fluidStats.created++;
+      if (FLUID_LOG) {
+        console.debug(
+          `[orb] liquid created (live ${this.liquids.size}, created ${this.fluidStats.created}, released ${this.fluidStats.released})`,
+        );
+      }
     }
-    if (liquid) this.fluid.step(liquid, { bands: f.bands, seed: f.seed, pull: f.pull }, dt);
-    return liquid;
+    if (entry) this.fluid.step(entry.state, { bands: f.bands, seed: f.seed, pull: f.pull }, dt);
+    return entry ? entry.state : null;
   }
 
   private draw(view: OrbView, f: OrbFrame, dt: number): boolean {
