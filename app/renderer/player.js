@@ -26,7 +26,11 @@ import {
     isInputChecked,
     joinPath
 } from "../util.js"
-import {shiftLyricsByPercentage, showLyrics} from "./lyrics.js"
+import {
+    resetShowingLyrics,
+    shiftLyricsByPercentage,
+    showLyrics
+} from "./lyrics.js"
 import mpvAPI from "./mpv.js"
 import {
     autoPlayOpts,
@@ -44,6 +48,9 @@ let hasAnySong = false
 let stoppedAfterTrack = false
 /** @type {HTMLAudioElement|null} */
 let audioEl = null
+let displayToken = 0
+/** @type {string|null} */
+let lastDisplayedSongId = null
 
 /** Checks if there are songs queued and mpv is defined. */
 export const isAlive = () => hasAnySong && mpv
@@ -197,8 +204,25 @@ export const toggleMute = async() => {
     await updateVolume(getCurrentVolume())
 }
 
-/** Stop playback of mpv if alive. */
+/** Clear the cover art images and the media session metadata. */
+const clearCoverDisplay = () => {
+    for (const id of ["song-cover", "fs-song-cover"]) {
+        const coverEl = document.getElementById(id)
+        if (coverEl) {
+            coverEl.removeAttribute("src")
+            coverEl.style.display = "none"
+        }
+    }
+    navigator.mediaSession.metadata = null
+}
+
+/** Stop playback of mpv if alive and reset the displayed song info. */
 export const stopPlayback = async() => {
+    // Invalidate in-flight cover and lyrics updates, late results are dropped
+    displayToken += 1
+    lastDisplayedSongId = null
+    clearCoverDisplay()
+    resetShowingLyrics()
     if (isAlive()) {
         await mpv?.command("stop")?.catch(() => null)
     }
@@ -209,6 +233,9 @@ export const stopPlayback = async() => {
  * @param {import("./songs.js").Song|null} song
  */
 export const displayCurrentSong = async song => {
+    // Each display call invalidates the previous one, only the latest applies
+    displayToken += 1
+    const token = displayToken
     const els = [
         document.getElementById("current-song"),
         document.getElementById("fs-current-song")
@@ -249,10 +276,31 @@ export const displayCurrentSong = async song => {
         songContainer.append(otherInfo)
     }
     if (!song) {
+        lastDisplayedSongId = null
+        clearCoverDisplay()
         return
+    }
+    if (song.id !== lastDisplayedSongId) {
+        // A different song: hide the old cover and reset the media session,
+        // so no info of the previous song remains while the cover loads
+        lastDisplayedSongId = song.id
+        for (const id of ["song-cover", "fs-song-cover"]) {
+            const coverEl = document.getElementById(id)
+            if (coverEl) {
+                coverEl.removeAttribute("src")
+                coverEl.style.display = "none"
+            }
+        }
+        navigator.mediaSession.metadata = new window.MediaMetadata({
+            ...song, "artwork": []
+        })
     }
     // MediaSession details
     const cover = await coverArt(song.path)
+    if (token !== displayToken) {
+        // A newer song or a stop happened while reading the cover, discard it
+        return
+    }
     const songCoverEl = document.getElementById("song-cover")
     const songCoverFsEl = document.getElementById("fs-song-cover")
     if (cover) {

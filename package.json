@@ -25,6 +25,7 @@
         "fix": "eslint --fix",
         "lint": "npm run eslint && npm run tsc",
         "start": "electron app",
+        "test": "node --experimental-test-module-mocks --test \"test/**/*.test.mjs\"",
         "tsc": "tsc",
         "update": "npx -y jelmerro/nus"
     },

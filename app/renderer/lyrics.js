@@ -40,6 +40,7 @@ import {getSong, updateLyricsOfSong} from "./songs.js"
 /** @type {NodeJS.Timeout|null} */
 let shiftLyricsTimeout = null
 let showingLyrics = false
+let lyricsToken = 0
 /** @type {import("genius-lyrics").Song[]} */
 let lyricsSearchCache = []
 
@@ -68,6 +69,9 @@ export const sanitizeLyrics = lyrics => {
  * @param {import("./songs.js").Song|null} originalReq
  */
 export const fetchLyrics = async(req, force = false, originalReq = null) => {
+    // Each fetch invalidates the previous one, only the latest may display
+    lyricsToken += 1
+    const token = lyricsToken
     const songInfoEl = document.getElementById("song-info")
     const fsLyricsEl = document.getElementById("fs-lyrics")
     const lyricsEditEl = document.getElementById("lyrics-edit-field")
@@ -99,7 +103,8 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
     for (const file of files) {
         const lyrics = sanitizeLyrics(readFile(file))
         if (lyrics) {
-            if (currentAndNext().current?.id === req.id) {
+            if (token === lyricsToken
+                && currentAndNext().current?.id === req.id) {
                 songInfoEl.textContent = lyrics
                 fsLyricsEl.textContent = lyrics
                 lyricsEditEl.value = lyrics
@@ -151,7 +156,8 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
             if (!song.instrumental) {
                 lyrics = sanitizeLyrics(await song.lyrics())
             }
-            if (currentAndNext().current?.id === req.id) {
+            if (token === lyricsToken
+                && currentAndNext().current?.id === req.id) {
                 songInfoEl.textContent = lyrics
                 fsLyricsEl.textContent = lyrics
                 lyricsEditEl.value = lyrics
@@ -173,7 +179,8 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
     if (originalReq) {
         return
     }
-    if (currentAndNext().current?.id === req.id) {
+    if (token === lyricsToken
+        && currentAndNext().current?.id === req.id) {
         const reqWithoutExtraText = JSON.parse(JSON.stringify(req))
         reqWithoutExtraText.artist = req.artist.replace(/\(.*\)/g, "")
             .split(" featuring ", 1)[0].split(" feat. ", 1)[0]
@@ -314,6 +321,8 @@ export const searchLyrics = async() => {
 
 /** Switch back to showing the help text instead of the lyrics. */
 export const resetShowingLyrics = () => {
+    // Invalidate in-flight fetches, so late lyrics results are discarded
+    lyricsToken += 1
     resetWelcome()
     document.getElementById("song-info")?.scrollTo(0, 0)
     showingLyrics = false
@@ -324,6 +333,8 @@ export const resetShowingLyrics = () => {
  * @param {string} id
  */
 export const showLyrics = async id => {
+    // Invalidate in-flight fetches for other songs before showing this one
+    lyricsToken += 1
     if (showingLyrics) {
         resetShowingLyrics()
     }

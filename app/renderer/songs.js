@@ -620,7 +620,7 @@ export const query = search => {
  * Try parsing the file again but with cover art and return it if found.
  * @param {string} p
  */
-export const coverArt = async p => {
+const readCoverArt = async p => {
     try {
         const details = await parseFile(p, {"skipCovers": false})
             .catch(() => null)
@@ -632,6 +632,22 @@ export const coverArt = async p => {
     } catch {
         return null
     }
+}
+
+/** @type {Map<string, Promise<string|null>>} */
+const pendingCoverReads = new Map()
+
+/**
+ * Read the cover art for a path, deduplicating concurrent reads of a file.
+ * @param {string} p
+ */
+export const coverArt = p => {
+    let pending = pendingCoverReads.get(p)
+    if (!pending) {
+        pending = readCoverArt(p).finally(() => pendingCoverReads.delete(p))
+        pendingCoverReads.set(p, pending)
+    }
+    return pending
 }
 
 /**
