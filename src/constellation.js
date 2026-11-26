@@ -1,0 +1,537 @@
+// Nebula: a hub at the centre, one tilted orbit ring per folder, every note a glowing node,
+// real links drawn between them, light beads running along links. Renderer only: no Obsidian imports.
+import * as THREE from "three";
+import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+
+export const DEFAULTS = {
+  color: "#2cf27f", glow: 0.75, glowSize: 0.45, nodeSize: 1.15, links: 1.4, rings: 1, beads: 420, beadSpeed: 1, comets: true,
+  spin: 0.3, pulse: true, stars: true, clouds: true, labels: true, quality: "high", saveGpu: true, motion: "auto",
+};
+const HINT = "Left drag to spin any way · right drag to move · scroll to zoom · click a note to open it";
+const HINT_TOUCH = "Drag to spin · pinch to zoom · tap a note to open it";
+const HINT_STILL = "Your system asks for reduced motion, so Nebula holds still · set Motion to On in Customize to animate it";
+const SWATCHES = [["Green", "#2cf27f"], ["White", "#ffffff"], ["Ice", "#9fdcff"], ["Violet", "#b38cff"], ["Amber", "#ffc46b"]];
+const QUALITY = { fast: 1, high: 1.75, max: 2.5 };
+const MAX_BEADS = 800;
+const ease = (t) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+
+const POINT_VS = `
+  attribute float aSize; attribute float aBoost; attribute float aPhase;
+  uniform float uScale; uniform float uTime; uniform float uSizeMul; uniform float uPulse;
+  varying float vBoost; varying float vFade;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    float pulse = 1.0 + uPulse * 0.18 * sin(uTime * 1.6 + aPhase);
+    gl_PointSize = aSize * uSizeMul * pulse * (1.0 + aBoost * 0.9) * uScale / -mv.z;
+    vBoost = aBoost; vFade = clamp(1.25 - (-mv.z) / 900.0, 0.45, 1.0);
+    gl_Position = projectionMatrix * mv;
+  }`;
+const POINT_FS = `
+  uniform vec3 uColor; varying float vBoost; varying float vFade;
+  void main() {
+    float d = length(gl_PointCoord - 0.5);
+    if (d > 0.5) discard;
+    float halo = pow(1.0 - d * 2.0, 2.2);
+    float core = smoothstep(0.16, 0.0, d);
+    vec3 col = uColor * (halo * 0.5) + vec3(1.0) * core * (0.3 + vBoost * 0.7);
+    gl_FragColor = vec4(col * vFade * (0.7 + vBoost * 0.8), halo * vFade * 0.8);
+  }`;
+
+// The hub star, drawn the way a camera actually records a very bright star: a tiny white-hot point, smooth glare
+// falling off as 1/r^2, a ciliary corona of hundreds of hair-thin streaks that shimmer (the "temporal glare" seen in
+// real photos of the sun and bright stars), a faint chromatic halo ring, and only short, soft diffraction spikes.
+// Billboarded, so the streaks stay fixed on screen like they would in a lens.
+const STAR_VS = `varying vec2 vUv; void main() { vUv = uv * 2.0 - 1.0; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+const STAR_FS = `
+  uniform vec3 uColor; uniform float uTime; varying vec2 vUv;
+  float h1(float n) { return fract(sin(n * 127.1) * 43758.5453); }
+  // value noise around the circle: x in [0,1), N cells, wraps seamlessly
+  float ring(float x, float N, float seed) {
+    float f = x * N, i = floor(f), t = fract(f); t = t * t * (3.0 - 2.0 * t);
+    return mix(h1(mod(i, N) + seed), h1(mod(i + 1.0, N) + seed), t);
+  }
+  float spike(vec2 p, vec2 d, float len, float width) {
+    float along = abs(dot(p, d)), across = abs(p.x * d.y - p.y * d.x);
+    return exp(-across / (width * (1.0 + along * 6.0))) * exp(-along / len);
+  }
+  float h2(vec2 q) { q = mod(q, 1024.0); return fract(sin(dot(q, vec2(12.9898, 78.233))) * 43758.5453); }
+  float n2(vec2 q) { vec2 i = floor(q), f = fract(q); f = f * f * (3.0 - 2.0 * f);
+    float a = h2(i), b = h2(i + vec2(1.0, 0.0)), c = h2(i + vec2(0.0, 1.0)), d = h2(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y); }
+  void main() {
+    vec2 p = vUv; float r = length(p);
+    float x = atan(p.y, p.x) / 6.2831853 + 0.5;
+    vec3 white = vec3(1.0), tint = mix(uColor, white, 0.45);
+    float drift = uTime * 0.035;
+    // lopsided glow: real glare is never a perfect circle
+    float lop = 0.6 + 0.8 * ring(x + drift * 0.05, 7.0, 5.0) * ring(x - drift * 0.04, 3.0, 9.0);
+    float core = exp(-r * r / 0.00003) * 3.2;
+    float glare = (0.0012 / (0.0012 + r * r) * 0.5 + exp(-r * 9.0) * 0.035) * mix(1.0, lop, smoothstep(0.01, 0.06, r));
+    // every streak gets its own length, and a few rare ones run far, so the outline is jagged instead of round
+    float lenA = mix(0.025, 0.11, pow(ring(x, 97.0, 11.0), 1.6)) + pow(ring(x + drift * 0.1, 41.0, 23.0), 9.0) * 0.45;
+    float lenB = mix(0.02, 0.07, ring(x, 53.0, 31.0));
+    float fine = pow(ring(x + drift * 0.3, 360.0, 1.0) * ring(x - drift * 0.2, 211.0, 7.0), 3.0) * 3.2;
+    float hair = pow(ring(x - drift * 0.25, 720.0, 13.0), 10.0) * 2.0;           // single-pixel hairs
+    float soft = pow(ring(x - drift * 0.15, 64.0, 3.0), 2.5);
+    float streaks = (fine * exp(-r / lenA) + hair * exp(-r / (lenA * 1.4)) + soft * exp(-r / lenB) * 0.5)
+                  * smoothstep(0.0, 0.015, r) * (0.85 + 0.15 * sin(uTime * 1.7));
+    // streaks disperse like a prism: bluish near the core, warm toward the tips
+    vec3 spec = mix(vec3(0.75, 0.88, 1.0), vec3(1.0, 0.82, 0.62), smoothstep(0.02, 0.2, r));
+    vec3 scol = mix(spec, tint, 0.45);
+    // diffraction speckle grain close to the core
+    float speck = pow(n2(vec2(x * 1400.0, r * 160.0 - uTime * 0.6)), 7.0) * exp(-r * 20.0) * smoothstep(0.004, 0.02, r) * 0.7;   // polar, so grains stretch along the rays
+    vec3 halo = vec3(exp(-pow((r - 0.135) / 0.012, 2.0)), exp(-pow((r - 0.128) / 0.012, 2.0)), exp(-pow((r - 0.121) / 0.012, 2.0))) * 0.035 * lop;
+    float sp = spike(p, vec2(0.0, 1.0), 0.06, 0.0012) + spike(p, vec2(1.0, 0.0), 0.06, 0.0012)
+             + 0.35 * (spike(p, vec2(0.7071, 0.7071), 0.03, 0.001) + spike(p, vec2(0.7071, -0.7071), 0.03, 0.001));
+    vec3 col = white * core + tint * glare + scol * streaks * 0.36 + mix(white, tint, smoothstep(0.0, 0.25, r)) * sp * 0.6 + white * speck + halo;
+    gl_FragColor = vec4(col * smoothstep(1.0, 0.75, r), 1.0);
+  }`;
+// Background stars that twinkle, with a little colour temperature spread.
+const DUST_VS = `
+  attribute float aSize; attribute float aPhase; attribute float aTint;
+  uniform float uScale; uniform float uTime; varying float vTw; varying float vTint;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vTw = 0.55 + 0.45 * sin(uTime * (0.6 + fract(aPhase * 7.13) * 1.8) + aPhase);
+    vTint = aTint; gl_PointSize = aSize * uScale / -mv.z * (0.8 + 0.35 * vTw); gl_Position = projectionMatrix * mv;
+  }`;
+const DUST_FS = `
+  uniform float uOpacity; varying float vTw; varying float vTint;
+  void main() {
+    float d = length(gl_PointCoord - 0.5); if (d > 0.5) discard;
+    float a = pow(1.0 - d * 2.0, 2.0);
+    vec3 col = mix(vec3(0.72, 0.8, 1.0), vec3(1.0, 0.86, 0.7), vTint);
+    gl_FragColor = vec4(col, a * uOpacity * vTw);
+  }`;
+
+export class Constellation {
+  /**
+   * @param {HTMLElement} el container
+   * @param {{notes:{id:string,name:string,group:string}[], links:[string,string][]}} data
+   * @param {{settings?:object, onOpen?:(id:string)=>void, onSettings?:(s:object)=>void, onFocus?:()=>void, force?:boolean}} opts
+   */
+  constructor(el, data, opts = {}) {
+    this.el = el; this.opts = opts; this.data = data;
+    this.s = Object.assign({}, DEFAULTS, opts.settings || {});
+    // Use the window that owns the view, so a Nebula tab moved to a popout window keeps animating.
+    this.doc = el.ownerDocument || document; this.win = this.doc.defaultView || window;
+    this.mq = typeof this.win.matchMedia === "function" ? this.win.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    this.t0 = performance.now(); this.running = true; this.hover = -1; this._last = 0; this.frames = 0; this.spinPause = 0;
+    this.root = this.doc.createElement("div"); this.root.className = "nebula-root"; el.appendChild(this.root);
+    this._build(); this._ui(); this._events(); this.apply();
+    this._loop = this._loop.bind(this); this.win.requestAnimationFrame(this._loop);
+  }
+
+  // Motion "auto" follows the system's reduced-motion setting (Windows "Animation effects" off, macOS "Reduce motion").
+  // Before 0.1.5 that was the only choice, so on those machines Nebula never spun and there was no way to turn it on.
+  // Phones and tablets run the bloom pass on a much smaller GPU, so below Max they render at 1.25x at most.
+  _ratio(q) { const r = Math.min(window.devicePixelRatio || 1, QUALITY[q] || 1.75); return this.opts.mobile && q !== "max" ? Math.min(r, 1.25) : r; }
+  get sysReduced() { return !!(this.mq && this.mq.matches); }
+  get reduced() { const m = this.s.motion; return m === "off" || (m !== "on" && this.sysReduced); }
+
+  /** Camera and panel state, so a rebuild (notes or links changed) does not throw the user back to the fly-in. */
+  getView() { return { pos: this.camera.position.toArray(), target: this.controls.target.toArray(), up: this.camera.up.toArray(), panel: this.panel.classList.contains("is-open") }; }
+  setView(v) {
+    if (!v) return;
+    this.camera.position.fromArray(v.pos); this.controls.target.fromArray(v.target); this.camera.up.fromArray(v.up);
+    this.flying = false; this.panel.classList.toggle("is-open", !!v.panel);
+  }
+
+  _build() {
+    const w = Math.max(this.el.clientWidth, 200), h = Math.max(this.el.clientHeight, 200);
+    const r = (this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" }));
+    r.setPixelRatio(this._ratio(this.s.quality)); r.setSize(w, h); r.setClearColor(0x000000, 1);
+    r.toneMapping = THREE.NoToneMapping; this.root.appendChild(r.domElement); r.domElement.className = "nebula-canvas";
+    const scene = (this.scene = new THREE.Scene());
+    const cam = (this.camera = new THREE.PerspectiveCamera(52, w / h, 0.5, 900));
+    const color = (this.color = new THREE.Color(this.s.color));
+
+    // layout: biggest folders on the inner rings
+    const notes = this.data.notes, groups = new Map();
+    notes.forEach((n, i) => { if (!groups.has(n.group)) groups.set(n.group, []); groups.get(n.group).push(i); });
+    const order = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+    this.groupInfo = [];
+    const N = notes.length, total = N + order.length + 1;
+    const pos = new Float32Array(total * 3), size = new Float32Array(total), boost = new Float32Array(total), phase = new Float32Array(total);
+    this.index = new Map(notes.map((n, i) => [n.id, i + 1])); // slot 0 = core
+    const v = new THREE.Vector3(), eu = new THREE.Euler();
+    const deg = new Uint16Array(total);
+    for (const [a, b] of this.data.links) { const x = this.index.get(a), y = this.index.get(b); if (x && y) { deg[x]++; deg[y]++; } }
+    this.ringLines = []; this.ringPts = []; // ringPts must exist even for a vault with no notes, or the comet setup below throws
+    const fs =Math.min(2.4, Math.max(0.5, 3.0 / Math.pow(Math.max(N, 50) / 100, 0.3)));
+    let acc = 28;
+    order.forEach(([name, ids], gi) => {
+      const spread = 1.0 + Math.sqrt(ids.length) * 0.42; acc += 5 + spread * 1.1; const radius = acc; acc += spread * 1.1;
+      eu.set((gi % 2 ? 1 : -1) * (0.16 + 0.07 * (gi % 5)), 0, 0.11 * (gi % 7) - 0.25);
+      const hubSlot = N + 1 + gi, R = rng(hash(name));
+      const ha = gi * 2.39996; v.set(Math.cos(ha) * radius, 0, Math.sin(ha) * radius).applyEuler(eu); pos.set([v.x, v.y, v.z], hubSlot * 3); size[hubSlot] = 4.2 * fs; phase[hubSlot] = R() * 6;
+      ids.forEach((id, k) => {
+        const slot = id + 1, th = (k / ids.length) * Math.PI * 2 + (R() - 0.5) * 0.35;
+        const rr = radius + (R() - 0.5) * spread * 2, y = (R() - 0.5) * spread * 0.7;
+        v.set(Math.cos(th) * rr, y, Math.sin(th) * rr).applyEuler(eu); pos.set([v.x, v.y, v.z], slot * 3);
+        size[slot] = (1.3 + Math.min(4.2, Math.sqrt(deg[slot])) * 0.8) * fs; phase[slot] = R() * 6.28;
+      });
+      const seg = 220, lp = new Float32Array(seg * 3);
+      for (let s = 0; s < seg; s++) { const th = (s / seg) * Math.PI * 2; v.set(Math.cos(th) * radius, 0, Math.sin(th) * radius).applyEuler(eu); lp.set([v.x, v.y, v.z], s * 3); }
+      const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(lp, 3));
+      const ring = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false }));
+      scene.add(ring); this.ringLines.push(ring); this.ringPts.push(lp);
+      this.groupInfo.push({ name, count: ids.length, slot: hubSlot });
+    });
+    this.pos = pos;
+
+    // note nodes
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(size, 1));
+    geo.setAttribute("aPhase", new THREE.BufferAttribute(phase, 1));
+    this.boostAttr = new THREE.BufferAttribute(boost, 1); geo.setAttribute("aBoost", this.boostAttr);
+    this.uniforms = { uColor: { value: color }, uScale: { value: h * 0.62 }, uTime: { value: 0 }, uSizeMul: { value: 1 }, uPulse: { value: 1 } };
+    this.points = new THREE.Points(geo, new THREE.ShaderMaterial({ vertexShader: POINT_VS, fragmentShader: POINT_FS, uniforms: this.uniforms, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+    this.points.frustumCulled = false; scene.add(this.points);
+    this.raycaster = new THREE.Raycaster(); this.raycaster.params.Points.threshold = 0.9;
+
+    // links (randomly thinned past 6000 so huge vaults stay light)
+    this.adj = new Map(); const edges = [];
+    for (const [a, b] of this.data.links) {
+      const x = this.index.get(a), y = this.index.get(b); if (!x || !y || x === y) continue;
+      edges.push([x, y]);
+      (this.adj.get(x) || this.adj.set(x, []).get(x)).push(y); (this.adj.get(y) || this.adj.set(y, []).get(y)).push(x);
+    }
+    const cap = 6000; let use = edges;
+    if (edges.length > cap) { const R = rng(7); use = edges.filter(() => R() < cap / edges.length); }
+    const lp = new Float32Array(use.length * 6);
+    use.forEach(([x, y], i) => { lp.set(pos.subarray(x * 3, x * 3 + 3), i * 6); lp.set(pos.subarray(y * 3, y * 3 + 3), i * 6 + 3); });
+    this.edges = use;
+    const lg = new THREE.BufferGeometry(); lg.setAttribute("position", new THREE.BufferAttribute(lp, 3));
+    const lc = (this.linkFade = new Float32Array(lp.length / 3));
+    for (let i = 0; i < lc.length; i += 2) { const dx = lp[i * 3] - lp[i * 3 + 3], dy = lp[i * 3 + 1] - lp[i * 3 + 4], dz = lp[i * 3 + 2] - lp[i * 3 + 5]; const f = Math.min(1, Math.max(0.12, 1.25 - Math.sqrt(dx * dx + dy * dy + dz * dz) / 110)); lc[i] = lc[i + 1] = f; }
+    lg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(lp.length), 3)); this.linkGeo = lg; this._linkColors();
+    this.linkMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false });
+    scene.add((this.links = new THREE.LineSegments(lg, this.linkMat)));
+
+    // hover neighbour lines
+    this.hoverGeo = new THREE.BufferGeometry(); this.hoverGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(600 * 6), 3)); this.hoverGeo.setDrawRange(0, 0);
+    this.hoverLines = new THREE.LineSegments(this.hoverGeo, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }));
+    this.hoverLines.frustumCulled = false; scene.add(this.hoverLines);
+
+    // light beads along links
+    this.beads = [];
+    const R2 = rng(3); for (let i = 0; i < MAX_BEADS; i++) this.beads.push({ e: use.length ? use[Math.floor(R2() * use.length)] : [0, 0], t: R2(), s: 0.12 + R2() * 0.22 });
+    const bg = new THREE.BufferGeometry(); bg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(MAX_BEADS * 3), 3));
+    this.beadMat = new THREE.PointsMaterial({ map: this._dotTex(), color: 0xffffff, size: 2.2, sizeAttenuation: true, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
+    this.beadPts = new THREE.Points(bg, this.beadMat); this.beadPts.frustumCulled = false; scene.add(this.beadPts);
+
+    // the hub star (billboarded each frame in _loop)
+    this.starU = { uColor: { value: color }, uTime: { value: 0 } };
+    this.core = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({ vertexShader: STAR_VS, fragmentShader: STAR_FS, uniforms: this.starU, transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending }));
+    this.core.renderOrder = 10; this.core.frustumCulled = false; scene.add(this.core);
+    // comets: a bright head with a fading tail racing round every ring
+    this.comets = []; const TL = 34;
+    this.ringPts.forEach((lp, i) => {
+      const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(TL * 3), 3)); g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(TL * 3), 3));
+      const line = new THREE.Line(g, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })); line.frustumCulled = false;
+      scene.add(line); const R = rng(100 + i); this.comets.push({ line, lp, ph: R(), sp: (0.025 + R() * 0.05) * (R() < 0.5 ? -1 : 1), TL });
+    });
+    // background stars: twinkle, slight warm/cool spread
+    const DN = 2200, dust = new Float32Array(DN * 3), dSize = new Float32Array(DN), dPhase = new Float32Array(DN), dTint = new Float32Array(DN), R3 = rng(11);
+    for (let i = 0; i < DN; i++) {
+      const rr = acc * 0.7 + R3() * acc * 2.6, a = R3() * 6.283, b = Math.acos(2 * R3() - 1); dust.set([rr * Math.sin(b) * Math.cos(a), rr * Math.cos(b), rr * Math.sin(b) * Math.sin(a)], i * 3);
+      const big = R3(); dSize[i] = 0.55 + big * big * big * 1.9; dPhase[i] = R3() * 6.283; dTint[i] = R3();
+    }
+    const dg = new THREE.BufferGeometry(); dg.setAttribute("position", new THREE.BufferAttribute(dust, 3));
+    dg.setAttribute("aSize", new THREE.BufferAttribute(dSize, 1)); dg.setAttribute("aPhase", new THREE.BufferAttribute(dPhase, 1)); dg.setAttribute("aTint", new THREE.BufferAttribute(dTint, 1));
+    this.dustU = { uScale: { value: h * 0.5 }, uTime: { value: 0 }, uOpacity: { value: 0.55 } };
+    this.dust = new THREE.Points(dg, new THREE.ShaderMaterial({ vertexShader: DUST_VS, fragmentShader: DUST_FS, uniforms: this.dustU, transparent: true, depthWrite: false }));
+    this.dust.frustumCulled = false; scene.add(this.dust);
+    // nebula gas: a few huge, faint clouds behind the rings, tinted from the accent colour
+    this.clouds = []; const Rc = rng(29), cloudTex = [17, 18, 19].map((sd) => this._cloudTex(sd));
+    for (let i = 0; i < 7; i++) {
+      const m = new THREE.SpriteMaterial({ map: cloudTex[i % 3], transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.04 + Rc() * 0.04, rotation: Rc() * 6.283 });
+      const sp = new THREE.Sprite(m), a = (i / 7) * 6.283 + Rc() * 0.6, rr = acc * (1.05 + Rc() * 0.9);
+      sp.position.set(Math.cos(a) * rr, (Rc() - 0.5) * acc * 0.9, Math.sin(a) * rr); sp.scale.setScalar(acc * (1.3 + Rc() * 1.1));
+      sp.userData = { hue: [0, 0.07, 0.14][i % 3], spin: (Rc() - 0.5) * 0.03 }; sp.renderOrder = -1; scene.add(sp); this.clouds.push(sp);
+    }
+    this._cloudColors();
+
+    // post: bloom
+    const comp = (this.composer = new EffectComposer(r));
+    comp.addPass(new RenderPass(scene, cam));
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.5, 0.4, 0.4); comp.addPass(this.bloom);
+    comp.addPass(new OutputPass()); comp.setSize(w, h);
+
+    // camera + free rotation (trackball: no pole lock, roll all the way around)
+    const far = (this.far = Math.max(60, acc * 1.25)); this.coreSize = Math.max(12, acc * 0.085);
+    cam.far = far * 16; cam.updateProjectionMatrix();
+    const c = (this.controls = new TrackballControls(cam, r.domElement));
+    Object.assign(c, { rotateSpeed: 2.6, zoomSpeed: 1.1, panSpeed: 0.7, staticMoving: false, dynamicDampingFactor: 0.1, minDistance: 8, maxDistance: far * 7 });
+    this.home = new THREE.Vector3(0, far * 0.42, far);
+    cam.position.copy(this.reduced ? this.home : this.home.clone().multiplyScalar(2.6)); c.target.set(0, 0, 0);
+    this.flyStart = performance.now(); this.flying = !this.reduced;
+  }
+
+  _dotTex() {
+    const c = document.createElement("canvas"); c.width = c.height = 64; const g = c.getContext("2d");
+    const r = g.createRadialGradient(32, 32, 0, 32, 32, 32); r.addColorStop(0, "rgba(255,255,255,1)"); r.addColorStop(0.25, "rgba(255,255,255,.8)"); r.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = r; g.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+  }
+
+  _linkColors() {
+    const a = this.linkGeo.attributes.color.array, c = this.color;
+    for (let i = 0; i < this.linkFade.length; i++) { const f = this.linkFade[i]; a[i * 3] = c.r * f; a[i * 3 + 1] = c.g * f; a[i * 3 + 2] = c.b * f; }
+    this.linkGeo.attributes.color.needsUpdate = true;
+  }
+
+  // soft cloud texture: value-noise fbm, wispy threshold, round falloff so sprite edges never show
+  _cloudTex(seed) {
+    const S = 192, c = this.doc.createElement("canvas"); c.width = c.height = S; const g = c.getContext("2d"), img = g.createImageData(S, S), R = rng(seed);
+    const G = 32, grid = Array.from({ length: G * G }, R), at = (i, j) => grid[(((j % G) + G) % G) * G + (((i % G) + G) % G)];
+    const vn = (x, y) => { const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+      return (at(xi, yi) * (1 - u) + at(xi + 1, yi) * u) * (1 - v) + (at(xi, yi + 1) * (1 - u) + at(xi + 1, yi + 1) * u) * v; };
+    const ox = R() * 100, oy = R() * 100;
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      let n = 0, a = 0.5, f = 3.2 / S;
+      for (let o = 0; o < 5; o++) { n += a * vn(ox + x * f, oy + y * f); f *= 2.05; a *= 0.5; }
+      const dx = x / S - 0.5, dy = y / S - 0.5, d = Math.sqrt(dx * dx + dy * dy) * 2, fall = Math.pow(Math.max(0, 1 - d), 1.8);
+      const al = Math.min(1, Math.max(0, (n - 0.33) * 2.4)) * fall, k = (y * S + x) * 4;
+      img.data[k] = img.data[k + 1] = img.data[k + 2] = 255; img.data[k + 3] = al * 255;
+    }
+    g.putImageData(img, 0, 0); return new THREE.CanvasTexture(c);
+  }
+
+  _cloudColors() {
+    const hsl = {}; this.color.getHSL(hsl);
+    this.clouds.forEach((sp) => sp.material.color.setHSL((hsl.h + sp.userData.hue + 1) % 1, hsl.s * 0.7, Math.min(0.4, hsl.l * 0.6 + 0.05) * (0.35 + 0.65 * hsl.s))); // grey accents would turn the gas into fog, so dim it
+  }
+
+  _ui() {
+    const mk = (cls, parent = this.root, tag = "div") => { const e = document.createElement(tag); e.className = cls; parent.appendChild(e); return e; };
+    this.labelLayer = mk("nebula-labels");
+    this.hubLabels = this.groupInfo.map((g) => { const e = mk("nebula-label", this.labelLayer); mk("", e, "b").textContent = g.name; mk("", e, "span").textContent = `${g.count} notes`; e.addEventListener("click", () => this.focusSlot(g.slot)); return e; });
+    this.tip = mk("nebula-tip"); this.tip.classList.add("is-hidden");
+    mk("nebula-hud").textContent = `${this.data.notes.length.toLocaleString()} notes · ${this.groupInfo.length} rings · ${this.edges.length.toLocaleString()} links`;
+    this.fpsEl = mk("nebula-fps");
+    this.hintEl = mk("nebula-hint"); this.hintEl.textContent = HINT;
+    const bar = mk("nebula-bar");
+    const b1 = mk("nebula-btn", bar, "button"); b1.textContent = "Reset view"; b1.addEventListener("click", () => this.resetView());
+    const b2 = mk("nebula-btn", bar, "button"); b2.textContent = "Focus"; b2.addEventListener("click", () => this.opts.onFocus && this.opts.onFocus());
+    const b3 = mk("nebula-btn", bar, "button"); b3.textContent = "Customize"; b3.addEventListener("click", () => this.panel.classList.toggle("is-open"));
+    this._panel(mk);
+  }
+
+  _panel(mk) {
+    const p = (this.panel = mk("nebula-panel"));
+    mk("nebula-ph", p).textContent = "Customize";
+    const row = (label) => { const r = mk("nebula-row", p); mk("nebula-rl", r).textContent = label; return r; };
+    // color
+    const cr = row("Color"), sw = mk("nebula-sw", cr);
+    SWATCHES.forEach(([name, hex]) => { const b = mk("nebula-dot", sw, "button"); b.title = name; b.style.background = hex; b.addEventListener("click", () => this.set({ color: hex })); });
+    const pick = mk("nebula-pick", sw, "input"); pick.type = "color"; pick.value = this.s.color; pick.addEventListener("input", () => this.set({ color: pick.value })); this.picker = pick;
+    const slider = (label, key, min, max, step) => {
+      const r = row(label), inp = mk("nebula-range", r, "input"), out = mk("nebula-val", r, "span");
+      Object.assign(inp, { type: "range", min, max, step, value: this.s[key] });
+      const show = () => (out.textContent = key === "beads" ? String(Math.round(this.s[key])) : (+this.s[key]).toFixed(2));
+      inp.addEventListener("input", () => { this.set({ [key]: +inp.value }); show(); }); show();
+      (this._inputs = this._inputs || []).push(() => { inp.value = this.s[key]; show(); });
+    };
+    slider("Glow", "glow", 0, 2, 0.05);
+    slider("Glow size", "glowSize", 0, 1, 0.05);
+    slider("Node size", "nodeSize", 0.3, 3, 0.05);
+    slider("Links", "links", 0, 3, 0.05);
+    slider("Rings", "rings", 0, 3, 0.05);
+    slider("Light beads", "beads", 0, MAX_BEADS, 10);
+    slider("Bead speed", "beadSpeed", 0.1, 4, 0.1);
+    slider("Spin", "spin", 0, 2, 0.05);
+    const toggle = (label, key) => {
+      const r = row(label), b = mk("nebula-tog", r, "button");
+      const show = () => { b.classList.toggle("is-on", !!this.s[key]); b.textContent = this.s[key] ? "On" : "Off"; };
+      b.addEventListener("click", () => { this.set({ [key]: !this.s[key] }); show(); }); show();
+      (this._inputs = this._inputs || []).push(show);
+    };
+    toggle("Comets", "comets"); toggle("Pulse", "pulse"); toggle("Stars", "stars"); toggle("Nebula clouds", "clouds"); toggle("Folder names", "labels"); toggle("Save GPU in background", "saveGpu");
+    const mr = row("Motion"), mseg = mk("nebula-seg", mr);
+    this._mBtns = [["auto", "Auto"], ["on", "On"], ["off", "Off"]].map(([m, label]) => { const b = mk("nebula-segb", mseg, "button"); b.textContent = label; b.title = m === "auto" ? "Follow the system's reduced motion setting" : ""; b.addEventListener("click", () => this.set({ motion: m })); return [m, b]; });
+    const qr = row("Quality"), seg = mk("nebula-seg", qr);
+    this._qBtns = Object.keys(QUALITY).map((q) => { const b = mk("nebula-segb", seg, "button"); b.textContent = q[0].toUpperCase() + q.slice(1); b.addEventListener("click", () => this.set({ quality: q })); return [q, b]; });
+    const reset = mk("nebula-btn nebula-reset", p, "button"); reset.textContent = "Reset to default";
+    reset.addEventListener("click", () => { this.set(Object.assign({}, DEFAULTS)); this.picker.value = this.s.color; (this._inputs || []).forEach((f) => f()); });
+  }
+
+  set(patch) {
+    Object.assign(this.s, patch); this.apply(patch);
+    window.clearTimeout(this._saveT); this._saveT = window.setTimeout(() => this.opts.onSettings && this.opts.onSettings(Object.assign({}, this.s)), 300);
+  }
+
+  apply(patch) {
+    const s = this.s;
+    if (!patch || "color" in patch) {
+      this.color.set(s.color); this.ringLines.forEach((r) => r.material.color.copy(this.color)); this._linkColors(); this._cloudColors();
+      this.root.style.setProperty("--nebula-color", s.color); if (this.picker) this.picker.value = s.color;
+    }
+    this.bloom.strength = s.glow; this.bloom.radius = s.glowSize;
+    this.uniforms.uSizeMul.value = s.nodeSize; this.uniforms.uPulse.value = s.pulse && !this.reduced ? 1 : 0;
+    this.linkMat.opacity = 0.1 * s.links; this.links.visible = s.links > 0;
+    this.ringLines.forEach((r) => { r.material.opacity = 0.2 * s.rings; r.visible = s.rings > 0; });
+    this.beadPts.geometry.setDrawRange(0, Math.min(MAX_BEADS, Math.round(s.beads))); this.beadPts.visible = s.beads > 0;
+    this.dust.visible = !!s.stars; this.clouds.forEach((c) => (c.visible = s.clouds !== false)); this.comets.forEach((c) => (c.line.visible = !!s.comets && s.rings > 0)); this.labelLayer.style.display = s.labels ? "" : "none";
+    if (!patch || "quality" in patch) { this.renderer.setPixelRatio(this._ratio(s.quality)); this.resize(); }
+    if (this._qBtns) this._qBtns.forEach(([q, b]) => b.classList.toggle("is-on", q === s.quality));
+    if (this._mBtns) this._mBtns.forEach(([m, b]) => b.classList.toggle("is-on", m === (s.motion || "auto")));
+    if (this.hintEl) this.hintEl.textContent = this.reduced && s.motion !== "off" ? HINT_STILL : this.opts.mobile ? HINT_TOUCH : HINT;
+  }
+
+  resetView() {
+    this._fly = { t0: performance.now(), from: this.controls.target.clone(), to: new THREE.Vector3(), cf: this.camera.position.clone(), ct: this.home.clone() };
+    this.camera.up.set(0, 1, 0);
+  }
+
+  _events() {
+    const cv = this.renderer.domElement;
+    this._mv = (e) => { const r = cv.getBoundingClientRect(); this.mouse = { x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }; this._dirty = true; };
+    this._lv = () => { this.mouse = null; this._dirty = true; };
+    this._ptrs = new Set();
+    this._dn = (e) => { this._ptrs.add(e.pointerId); if (this._ptrs.size > 1) this._multi = true; else this._multi = false; this._mv(e); this._down = [e.clientX, e.clientY]; this.spinPause = performance.now() + 6000; this._fly = null; this.flying = false; };
+    this._up = (e) => {
+      this._ptrs.delete(e.pointerId); const multi = this._multi; if (this._ptrs.size) return; const d = this._down; this._down = null; if (multi) { this._multi = false; return; }
+      // A tap has no hover before it, so pick the star under the finger now.
+      if (e.pointerType === "touch") { const pp = this.raycaster.params.Points, t = pp.threshold; pp.threshold = t * 1.8; const i = this._pick(); pp.threshold = t; if (i !== this.hover) this._setHover(i); }
+      if (!d || e.button !== 0 || Math.hypot(e.clientX - d[0], e.clientY - d[1]) > (e.pointerType === "touch" ? 12 : 5)) return;
+      if (this.hover > 0 && this.hover <= this.data.notes.length && this.opts.onOpen) this.opts.onOpen(this.data.notes[this.hover - 1].id, e);
+    };
+    this._wh = () => { this.spinPause = performance.now() + 3000; this._fly = null; this.flying = false; };
+    cv.addEventListener("pointermove", this._mv); cv.addEventListener("pointerleave", this._lv); cv.addEventListener("pointerdown", this._dn); cv.addEventListener("pointerup", this._up); cv.addEventListener("wheel", this._wh, { passive: true });
+    // A drag that never gets its pointerup (alt-tab mid drag, a dialog stealing the pointer) left _down set, and spin
+    // waits for !_down, so the view stopped spinning until Obsidian was restarted. Clear it on cancel too.
+    // TrackballControls only drops the pointer on cancel and stays in its drag state, so the camera kept following the
+    // mouse with no button held. End its drag the same way a pointerup does.
+    this._cn = (e) => {
+      this._down = null; if (this._ptrs) this._ptrs.clear(); this._multi = false;
+      if (e && e.type === "pointercancel" && this.controls._onPointerUp) { try { this.controls._onPointerUp(e); } catch (err) { /* pointer already released */ } }
+    };
+    cv.addEventListener("pointercancel", this._cn); this.win.addEventListener("blur", this._cn);
+    cv.addEventListener("contextmenu", (e) => e.preventDefault());
+    this._mqh = () => this.apply({}); if (this.mq && this.mq.addEventListener) this.mq.addEventListener("change", this._mqh);
+    this.ro = new ResizeObserver(() => this.resize()); this.ro.observe(this.el);
+  }
+
+  resize() {
+    const w = Math.max(this.el.clientWidth, 100), h = Math.max(this.el.clientHeight, 100);
+    this.renderer.setSize(w, h); this.composer.setSize(w, h); this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
+    this.uniforms.uScale.value = h * 0.62; this.dustU.uScale.value = h * 0.5; this.controls.handleResize && this.controls.handleResize();
+  }
+
+  focusSlot(slot) {
+    const p = new THREE.Vector3().fromArray(this.pos, slot * 3);
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize().multiplyScalar(24);
+    this._fly = { t0: performance.now(), from: this.controls.target.clone(), to: p, cf: this.camera.position.clone(), ct: p.clone().add(dir) };
+  }
+
+  _pick() {
+    if (!this.mouse) return -1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+    const hits = this.raycaster.intersectObject(this.points); let best = -1, bd = 1e9;
+    for (const h of hits) { if (h.index === 0) continue; if (h.distanceToRay < bd) { bd = h.distanceToRay; best = h.index; } }
+    return best;
+  }
+
+  _setHover(i) {
+    const b = this.boostAttr.array, old = this.hover;
+    if (old >= 0) { b[old] = 0; (this.adj.get(old) || []).forEach((n) => (b[n] = 0)); }
+    this.hover = i;
+    if (i >= 0) {
+      b[i] = 1; const nb = this.adj.get(i) || []; nb.forEach((n) => (b[n] = 0.55));
+      const lp = this.hoverGeo.attributes.position.array; let k = 0;
+      for (const n of nb) { if (k >= 600) break; lp.set(this.pos.subarray(i * 3, i * 3 + 3), k * 6); lp.set(this.pos.subarray(n * 3, n * 3 + 3), k * 6 + 3); k++; }
+      this.hoverGeo.attributes.position.needsUpdate = true; this.hoverGeo.setDrawRange(0, k * 2);
+    } else this.hoverGeo.setDrawRange(0, 0);
+    this.boostAttr.needsUpdate = true;
+  }
+
+  _project(slot, out) { out.fromArray(this.pos, slot * 3).project(this.camera); return out; }
+
+  _loop(now) {
+    if (!this.running) return;
+    this.win.requestAnimationFrame(this._loop);
+    if (this.doc.hidden || !this.el.isConnected || this.el.clientWidth < 10 || (this.el.offsetParent === null && !this.opts.force)) return;
+    // no frame cap: runs at the monitor's refresh. Only throttles when Obsidian is in the background (optional).
+    if (this.s.saveGpu && !this.doc.hasFocus() && now - this._last < 66) return;
+    const dt = Math.min(100, now - (this._last || now)); this._last = now; this.frames++;
+    if ((this._fpsT = (this._fpsT || now)) && now - this._fpsT > 500) { this.fpsEl.textContent = Math.round((this.frames - (this._fpsF || 0)) * 1000 / (now - this._fpsT)) + " fps"; this._fpsT = now; this._fpsF = this.frames; }
+    const t = (now - this.t0) / 1000; this.uniforms.uTime.value = this.reduced ? 0 : t;
+    const cam = this.camera, c = this.controls;
+    if (this.flying) { const k = (now - this.flyStart) / 2600; cam.position.lerpVectors(this.home.clone().multiplyScalar(2.6), this.home, ease(k)); if (k >= 1) this.flying = false; }
+    if (this._fly) { const k = ease((now - this._fly.t0) / 900); c.target.lerpVectors(this._fly.from, this._fly.to, k); cam.position.lerpVectors(this._fly.cf, this._fly.ct, k); if (k >= 1) this._fly = null; }
+    if (!this.reduced && this.s.spin > 0 && now > this.spinPause && !this._down) {
+      const q = (this._q = this._q || new THREE.Quaternion()), off = (this._off = this._off || new THREE.Vector3());
+      q.setFromAxisAngle(cam.up, this.s.spin * 0.12 * (dt / 1000)); off.copy(cam.position).sub(c.target).applyQuaternion(q); cam.position.copy(c.target).add(off);
+    }
+    c.update();
+    const tm = this.reduced ? 0 : t;
+    this.core.quaternion.copy(cam.quaternion);
+    this.core.scale.setScalar(this.coreSize * 16 * (1 + (this.s.pulse && !this.reduced ? Math.sin(t * 1.3) * 0.012 : 0)));
+    this.starU.uTime.value = tm; this.dustU.uTime.value = tm;
+    if (!this.reduced) for (const cl of this.clouds) cl.material.rotation += cl.userData.spin * dt / 1000;
+    if (this._dirty || this.hover >= 0) { const p = this._pick(); if (p !== this.hover) this._setHover(p); this._dirty = false; }
+    const w = this.el.clientWidth, h = this.el.clientHeight, tmp = (this._tmp = this._tmp || new THREE.Vector3()), hv = (this._hv = this._hv || new THREE.Vector3());
+    if (this.hover > 0 && this.hover <= this.data.notes.length && this.mouse) {
+      const n = this.data.notes[this.hover - 1]; this._project(this.hover, tmp); this.tip.classList.remove("is-hidden");
+      this.tip.style.transform = `translate(${(tmp.x * 0.5 + 0.5) * w + 14}px,${(-tmp.y * 0.5 + 0.5) * h - 10}px)`;
+      if (this.tip._n !== this.hover) { this.tip.replaceChildren(); const b = document.createElement("b"), sp = document.createElement("span"); b.textContent = n.name; sp.textContent = n.group; this.tip.append(b, sp); this.tip._n = this.hover; }
+    } else this.tip.classList.add("is-hidden");
+    if (this.s.labels) {
+      const zf = Math.min(1, Math.max(0, (this.far * 3.2 - cam.position.distanceTo(c.target)) / (this.far * 1.6)));
+      this.groupInfo.forEach((g, i) => {
+        const e = this.hubLabels[i]; this._project(g.slot, tmp); const cd = cam.position.distanceTo(hv.fromArray(this.pos, g.slot * 3));
+        const show = (i < 9 || cd < 70) && zf > 0.02;
+        if (tmp.z > 1 || tmp.z < -1 || !show) { e.classList.add("is-off"); return; }
+        e.style.opacity = (i < 9 ? 1 : Math.min(1, (70 - cd) / 25)) * zf; e.classList.remove("is-off");
+        e.style.transform = `translate(${(tmp.x * 0.5 + 0.5) * w}px,${(-tmp.y * 0.5 + 0.5) * h}px) translate(-50%,-135%)`;
+      });
+    }
+    const nb = Math.min(MAX_BEADS, Math.round(this.s.beads));
+    if (!this.reduced && nb > 0 && this.edges.length) {
+      const bp = this.beadPts.geometry.attributes.position.array, P = this.pos, sp = this.s.beadSpeed * dt / 1000;
+      for (let i = 0; i < nb; i++) {
+        const b = this.beads[i]; b.t += b.s * sp; if (b.t > 1) { b.t = 0; b.e = this.edges[(Math.random() * this.edges.length) | 0]; }
+        const a = b.e[0] * 3, e2 = b.e[1] * 3, k = b.t;
+        bp[i * 3] = P[a] + (P[e2] - P[a]) * k; bp[i * 3 + 1] = P[a + 1] + (P[e2 + 1] - P[a + 1]) * k; bp[i * 3 + 2] = P[a + 2] + (P[e2 + 2] - P[a + 2]) * k;
+      }
+      this.beadPts.geometry.attributes.position.needsUpdate = true;
+    }
+    if (!this.reduced) {
+      if (this.s.comets && this.s.rings > 0) for (const cm of this.comets) {
+        cm.ph = (cm.ph + cm.sp * dt / 1000 + 1) % 1; const seg = cm.lp.length / 3, head = Math.floor(cm.ph * seg), dir = cm.sp > 0 ? 1 : -1;
+        const P = cm.line.geometry.attributes.position.array, C = cm.line.geometry.attributes.color.array, col = this.color, br = Math.min(2, 0.6 + this.s.rings * 0.7);
+        for (let j = 0; j < cm.TL; j++) {
+          const idx = ((head - j * dir) % seg + seg) % seg; P[j * 3] = cm.lp[idx * 3]; P[j * 3 + 1] = cm.lp[idx * 3 + 1]; P[j * 3 + 2] = cm.lp[idx * 3 + 2];
+          const f = Math.pow(1 - j / cm.TL, 2) * br, w = j < 2 ? 0.5 : 0;
+          C[j * 3] = Math.min(1, col.r * f + w); C[j * 3 + 1] = Math.min(1, col.g * f + w); C[j * 3 + 2] = Math.min(1, col.b * f + w);
+        }
+        cm.line.geometry.attributes.position.needsUpdate = true; cm.line.geometry.attributes.color.needsUpdate = true;
+      }
+    }
+    this.composer.render();
+  }
+
+  destroy() {
+    this.running = false; window.clearTimeout(this._saveT); this.ro && this.ro.disconnect(); this.controls.dispose();
+    this.win.removeEventListener("blur", this._cn); if (this.mq && this.mq.removeEventListener) this.mq.removeEventListener("change", this._mqh);
+    this.scene.traverse((o) => { o.geometry && o.geometry.dispose(); if (o.material) { o.material.map && o.material.map.dispose(); o.material.dispose(); } });
+    this.composer.dispose && this.composer.dispose(); this.renderer.dispose(); this.root.remove();
+  }
+}
