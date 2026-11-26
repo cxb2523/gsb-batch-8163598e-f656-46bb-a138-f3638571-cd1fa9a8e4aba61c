@@ -47,6 +47,7 @@ export function createSheet(mech, { layout: forcedLayout } = {}) {
     focus: 0,
     tween: null,
     scrubbing: false,
+    driveStep: 0,                 // theta degrees authored by playback this frame (scrub/tween excluded)
     phi: new Array(N).fill(0),
     layers,
     mech: {},                      // mechanism-private state (tyre pressure, heat...)
@@ -556,6 +557,10 @@ export function createSheet(mech, { layout: forcedLayout } = {}) {
     const dt = Math.min(clock.getDelta(), 0.05);
     // the rate follows the input with some inertia
     state.rate += (D.target(state.input) - state.rate) * (1 - Math.exp(-dt * (D.inertia ?? 1.4)));
+    // Only the playing branch authors a drive step. Tween/step moves and chart
+    // scrubs change theta too, but they are not pumping and must not integrate
+    // mechanism state such as tyre pressure or the stroke count.
+    state.driveStep = 0;
     if (state.tween) {
       const tw = state.tween;
       tw.t += dt / tw.dur;
@@ -563,10 +568,12 @@ export function createSheet(mech, { layout: forcedLayout } = {}) {
       state.theta = tw.from + (tw.to - tw.from) * k;
       if (tw.t >= 1) state.tween = null;
     } else if (state.playing) {
+      const before = state.theta;
       state.theta += D.degPerSec(state.rate) / state.slow * dt;
+      state.driveStep = state.theta - before;
     }
     for (let i = 0; i < N; i++) state.phi[i] = phiOf(i);
-    model.pose(state.theta, dt, state);
+    model.pose(state.theta, dt, state, state.driveStep);
 
     if (intro < 1) {
       intro = Math.min(1, intro + dt / 1.8);
@@ -589,6 +596,13 @@ export function createSheet(mech, { layout: forcedLayout } = {}) {
     updateGauge();
     requestAnimationFrame(frame);
   }
+  // Paint instruments, readouts and charts once before the first rAF so that on
+  // entry (and right after a layout switch) every consumer already shows the
+  // exact same mechanism state, even before a frame has elapsed.
+  updatePanel();
+  updateGauge();
+  if (chart) drawChart();
+  drawPlot();
   requestAnimationFrame(frame);
 
   // for scripted shots, the clip recorder and the console

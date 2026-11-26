@@ -20,6 +20,53 @@ const DEAD = 0.06;                  // dead volume under the piston, as a fracti
 const VMAX = 1 + DEAD;
 const RATIO = 0.3;                  // barrel volume / tyre volume (sets how fast the tyre fills)
 const TYRE_START = 0.4;             // bar (gauge): nearly flat
+const DEFLATE_RATE = 3.5;           // bar per second while "Let air out" is held
+
+/* Pressure lifecycle. state.mech.tyre is the one value the pump, the SVG gauge,
+   the P-V plot, the cycle chart and the readouts all read. Switching sheet/figure
+   is a full ?layout= navigation, so keep the current value in web storage (plus an
+   in-realm copy for an in-place rebuild) and restore it in build(): a freshly built
+   model can never reset to 0.4 while an instrument still shows the old value. */
+const PRESSURE_KEY = 'inkworks:pump:pressure:v1';
+const PRESSURE_GLOBAL = '__inkworksPumpPressure__';
+function pressureStorage() {
+  try { return globalThis.localStorage || globalThis.sessionStorage || null; }
+  catch { try { return globalThis.sessionStorage || null; } catch { return null; } }
+}
+function readPressureRecord() {
+  // Web storage is authoritative: it survives a full ?layout= navigation and an
+  // in-place rebuild, and clearing it genuinely resets the baseline.
+  const storage = pressureStorage();
+  if (storage) {
+    try {
+      const raw = storage.getItem(PRESSURE_KEY);
+      if (raw) { const rec = JSON.parse(raw); if (rec && Number.isFinite(rec.tyre)) return rec; }
+      return null;
+    } catch { /* fall through to the in-realm copy */ }
+  }
+  try {
+    const g = globalThis[PRESSURE_GLOBAL];
+    if (g && Number.isFinite(g.tyre)) return g;
+  } catch { /* globalThis unavailable */ }
+  return null;
+}
+function writePressureRecord(tyre) {
+  const rec = { tyre };
+  try { globalThis[PRESSURE_GLOBAL] = rec; } catch { /* ignore */ }
+  try { pressureStorage()?.setItem(PRESSURE_KEY, JSON.stringify(rec)); } catch { /* ignore */ }
+}
+function initPressureState(state) {
+  if (!state.mech) state.mech = {};
+  const m = state.mech;
+  const saved = readPressureRecord();
+  // An existing in-memory value always wins (an in-place rebuild shares state);
+  // only a fresh navigation falls back to storage, then to the flat baseline.
+  if (!Number.isFinite(m.tyre)) m.tyre = saved ? Math.max(TYRE_START, saved.tyre) : TYRE_START;
+  if (!Number.isFinite(m.strokes)) m.strokes = 0;
+  m.deflating = false;              // a release action is transient, never restored
+  writePressureRecord(m.tyre);
+  return m;
+}
 
 const h = (phi) => (1 - Math.cos(phi * D2R)) / 2;          // piston height 0..1
 function openAngle(tyre) {                                  // where the check valve opens on the down stroke
@@ -91,8 +138,12 @@ export default {
     const { THREE, part, ghost, ghostRings, toon, M, lineMat, xCyl, inkRing, stream, scene, INK } = kit;
     const root = new THREE.Group();
     scene.add(root);
-    state.mech.tyre = TYRE_START;
-    state.mech.strokes = 0;
+    initPressureState(state);
+    // Flush on layout navigation/re-entry even if pressure was set directly and
+    // no animation frame ran between the write and the unload.
+    try {
+      globalThis.addEventListener?.('pagehide', () => writePressureRecord(state.mech.tyre));
+    } catch { /* no event target */ }
     const C_IN = new THREE.Color(C.in), C_CO = new THREE.Color(C.co), C_PW = new THREE.Color(C.pw);
     const tmpColor = new THREE.Color();
     const zCyl = (r, len, seg = 32) => new THREE.CylinderGeometry(r, r, len, seg).rotateX(Math.PI / 2);
@@ -242,25 +293,47 @@ export default {
 
     /* ---------- pose ---------- */
     let lastTheta = state.theta;
+    let lastSavedTyre = state.mech.tyre;
+    const persist = (m) => {
+      if (m.tyre !== lastSavedTyre) { writePressureRecord(m.tyre); lastSavedTyre = m.tyre; }
+    };
     const fill = () => clamp01(state.mech.tyre / 8);
-    function pose(theta, dt, s) {
+    // driveDelta is the playback-authored theta step from the sheet loop (0 for a
+    // scrub, tween or paused frame). Omit it for a standalone/scripted pose() call,
+    // where a non-scrubbing forward theta step behaves as pumping.
+    function pose(theta, dt, s, driveDelta) {
       const dTheta = theta - lastTheta;
       lastTheta = theta;
       const m = s.mech;
-      const phi = s.phi[0];
+      // theta is the one driver variable; derive phi from it so a scripted pose()
+      // call that moves theta is as coherent as the animation loop.
+      const phi = mod(theta, 360);
+      if (s.phi) s.phi[0] = phi;
       const hh = h(phi);
       moving.position.y = PB0 + STROKE * hh;
 
-      // tyre fills only while the crank moves forward through the delivery phase
+      // Visual streams may follow any angular motion (including a scrub drag),
+      // but pressure and strokes integrate only the authoritative drive step.
       const step = Math.abs(dTheta) < 180 ? dTheta : 0;
+      const drive = s.scrubbing ? 0 : (Number.isFinite(driveDelta) ? driveDelta : step);
       const open = openAngle(m.tyre);
-      if (step > 0 && !m.deflating) {
-        const prevPhi = mod(phi - step, 360);
+
+      // The single pressure value has two mutually exclusive writers:
+      //  - deflating: falls with wall time to TYRE_START (0.4 bar), then stops;
+      //  - pumping: a forward playback step through the delivery band.
+      // Scrubbing the cycle chart, phase tweens and paused angle edits move the
+      // crank only: they never add pressure and never add strokes.
+      if (m.deflating) {
+        m.tyre = Math.max(TYRE_START, m.tyre - dt * DEFLATE_RATE);
+        if (m.tyre <= TYRE_START + 1e-9) { m.tyre = TYRE_START; m.deflating = false; }
+      } else if (drive > 0) {
+        const prevPhi = mod(phi - drive, 360);
         const lo = Math.max(open, prevPhi < phi ? prevPhi : open), hi = phi;
         if (hi > lo && phi >= open) m.tyre += RATIO * (m.tyre + 1) * Math.max(0, h(lo) - h(hi));
+        // exactly one completed down stroke per forward crossing of the 360/0 seam
         if (prevPhi > phi) m.strokes += 1;
       }
-      if (m.deflating) { m.tyre = Math.max(TYRE_START, m.tyre - dt * 3.5); if (m.tyre <= TYRE_START) m.deflating = false; }
+      persist(m);
 
       // cup seal: lip folds in going up, flares out going down
       const flare = phi < 180 ? 1 - smooth(4, 18, phi) : smooth(180, 194, phi);
