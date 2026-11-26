@@ -172,6 +172,84 @@ test("SpeechAccumulator", async (t) => {
     assert.equal(accumulator.finish().length, 120);
   });
 
+  await t.test("fills a gap between blocks with explicit non-speech", () => {
+    // A seek that came back short, or a missing window, leaves a hole in the
+    // timeline. The uncovered region must read as non-speech on purpose, not
+    // as whatever a reused or reallocated buffer happened to contain —
+    // otherwise a long film's reference drifts away from the real speech.
+    //
+    // The gap is kept wider than the tokenizer's 25-window silence tolerance:
+    // a shorter pause is absorbed INTO a speech token by design (see
+    // detectSpeech), so only a real hole demonstrates the accumulator fill.
+    const accumulator = new SpeechAccumulator();
+    // First block covers windows 0..99, with speech in its first 40 windows.
+    accumulator.push(pcm([[0, 40]], 100), { startSeconds: 0 });
+    // Second block starts at 2 s: windows 100..199 are a declared gap.
+    accumulator.push(pcm([[10, 50]], 100), { startSeconds: 2 });
+    const signal = accumulator.finish();
+
+    assert.equal(signal.length, 300, "the timeline runs to the last block's end");
+    // The gap itself: every sample in the uncovered 1 s interval is non-speech.
+    for (let i = 100; i < 200; i += 1) {
+      assert.equal(signal[i], 0, `gap sample ${i} was not explicitly non-speech`);
+    }
+    // Speech either side of the gap is unaffected.
+    assert.equal(signal[20], 1);
+    assert.equal(signal[215], 1);
+    assert.equal(signal[295], 0);
+  });
+
+  await t.test("marks the leading interval non-speech when the first block starts late", () => {
+    const accumulator = new SpeechAccumulator();
+    accumulator.push(pcm([[10, 40]], 60), { startSeconds: 1 });
+    const signal = accumulator.finish();
+    assert.equal(signal.length, 160, "index 0 is timeline zero, not the first block");
+    for (let i = 0; i < 100; i += 1) {
+      assert.equal(signal[i], 0, `leading sample ${i} was not explicitly non-speech`);
+    }
+    assert.equal(signal[115], 1);
+  });
+
+  await t.test("uses the block's non-speech label when filling gaps", () => {
+    // A detector configured with an "unsure" label rather than zero must leave
+    // that same label in the gaps, so the two kinds of silence never disagree.
+    const accumulator = new SpeechAccumulator();
+    accumulator.push(pcm([[0, 30]], 50), { startSeconds: 0, nonSpeechLabel: 0.25 });
+    accumulator.push(pcm([[0, 30]], 50), { startSeconds: 1, nonSpeechLabel: 0.25 });
+    const signal = accumulator.finish();
+    assert.equal(signal.length, 150);
+    for (let i = 50; i < 100; i += 1) {
+      assert.equal(signal[i], 0.25, `gap sample ${i} did not take the non-speech label`);
+    }
+  });
+
+  await t.test("finish length equals the covered timeline, gaps included", () => {
+    const accumulator = new SpeechAccumulator();
+    accumulator.push(pcm([[0, 20]], 30), { startSeconds: 0 });
+    // Half a second of block ending at 3.5 s, after a 2.5 s gap.
+    accumulator.push(pcm([[0, 20]], 50), { startSeconds: 3 });
+    const signal = accumulator.finish();
+    assert.equal(signal.length, 3.5 * SAMPLE_RATE);
+    // And nothing beyond the covered timeline exists.
+    assert.equal(signal[signal.length - 1], 0);
+  });
+
+  await t.test("reset releases the signal and leaves a clean accumulator", () => {
+    const accumulator = new SpeechAccumulator();
+    accumulator.push(pcm([[0, 40]], 100), { startSeconds: 0 });
+    accumulator.reset();
+    assert.equal(accumulator.processedSeconds, 0);
+    assert.equal(accumulator.finish().length, 0, "a reset accumulator must start empty");
+
+    // A fresh run after reset must not see any of the old run's speech, and a
+    // gap before its first block is filled rather than inheriting old samples.
+    accumulator.push(pcm([[10, 40]], 50), { startSeconds: 1 });
+    const signal = accumulator.finish();
+    assert.equal(signal.length, 150);
+    assert.equal(signal[50], 0);
+    assert.equal(signal[115], 1);
+  });
+
   await t.test("resets after finishing", () => {
     const accumulator = new SpeechAccumulator();
     accumulator.push(pcm([[0, 50]], 100));

@@ -275,31 +275,84 @@ export class SpeechAccumulator {
   }
 
   /**
+   * Write the non-speech label over a region the timeline has reached but no
+   * block has covered.
+   *
+   * `Float64Array` happens to zero-initialize, so an explicit fill looks
+   * redundant — it is not. The label is a detector OPTION (`nonSpeechLabel` in
+   * VadOptions), not always zero, and the buffer may have been reallocated in
+   * an earlier configuration. Writing the label ourselves means the gaps mean
+   * "this part of the timeline was examined and found silent", rather than
+   * "nobody ever wrote here" — which a later block could mistake for data.
+   */
+  private markNonSpeech(from: number, to: number, label: number): void {
+    if (to <= from) return;
+    this.samples.fill(label, from, to);
+  }
+
+  /**
    * Detect one block and write it at `startSeconds` on the reference timeline.
    *
    * Omitting `startSeconds` appends, which is only correct when the caller
    * really is feeding one continuous stream (the tests do).
+   *
+   * Every region the block does not cover is explicitly marked non-speech:
+   *
+   *  - a block placed AFTER the current end (a seek gap, a missing window)
+   *    leaves the interval in between filled with the non-speech label, so a
+   *    gap in the audio can never inherit a previous block's speech;
+   *  - a block placed at a non-zero start fills the leading interval the same
+   *    way, so the signal's index 0 really is timeline zero.
+   *
+   * Overlapping blocks still overwrite: a re-detected region belongs to the
+   * block placed against it, which is the latest word on that interval.
    */
   push(pcm: Int16Array, options?: VadOptions & { startSeconds?: number }): void {
     const block = detectSpeech(pcm, options);
     const sampleRate = options?.sampleRate ?? SAMPLE_RATE;
+    const label = options?.nonSpeechLabel ?? NON_SPEECH_LABEL;
     const at =
       options?.startSeconds === undefined
         ? this.length
         : Math.max(0, Math.round(options.startSeconds * sampleRate));
     this.ensure(at + block.length);
+    // Fill the uncovered interval up to this block BEFORE the block itself.
+    // When growth just allocated the backing array this fill is writing the
+    // same zeros it was born with, but doing it explicitly keeps a non-zero
+    // non-speech label honest and makes the gap guarantee independent of the
+    // allocator.
+    this.markNonSpeech(this.length, Math.max(this.length, at), label);
     this.samples.set(block, at);
     this.length = Math.max(this.length, at + block.length);
     this.detected += block.length;
   }
 
-  /** Hand the signal over and reset. Trimmed to the timeline actually covered. */
+  /**
+   * Hand the signal over and reset.
+   *
+   * The returned array is trimmed to `length` — exactly the span of timeline
+   * covered, one float per 10 ms, gaps included as explicit non-speech — and
+   * the accumulator drops every sample it held so a later run starts from a
+   * genuinely empty signal rather than a reused buffer.
+   */
   finish(): Float64Array {
     const out = this.samples.slice(0, this.length);
+    this.reset();
+    return out;
+  }
+
+  /**
+   * Discard the accumulated reference without returning it.
+   *
+   * A cancelled sync must release its (potentially film-length) signal at
+   * once rather than waiting for garbage collection, and the same instance can
+   * then never leak the old run into a new one. After this the accumulator is
+   * indistinguishable from a freshly constructed one.
+   */
+  reset(): void {
     this.samples = new Float64Array(0);
     this.length = 0;
     this.detected = 0;
-    return out;
   }
 
   /** Seconds of reference DETECTED so far, for progress reporting. */

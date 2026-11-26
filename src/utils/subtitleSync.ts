@@ -26,9 +26,8 @@
 import { getRelayBase } from "./secureUrl";
 import { getRelayStatus } from "./relayDiscovery";
 import { EXTRACT_SAMPLE_RATE, extractReferenceAudio } from "./subsyncAudio";
-import { runAlignment } from "./subsyncEngine";
 import { cuesToSpeech, preprocessCues } from "./subsyncSpeech";
-import { SpeechAccumulator } from "./subsyncVad";
+import { SubsyncRunController } from "./subsyncRunController";
 import type { SubsyncRequest, SubsyncResponse } from "./subsyncWorkerProtocol";
 import {
   BackendUnavailableError,
@@ -154,44 +153,37 @@ const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
   const worker = getWorker();
 
   if (!worker) {
-    // No worker: buffer the audio through the same accumulator the worker uses
-    // and align when `finish` arrives.
-    let begin: Extract<SubsyncRequest, { type: "begin" }> | null = null;
-    const accumulator = new SpeechAccumulator();
-    let resolve!: (value: SubtitleSyncResult) => void;
-    let reject!: (reason: unknown) => void;
-    const done = new Promise<SubtitleSyncResult>((res, rej) => {
-      resolve = res;
-      reject = rej;
+    // No worker: run the SAME session controller the worker runs, on this
+    // thread. Routing through it — rather than a hand-rolled loop — means a
+    // cancelled or superseded run's late `pcm` is dropped on the runId boundary
+    // here too, and its accumulator is released on cancel exactly as in the
+    // worker. The only difference from the worker branch below is where the
+    // controller's replies come back.
+    let settle!: (value: SubtitleSyncResult) => void;
+    let fail!: (reason: unknown) => void;
+    const done = new Promise<SubtitleSyncResult>((resolve, reject) => {
+      settle = resolve;
+      fail = reject;
     });
+
+    const controller = new SubsyncRunController((message) => {
+      if (message.runId !== runId) return;
+      if (message.type === "result") {
+        settle(message.result);
+      } else if (message.type === "error") {
+        fail(new Error(message.message));
+      }
+    });
+
     return {
-      post: (message) => {
-        try {
-          if (message.type === "begin") begin = message;
-          else if (message.type === "pcm") {
-            accumulator.push(new Int16Array(message.buffer), {
-              frameRate: message.frameRate,
-              startSeconds: message.startSeconds,
-            });
-          } else if (message.type === "finish" && begin) {
-            const reference = begin.referenceSpeech ?? accumulator.finish();
-            if (reference.length === 0) {
-              reject(new Error("No speech was detected in this video."));
-              return;
-            }
-            resolve(
-              runAlignment(reference, begin.cues, begin.reference, begin.processingMode, begin.engine, {
-                ...begin.options,
-                referenceNumFrames: begin.referenceNumFrames ?? null,
-              }),
-            );
-          }
-        } catch (error) {
-          reject(error);
-        }
-      },
+      post: (message) => controller.handle(message),
       done,
-      cancel: () => reject(new DOMException("Subtitle sync was cancelled", "AbortError")),
+      cancel: () => {
+        // Tell the controller first so it drops the run and releases any
+        // reference signal already accumulated; then reject this run's promise.
+        controller.handle({ type: "cancel", runId });
+        fail(new DOMException("Subtitle sync was cancelled", "AbortError"));
+      },
     };
   }
 
