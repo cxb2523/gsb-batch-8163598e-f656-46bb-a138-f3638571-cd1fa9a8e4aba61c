@@ -23,7 +23,7 @@ import type {
 import * as React from 'react';
 
 import { createPlayerEventHandlers } from '../state/playerEventHandlers';
-import { playerReducer } from '../state/playerReducer';
+import { createGenerationScopedReducer } from '../state/playerReducer';
 import { DEFAULT_PLAYER_STATE, DEFAULT_PROGRESS } from '../state/playerState';
 
 export type {
@@ -42,10 +42,13 @@ export type {
  * @param options  Optional user-supplied event handlers.
  * @param sourceKey  Identity key for the current source (e.g. from
  *   `sourceIdentityKey`). When this changes, the hook resets `state` and
- *   `progress` to defaults — this prevents stale VOD state (videoId,
- *   duration, progress, playback state) from lingering after a VOD → live
- *   transition or a source change. Pass `undefined` to opt out of resets
- *   (legacy behaviour).
+ *   `progress` to defaults and advances the source generation — this
+ *   prevents stale VOD state (videoId, duration, progress, playback state)
+ *   from lingering after a VOD → live transition or a source change. A
+ *   handler set retained by the previous, torn-down source recognises itself
+ *   as stale and ignores late events (including `onProgress`); current
+ *   source events still update state and forward the raw payload to user
+ *   callbacks. Pass `undefined` to opt out of resets (legacy behaviour).
  */
 export function useBunnyStreamPlayer(
   options?: UseBunnyStreamPlayerOptions,
@@ -53,25 +56,38 @@ export function useBunnyStreamPlayer(
 ): UseBunnyStreamPlayerResult {
   const ref = React.useRef<BunnyVodPlayerRef | null>(null);
 
-  const [state, dispatch] = React.useReducer(playerReducer, DEFAULT_PLAYER_STATE);
+  // Monotonic source generation. Mirrored into a ref so the stable reducer
+  // fence and the memoised handlers can read the newest value without
+  // changing their own identity every render.
+  const generationRef = React.useRef(0);
+  const scopedReducer = React.useMemo(
+    () => createGenerationScopedReducer(() => generationRef.current),
+    [],
+  );
+  const [state, dispatch] = React.useReducer(scopedReducer, DEFAULT_PLAYER_STATE);
   const [progress, setProgress] = React.useState<PlayerProgress>(DEFAULT_PROGRESS);
 
-  // Reset state + progress when the source identity changes. This clears
-  // stale VOD state (videoId, duration, progress, playback state) when
-  // switching to live (which doesn't emit onReady) or between VOD sources.
-  // Uses a ref to track the previous key so the reset only fires on actual
-  // changes, not on every render.
-  const prevSourceKey = React.useRef<string | number | undefined>(sourceKey);
-  React.useEffect(() => {
-    if (prevSourceKey.current !== sourceKey) {
-      prevSourceKey.current = sourceKey;
-      // Reset state + progress to defaults so stale VOD state (videoId,
-      // duration, progress, playback state) doesn't linger after a source
-      // change (e.g. VOD → live, which doesn't emit onReady).
-      dispatch({ type: 'RESET' });
-      setProgress(DEFAULT_PROGRESS);
-    }
-  }, [sourceKey]);
+  // Track the sourceKey + generation in state so a source change can be
+  // handled during render (React's endorsed "adjust state when props change"
+  // pattern). The reset therefore lands BEFORE children render and before
+  // any effect/native event can observe the new source, closing the window
+  // where the old effect-based reset raced late native events.
+  const [trackedSourceKey, setTrackedSourceKey] = React.useState(sourceKey);
+  const [generation, setGeneration] = React.useState(0);
+
+  if (!Object.is(trackedSourceKey, sourceKey)) {
+    setTrackedSourceKey(sourceKey);
+    setGeneration(generation + 1);
+    // Reset BOTH channels together so state is never cleared while progress
+    // still holds the old position. RESET is unstamped and always accepted.
+    dispatch({ type: 'RESET' });
+    setProgress(DEFAULT_PROGRESS);
+  }
+  // Mirror the current generation for the stable reducer fence and event
+  // handlers to read. On the source-changing render this still holds the
+  // previous generation; React restarts with the incremented state before
+  // events are handled, at which point the mirror advances as well.
+  generationRef.current = generation;
 
   // Store user handlers in a ref so the memoised event handlers below have a
   // stable identity even when the user passes inline callbacks.
@@ -97,9 +113,20 @@ export function useBunnyStreamPlayer(
     [],
   );
 
+  // One handler set per source generation. Its identity is stable across
+  // ordinary re-renders and option changes (options go through optionsRef);
+  // only a sourceKey change mints a new set. The previous set — still held by
+  // the torn-down native instance — closes over the old bound generation and
+  // drops any late events instead of writing them into the new source.
   const eventHandlers = React.useMemo<PlayerEventHandlers>(
-    () => createPlayerEventHandlers(dispatch, setProgress, optionsRef),
-    [],
+    () =>
+      createPlayerEventHandlers(dispatch, setProgress, optionsRef, {
+        generationRef,
+        boundGeneration: generation,
+      }),
+    // `dispatch`/`setProgress`/refs are all stable; `generation` is the only
+    // identity-changing dependency and only moves on a sourceKey change.
+    [dispatch, generation],
   );
 
   return { ref, state, progress, controls, eventHandlers };

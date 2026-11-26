@@ -26,6 +26,20 @@ export type PlayerAction =
   | { type: 'LIVE_ERROR'; message: string }
   | { type: 'RESET' };
 
+/**
+ * Optional source-generation stamp attached by the event-handler layer.
+ *
+ * Every source identity change mints a new, monotonically increasing
+ * generation. Events captured by a handler set from an older generation
+ * carry that older value; the generation-scoped reducer below can then drop
+ * them even if they reach `dispatch` through a path that skipped the
+ * handler-level ownership check. Actions without a stamp (including every
+ * existing caller and the `RESET` that advances the source) are always
+ * accepted, so this stays backwards compatible.
+ */
+export type WithSourceGeneration = { sourceGeneration?: number };
+export type ScopedPlayerAction = PlayerAction & WithSourceGeneration;
+
 type ActionHandler<K extends PlayerAction['type']> = (
   state: PlayerState,
   action: Extract<PlayerAction, { type: K }>,
@@ -153,4 +167,33 @@ const handlers: HandlerMap = {
 
 export function playerReducer(state: PlayerState, action: PlayerAction): PlayerState {
   return handlers[action.type](state, action as never);
+}
+
+/**
+ * Whether an action stamped with `actionGeneration` may update the
+ * generation currently owned by the hook. Unstamped actions are accepted
+ * (legacy/direct dispatch and the source-changing `RESET`); only actions
+ * carrying an *older* generation are rejected. A same-generation or newer
+ * stamp is accepted so a fresh source's immediate events are never dropped.
+ */
+export function isGenerationCurrent(
+  actionGeneration: number | undefined,
+  currentGeneration: number,
+): boolean {
+  return actionGeneration === undefined || actionGeneration >= currentGeneration;
+}
+
+/**
+ * Wraps {@link playerReducer} with a source-generation fence. The reader
+ * returns the generation currently owned by the hook; actions from a
+ * previous generation are ignored while the source-changing `RESET`
+ * (unstamped) and all current-generation actions reduce normally.
+ */
+export function createGenerationScopedReducer(readCurrentGeneration: () => number) {
+  return (state: PlayerState, action: ScopedPlayerAction): PlayerState => {
+    if (!isGenerationCurrent(action.sourceGeneration, readCurrentGeneration())) {
+      return state;
+    }
+    return playerReducer(state, action);
+  };
 }
