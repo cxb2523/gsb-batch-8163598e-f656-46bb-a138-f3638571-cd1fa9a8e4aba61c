@@ -1,0 +1,242 @@
+# CursorFX
+
+**Your cursor, but alive.** Mix and match a custom cursor model, a movement trail and a click effect, with optional synthesised sound, and drop it on any website with one script tag. Zero dependencies, plain JavaScript, one 2D canvas.
+
+> 17 cursor models · 9 trails · 16 click effects · sound that is synthesised in the browser, no audio files
+
+![CursorFX demo: F1 car with particle animals, glow orb with fairy dust and butterflies, crosshair with gunshot, ghost with rainbow and fireworks](docs/demo.gif)
+
+It runs on any site. Here it is injected into a Google search with the crosshair and gunshot:
+
+![CursorFX gunshot effect on a Google search results page](docs/demo-google.gif)
+
+[Live studio](https://devkancheti4-design.github.io/cursorfx/) · [Browser extension](#browser-extension) · [Write a plugin](#write-your-own-plugin)
+
+## Quick start
+
+```html
+<script src="https://cdn.jsdelivr.net/gh/devkancheti4-design/cursorfx@main/dist/cursorfx.js"></script>
+<script>
+  CursorFX.init({ cursor: 'f1car', trail: null, click: 'animals', sound: true });
+</script>
+```
+
+Or download `dist/cursorfx.js` and serve it yourself. The studio page (`index.html`) lets you pick a combination, tweak options, and copies the exact snippet for you.
+
+## Catalog
+
+### Cursor models (what replaces the pointer)
+
+| name | | what it does | sound |
+| --- | --- | --- | --- |
+| `f1car` | 🏎️ | An F1 car that steers with your pointer. Synthesised V10 engine with an 8-speed gearbox, upshift cracks, backfires, tyre smoke and exhaust flames. Hold to boost. | yes |
+| `orb` | ✨ | Glowing orb with a rainbow comet tail and a ring that pulses on click. | |
+| `ring` | ◎ | The modern dot-and-ring cursor. The ring lags, grows over links and shrinks on click. | |
+| `ghost` | 👻 | A ghost floats after the pointer, its eyes follow your movement, and it leaves fading echoes. | |
+| `emoji` | 🐱 | Any emoji on a spring: it bounces, tilts and stretches. | |
+| `spotlight` | 🔦 | Dims the page except a soft circle of light around the pointer. | |
+| `blob` | 🫧 | A gooey blob that stretches with velocity and drags droplets. | |
+| `ribbon` | 🎀 | A silk ribbon that twists and narrows behind the pointer. | |
+| `rocket` | 🚀 | A rocket that turns to follow movement, with a flame that grows with speed. | thruster |
+| `crosshair` | ✚ | A shooting reticle with guide lines and live x/y coordinates. Blooms and kicks with recoil when you fire. | |
+| `clock` | 🕰️ | A working analog clock follows the pointer. | |
+| `textflag` | 🏁 | Your words trail behind the pointer and wave like a flag. | |
+| `pixel` | 🕹️ | A chunky 8-bit arrow. | |
+
+#### The gun collection
+
+Four battle-royale style guns, each with six skins: gold, neon, crimson, camo, frost and carbon. The muzzle tip is the hotspot, so a shot lands exactly where it points, and a small outlined reticle marks the spot on light and dark pages alike. Every shot kicks the gun back and up around its grip, throws a muzzle flash and ejects a brass casing. Pair any of them with the `gunshot` click effect, which fires continuously while you hold the button and tells the gun each time it fires.
+
+| name | | model | default skin |
+| --- | --- | --- | --- |
+| `gun-rifle` | 🎯 | Assault rifle with a curved magazine | gold |
+| `gun-sniper` | 🔭 | Scoped long rifle with a thumbhole stock and a glinting lens | frost |
+| `gun-shotgun` | 💥 | Lever-action shotgun with a tube magazine | crimson |
+| `gun-pistol` | 🔫 | Heavy pistol with a serrated slide | neon |
+
+```js
+CursorFX.init({ cursor: 'gun-sniper', click: 'gunshot', options: { 'gun-sniper': { skin: 'neon', aim: 'right' } } });
+```
+
+The designs are original. They take the look of a battle-royale weapon skin, not any game's actual artwork.
+
+### Trails (emitted while the pointer moves)
+
+| name | | what it does |
+| --- | --- | --- |
+| `sparkles` | ✨ | Fairy dust: twinkling four-point sparkles drift down. |
+| `rainbow` | 🌈 | Seven-band rainbow ribbon. |
+| `bubbles` | 🫧 | Soap bubbles rise and pop. |
+| `emojirain` | 😂 | Your emoji tumble out and fall. |
+| `snow` | ❄️ | Snowflakes drift and sway. |
+| `petals` | 🌸 | Cherry-blossom petals flutter down. |
+| `fire` | 🔥 | Flames lick behind the pointer, hotter as you speed up. |
+| `stars` | ⭐ | Golden stars twinkle along the path. |
+| `neon` | 💡 | A glowing neon tube traces your path and fades. |
+
+### Click effects (burst on every click or tap)
+
+| name | | what it does | sound |
+| --- | --- | --- | --- |
+| `animals` | 🦊 | Particles explode and reassemble into a different animal each click. Move through it to push the particles aside. Optional: `placement: 'corner'` keeps it small and off your content, `opacity` makes it translucent, `dissolveAfter` controls how long it stays. | whoosh |
+| `gunshot` | 🎯 | Fires a shot: muzzle flash, sparks, smoke, an ejected casing and a cracked bullet hole that fades away after a few seconds. Hold to keep firing. Pairs with the `crosshair` cursor, which blooms and kicks with recoil. | bang |
+| `waves` | 🌊 | The page itself ripples: real content bends and refracts outward from the click (backdrop-filter displacement, Chromium; rings elsewhere). `style: 'jelly'` wobbles the whole page. | drip |
+| `ripple` | 〰️ | Concentric water rings drawn on top. | drip |
+| `butterflies` | 🦋 | A flock of butterflies flutters out and flies away. | flutter |
+| `fireworks` | 🎆 | A rocket streaks up and bursts into sparks. | launch + bang |
+| `hearts` | ❤️ | Hearts float up and sway. | blip |
+| `confetti` | 🎉 | A confetti cannon with tumbling paper. | pop |
+| `bubbles` | 🫧 | A cloud of bubbles rises and pops one by one. | pops |
+| `stars` | 🌟 | Spinning golden stars with a chime. | chime |
+| `ink` | 🖌️ | An ink splat that spreads and drips. | splat |
+| `shockwave` | 💥 | A flash, an expanding ring and flying sparks. | boom |
+| `emojiburst` | 🎊 | A burst of your chosen emoji. | pop |
+| `textburst` | 💬 | Comic-book words: POW! BOOM! WOW! | zap |
+| `birds` | 🐦 | A flock takes flight and scatters. | chirp |
+| `notes` | 🎵 | Music notes float up; each click plays a pentatonic note, so clicking becomes a melody. | note |
+
+Any layer can be `null` to turn it off. Sound is off unless you pass `sound: true`, and browsers only start audio after the first click or key press.
+
+## Download
+
+No npm needed. Grab `dist/cursorfx.js` (the whole library in one file) or `dist/cursorfx-extension.zip` (the browser extension) from the studio's Download row or from the Releases page, or clone the repo. The studio page works when opened straight from a downloaded folder, because everything is plain scripts.
+
+## Request an effect, get credited
+
+Open a [request issue](../../issues/new?template=effect_request.yml) describing the cursor, trail or click effect you want. When it is built, the plugin ships with a `credits` field carrying your name, which shows on its card in the studio and in [CREDITS.md](CREDITS.md). Details in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## API
+
+```js
+CursorFX.init(config)     // start; safe to call before DOM is ready
+                          // config.cursorScale (default 1) scales any cursor model around the pointer
+CursorFX.set(config)      // change any part of the config on the fly
+CursorFX.destroy()        // remove the canvas, listeners and audio
+CursorFX.list()           // { cursor: [...], trail: [...], click: [...] } with labels, icons, descriptions, defaults
+CursorFX.trigger(x, y)    // fire the click effect programmatically (defaults to the pointer position)
+CursorFX.preview(kind, name, { w, h, options, frames, step })
+                          // render one plugin to its own canvas, stepped by hand; works in hidden tabs
+CursorFX.getConfig()
+```
+
+Config:
+
+```js
+{
+  cursor: 'ring',           // cursor model name or null
+  trail: 'sparkles',        // trail name or null
+  click: 'ripple',          // click effect name or null
+  sound: false,             // enable synthesised sound
+  volume: 0.8,
+  hideNative: true,         // hide the OS cursor while a cursor model is active
+  zIndex: 2147483646,
+  options: {                // per-plugin options, keyed by plugin name
+    emoji: { emoji: '🦄', size: 44 },
+    textflag: { text: 'HELLO WORLD' },
+    animals: { animals: ['🐙', '🦕'], dissolveAfter: 0 },
+  },
+}
+```
+
+Add `data-cursorfx-ignore` to any element to stop clicks inside it from firing the click effect (the studio panel uses this). Add `data-cursor="pointer"` to make a non-interactive element count as hoverable for cursors that react to links and buttons.
+
+## Write your own plugin
+
+Every plugin is a small object with a `create` function that returns `update` and `render` hooks. Register it after loading the bundle, then use its name in the config.
+
+```js
+CursorFX.registerClick('smiley', {
+  label: 'Smiley', icon: '🙂', description: 'A smiley pops out of every click.',
+  defaults: { size: 40 },
+  create(opts, api) {
+    const { state, util, audio } = api;
+    const list = util.particleList();
+    return {
+      trigger(x, y) {
+        list.add({ x, y, vy: -3, life: 60, max: 60 });
+        audio.tone({ freq: 880, dur: 0.2 });          // silently ignored when sound is off
+      },
+      update(f) { list.step(f, (p) => { p.y += p.vy * f; p.vy += 0.1 * f; }); },
+      render(g) {
+        list.items.forEach((p) => util.drawSprite(g, util.sprite('🙂', opts.size), p.x, p.y, 1, 0, p.life / p.max));
+      },
+    };
+  },
+});
+CursorFX.set({ click: 'smiley' });
+```
+
+- `state` gives you the pointer: `x, y, vx, vy, speed, heading, down, hover, seen, inside, w, h, time, reduceMotion`.
+- `util` has `rand, pick, clamp, lerp, hsla, rrect, star, heart, sprite, drawSprite, samplePoints, particleList`.
+- `audio` has `pop, tone, whoosh` (all no-ops when sound is off or not yet unlocked), plus `get()` for a raw `AudioContext` and `bus()` to connect your own nodes.
+- Frame values are in per-frame units at 60 fps; scale motion by `f` so it looks the same at 120 Hz.
+- Cursors use `update/render` plus optional `onEnter`, `onDown`, `onUp`. Trails use `update/render`. Click effects add `trigger(x, y, event)`.
+
+Optional metadata: `credits: { requestedBy: 'u/name', builtBy: 'you' }` is shown on the plugin's card and returned by `CursorFX.list()`. `choices: { skin: [{ value, label, color }] }` turns an option into a picker: a dropdown in the studio and a row of swatches in both desktop widgets.
+
+Plugins live in `src/cursors`, `src/trails` and `src/clicks`. Run `npm run build` to rebundle `dist/cursorfx.js` and the extension zip.
+
+## Desktop app (macOS): the whole Mac, not just web pages
+
+`desktop/macos/` is a native menu bar app that puts the same effects over your entire screen: the desktop, Finder, every app. It draws a click-through, always-on-top overlay on each display, follows the system mouse, hides the arrow, and plays the sounds.
+
+- Download `CursorFX-macOS.zip` from the [Releases page](../../releases), unzip, and drag `CursorFX.app` into Applications. It is not notarised, so the first time right-click it and choose Open.
+- Turn on **Open at login** in the widget, or the menu bar item is gone after every restart.
+- A cursor glyph appears in the menu bar, left of your other items. Click it for a Control Center style widget: a master switch to turn the custom mouse off, swipeable icon strips for cursor, trail and click effect, a size slider, and switches for sound, hiding the arrow, fading the cursor while you type (it comes back when the mouse moves, like the system arrow), and opening at login.
+- Build it yourself with `./desktop/macos/build.sh`, which needs the Xcode Command Line Tools. Add `install` to replace the copy in Applications and relaunch it. It embeds `dist/cursorfx.js`, so every plugin you add to the library shows up in the menu.
+
+## Desktop app (Windows)
+
+`desktop/windows/` is the same thing for Windows, built on Electron: one transparent click-through window per display, fed by the global pointer position, with a PowerShell helper supplying the mouse clicks and keystrokes that Electron cannot see on its own. It needs no drivers, no modules and no administrator rights.
+
+- Download `CursorFX-Windows.zip` from the [Releases page](../../releases), unzip it, and run `CursorFX.exe`. SmartScreen warns that the publisher is unknown because the build is not signed: choose **More info**, then **Run anyway**.
+- A cursor icon appears in the notification area. Left-click it for the panel, right-click for the same controls as a menu.
+- **Open at login** is a switch in the panel. It registers with Windows the usual way, so Settings, Apps, Startup can turn it off later.
+- Build it with `npm install` then `npm run dist` inside `desktop/windows`, on a Windows machine. `npm start` runs it from source anywhere.
+
+Details and the design notes are in [desktop/windows/README.md](desktop/windows/README.md).
+
+### Where each feature lives
+
+| | A web page | Browser extension | macOS app | Windows app |
+|---|---|---|---|---|
+| 17 cursors, 9 trails, 16 click effects | yes | yes | yes | yes |
+| Gun skins | `options.skin` | fixed | skin row | skin row |
+| Cursor size | `cursorScale` | fixed | slider | slider |
+| Sound | `sound: true` | switch | switch | switch |
+| Turn it all off | remove the script | switch | master switch | master switch |
+| Hide the real arrow | `hideNative` | `hideNative` | switch | switch |
+| Fade while typing | no | no | switch | switch |
+| Open at login | not applicable | starts with the browser | switch | switch |
+| Covers | that one page | every page you visit | every app and the desktop | every app and the desktop |
+
+The two desktop apps have the same controls. They differ only in how they reach the operating system, which is what the table in [desktop/windows/README.md](desktop/windows/README.md) covers.
+
+### Linux
+
+No overlay app yet. The browser extension below covers Chrome, Edge and Brave, and a port would follow the same shape as the two above. To start your own build at login, drop a `.desktop` file in `~/.config/autostart/` with an `Exec=` line pointing at the binary.
+
+## Browser extension
+
+The `extension/` folder is a Manifest V3 extension that runs CursorFX on every page you visit. Load it unpacked from `chrome://extensions` (Chrome, Edge, Brave, Arc) and pick your cursor, trail, click effect and sound from the toolbar popup. Settings sync through your browser profile.
+
+## Development
+
+```bash
+npm run build      # bundle src/ into dist/cursorfx.js and copy it into extension/
+npm start          # serve the studio at http://localhost:8765
+```
+
+There is no build tooling to install. Plugins are plain scripts that register themselves, so you can also load `src/core.js` and individual plugin files directly.
+
+## Accessibility and performance
+
+- Respects `prefers-reduced-motion`: particle counts are halved and bursts softened.
+- Eases off to a low frame rate once the pointer has been still for a moment, and snaps back to full speed the instant anything moves. An overlay spends most of its life idle, and redrawing it costs the same whether or not anything is happening. Measured numbers for the two desktop apps are in [desktop/windows/README.md](desktop/windows/README.md#performance).
+- One overlay canvas with `pointer-events: none`, so the page underneath stays fully interactive.
+- Particles are pooled and drawn with cached sprites; the animals effect batches thousands of dots per frame.
+- Sound is synthesised with the Web Audio API and unlocked by the first user gesture, per browser policy.
+
+## License
+
+MIT.
