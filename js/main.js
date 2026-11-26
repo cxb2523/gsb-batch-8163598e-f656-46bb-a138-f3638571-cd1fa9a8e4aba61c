@@ -76,6 +76,8 @@ console.log("%c\u25A0 %c\u25B6 %c\u25A0 %c PulseQuaver v" + DEFAULT_PARAMS.progr
 	}
 
 	const songObject = new SongObject(onSynthChange);
+	// Expose for browser-console verification (tests/console-live-checks.js)
+	window.songObject = songObject;
 
 	const synthUi = new SynthUi(songObject);
 

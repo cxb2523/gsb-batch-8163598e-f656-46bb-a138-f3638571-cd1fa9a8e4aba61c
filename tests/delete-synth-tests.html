@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="utf-8">
+	<title>PulseQuaver - synth deletion verification</title>
+	<style>
+		body {
+			background: #111;
+			color: #ddd;
+			font-family: monospace;
+			margin: 0;
+			padding: 16px;
+		}
+
+		h1 {
+			color: #1ff;
+			font-size: 18px;
+		}
+
+		#output {
+			white-space: pre-wrap;
+			line-height: 1.5;
+		}
+
+		.pass {
+			color: #4d6;
+		}
+
+		.fail {
+			color: #f66;
+			font-weight: bold;
+		}
+
+		.info {
+			color: #8ac;
+		}
+
+		button {
+			background: #222;
+			color: #ddd;
+			border: 1px solid #555;
+			padding: 8px 16px;
+			font-family: monospace;
+			cursor: pointer;
+			margin-bottom: 12px;
+		}
+	</style>
+</head>
+
+<body>
+	<h1>Synthesizer deletion verification (real Tone.js engine)</h1>
+	<p>
+		<button id="run-btn">Run verification scenarios</button>
+	</p>
+	<div id="output"></div>
+
+	<!-- Real application sources, in the same load order as index.html -->
+	<script src="../lib/Tone.js"></script>
+	<script src="../js/defaults.js"></script>
+	<script src="../js/loader.js"></script>
+	<script src="../js/synth-param-apply.js"></script>
+	<script src="../js/synth-proto.js"></script>
+	<script src="../js/synth.js"></script>
+	<script src="../js/wam-synth.js"></script>
+	<script src="../js/pattern.js"></script>
+	<script>
+		// The test page has no WAM UI DOM; provide lightweight stand-ins
+		function WamInit() {
+			this.loadModule = async function () { return null; };
+		}
+		function WamUi() {
+			this.showLoadingIndicator = function () { };
+			this.appendFxGui = function () { };
+			this.showFxSlotError = function () { };
+			this.resetFxSlotState = function () { };
+			this.appendIPluginGui = function () { };
+		}
+	</script>
+	<script src="../js/song-object.js"></script>
+
+	<!-- Shared verification scenarios -->
+	<script src="delete-synth-tests.js"></script>
+
+	<script>
+		"use strict";
+
+		const output = document.getElementById("output");
+
+		function appendLine(text, className) {
+			let line = document.createElement("DIV");
+			if (className)
+				line.classList.add(className);
+			line.textContent = text;
+			output.appendChild(line);
+		}
+
+		// With real Tone nodes there is no stub registry; node-cleanup is
+		// covered by the Node runner.
+		const browserEnv = {
+			makeSongObject() {
+				return new SongObject(function () { });
+			},
+			assert(condition, message) {
+				appendLine((condition ? "  [PASS] " : "  [FAIL] ") + message,
+					condition ? "pass" : "fail");
+				if (!condition)
+					browserEnv.failures++;
+			},
+			log(message) {
+				appendLine(message, "info");
+			},
+			getNodeRegistry() {
+				return null;
+			},
+			disposeSong(song) {
+				for (let synth of song.synths) {
+					if (synth && typeof synth.destroy === "function")
+						synth.destroy();
+				}
+			},
+			failures: 0
+		};
+
+		function runVerification() {
+			output.innerHTML = "";
+			browserEnv.failures = 0;
+
+			try {
+				const suite = createDeleteSynthTests(browserEnv);
+				suite.run();
+			} catch (error) {
+				appendLine("ERROR: " + error.message, "fail");
+				console.error(error);
+			}
+
+			appendLine("");
+			appendLine(browserEnv.failures === 0
+				? "ALL SCENARIOS PASSED"
+				: browserEnv.failures + " ASSERTION(S) FAILED",
+				browserEnv.failures === 0 ? "pass" : "fail");
+
+			console.log("deleteSynth verification finished, failures:", browserEnv.failures);
+		}
+
+		document.getElementById("run-btn").onclick = runVerification;
+
+		// Also callable from the browser console
+		window.runDeleteSynthVerification = runVerification;
+	</script>
+</body>
+
+</html>

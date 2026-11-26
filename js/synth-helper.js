@@ -181,13 +181,28 @@ function SynthHelper(songObj, synthUi, rebuildPatternSynthListCallback) {
 			return;
 		}
 
+		let deleteIndex = selectedSynthIndex;
+
 		showConfirm("Delete selected synthesizer?", (isOk) => {
 			if (!isOk)
 				return;
 
-			songObj.deleteSynth(selectedSynthIndex);
+			if (!songObj.deleteSynth(deleteIndex)) {
+				showAlert("Can not delete last synth");
+				return;
+			}
+
+			// Remap the menu-local selection to the post-deletion instrument layout
+			if (selectedSynthIndex > deleteIndex)
+				selectedSynthIndex--;
+			else if (selectedSynthIndex >= songObj.synths.length)
+				selectedSynthIndex = songObj.synths.length - 1;
+
 			rebuildPatternSynthListCallback(true);
-			selectSynth(0);
+
+			// The model already keeps currentSynthIndex on a legal index;
+			// sync the synth panel and list to that same instrument
+			selectSynth(songObj.currentSynthIndex);
 
 			that.rebuildSynthList();
 			g_switchTab("synth-list");

@@ -274,18 +274,59 @@ function SongObject(onSynthChangeCallback) {
 	}
 
 	this.deleteSynth = function (index) {
-		this.synths[index].destroy();
+		if (this.synths.length <= 1) {
+			console.log("Can not delete last synth");
+			return false;
+		}
 
+		if (index < 0 || index >= this.synths.length) {
+			console.log("Invalid synth index: " + index);
+			return false;
+		}
+
+		// Release any voices still sounding, then destroy the audio graph:
+		// disconnects/disposes every node of the removed instrument, including
+		// its link into the compressor or an FX plugin slot. Shared FX nodes
+		// are owned by the slot and stay alive.
+		let removedSynth = this.synths[index];
+		if (typeof removedSynth.triggerRelease === "function")
+			removedSynth.triggerRelease(Tone.now());
+
+		removedSynth.destroy();
+
+		// The parallel arrays (synth / name / params / sends) must stay aligned
 		this.synths.splice(index, 1);
 		this.synthNames.splice(index, 1);
 		this.synthParams.splice(index, 1);
 		this.sends.splice(index, 1);
 
+		// Remap sends of the remaining instruments: the deleted entry is gone,
+		// every other entry keeps its own effect slot. Clear entries that point
+		// to a slot which no longer exists so the routing can never go stale.
+		for (let i = 0; i < this.sends.length; i++) {
+			let sendIndex = this.sends[i];
+			if (sendIndex !== null && sendIndex !== undefined &&
+				(sendIndex < 0 || sendIndex >= this.pluginStates.length))
+				this.sends[i] = null;
+		}
+
+		// Repoint every pattern layer: layers using the removed instrument lose
+		// their assignment, layers pointing after it shift down by one.
 		for (let i = 0; i < this.patterns.length; i++) {
 			this.patterns[i].spliceSynth(index);
 		}
 
+		// Keep the selected instrument on a legal index after the removal
+		if (this.currentSynthIndex > index)
+			this.currentSynthIndex--;
+		else if (this.currentSynthIndex >= this.synths.length)
+			this.currentSynthIndex = this.synths.length - 1;
+
+		// Rebuild the collision table for the new instrument count and
+		// recompute the playable song length in the same pass
 		this.calculateSynthFill();
+
+		return true;
 	}
 
 	this.generateSynthName = function (prefix, startNumber) {
