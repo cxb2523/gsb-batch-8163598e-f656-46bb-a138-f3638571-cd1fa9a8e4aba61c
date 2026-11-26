@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { decodeWaveformForCurrentTrack } from "@/app/use-cases/decode-waveform";
+import { decodeWaveformForCurrentTrack, getCurrentWaveformTrackKey } from "@/app/use-cases/decode-waveform";
 import { BPM_FETCH_ACTION } from "@/domain/bpm-audio-messages";
 import { PLUME_CONSTANTS, PLUME_DEFAULTS } from "@/domain/plume";
 import { FakeAppCore } from "../../fakes/FakeAppCore";
@@ -219,5 +219,91 @@ describe("decodeWaveformForCurrentTrack", () => {
     const peaks = await decodeWaveformForCurrentTrack();
 
     expect(peaks).toBeNull();
+  });
+
+  it("returns null immediately when the abort signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const peaks = await decodeWaveformForCurrentTrack(controller.signal);
+
+    expect(peaks).toBeNull();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("returns null and releases the AudioContext when aborted mid-fetch", async () => {
+    const controller = new AbortController();
+    let resolveFetch!: (value: unknown) => void;
+    mockSendMessage.mockReturnValue(new Promise((r) => (resolveFetch = r)));
+
+    const promise = decodeWaveformForCurrentTrack(controller.signal);
+    controller.abort();
+    resolveFetch({ ok: true, data: FAKE_DATA });
+
+    const peaks = await promise;
+
+    expect(peaks).toBeNull();
+    expect(fakeAudioContextClose).toHaveBeenCalled();
+    expect(fakeDecodeAudioData).not.toHaveBeenCalled();
+  });
+
+  it("returns null and releases the AudioContext when aborted mid-decode", async () => {
+    const controller = new AbortController();
+    let resolveDecode!: (value: unknown) => void;
+    fakeDecodeAudioData.mockReturnValue(new Promise((r) => (resolveDecode = r)));
+
+    const promise = decodeWaveformForCurrentTrack(controller.signal);
+    await vi.waitFor(() => expect(fakeDecodeAudioData).toHaveBeenCalled()); // decode is now pending
+    controller.abort();
+    resolveDecode({ getChannelData: () => makeFakeSamples(WAVEFORM_PEAK_COLUMNS * 10) });
+
+    const peaks = await promise;
+
+    expect(peaks).toBeNull();
+    expect(fakeAudioContextClose).toHaveBeenCalled();
+  });
+
+  it("closes the AudioContext exactly once when abort races normal completion", async () => {
+    const controller = new AbortController();
+
+    const promise = decodeWaveformForCurrentTrack(controller.signal);
+    controller.abort();
+
+    await promise;
+
+    expect(fakeAudioContextClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── getCurrentWaveformTrackKey ───────────────────────────────────────────────
+
+describe("getCurrentWaveformTrackKey", () => {
+  it("returns the current track's URL", () => {
+    expect(getCurrentWaveformTrackKey()).toBe(TRACK_URL);
+  });
+
+  it("falls back to the audio stream URL when trackUrl is empty", () => {
+    fakeTrackAudio.getTrackAudioInfos.mockReturnValue([{ trackNumber: 1, trackUrl: "", audioStreamUrl: AUDIO_URL }]);
+
+    expect(getCurrentWaveformTrackKey()).toBe(AUDIO_URL);
+  });
+
+  it("returns null when no track audio info resolves", () => {
+    fakeTrackAudio.getTrackAudioInfos.mockReturnValue([]);
+
+    expect(getCurrentWaveformTrackKey()).toBeNull();
+  });
+
+  it("distinguishes tracks on a collection page via their track URLs", () => {
+    fakeTrackAudio.getTrackAudioInfos.mockReturnValue([
+      { trackNumber: 1, trackUrl: "/track/a", audioStreamUrl: "https://audio-a.mp3" },
+      { trackNumber: 2, trackUrl: "/track/b", audioStreamUrl: "https://audio-b.mp3" },
+    ]);
+    fakeAppCore = new FakeAppCore({
+      featureFlags: { ...PLUME_DEFAULTS.featureFlags },
+      trackNumber: "2/5",
+    });
+
+    expect(getCurrentWaveformTrackKey()).toBe("/track/b");
   });
 });

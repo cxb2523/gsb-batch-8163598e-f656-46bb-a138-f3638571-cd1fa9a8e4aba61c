@@ -6,10 +6,12 @@ import { PLUME_CSS_CLASSES } from "@/infra/elements/plume";
 import { FakeAppCore } from "../../../fakes/FakeAppCore";
 
 const mockDecodeWaveformForCurrentTrack = vi.hoisted(() => vi.fn());
+const mockGetCurrentWaveformTrackKey = vi.hoisted(() => vi.fn());
 const mockSeekToProgress = vi.hoisted(() => vi.fn());
 
 vi.mock("@/app/use-cases/decode-waveform", () => ({
   decodeWaveformForCurrentTrack: mockDecodeWaveformForCurrentTrack,
+  getCurrentWaveformTrackKey: mockGetCurrentWaveformTrackKey,
 }));
 vi.mock("@/app/use-cases", () => ({ seekToProgress: mockSeekToProgress }));
 vi.mock("@/shared/i18n", () => ({ getString: (k: string) => k }));
@@ -55,10 +57,11 @@ beforeEach(() => {
     duration: 100,
   });
   mockDecodeWaveformForCurrentTrack.mockResolvedValue(null);
+  mockGetCurrentWaveformTrackKey.mockReturnValue("/track/current");
 
   // Reset all module-level state between tests
   clearPeaksCache();
-  clearWaveform(makeCanvas()); // resets decodeAbortFlag
+  clearWaveform(makeCanvas()); // bumps the decode generation, invalidating stale completions
 });
 
 describe("createWaveformCanvas", () => {
@@ -478,6 +481,185 @@ describe("loading state", () => {
 
     expect(canvas.classList.contains(PLUME_CSS_CLASSES.waveformLoading)).toBe(false);
     expect(canvas.classList.contains(PLUME_CSS_CLASSES.featureHidden)).toBe(true);
+  });
+});
+
+describe("track identity, in-flight dedup and races", () => {
+  const peaksA = new Float32Array([0.2, 0.8, 0.6, 0.4]); // 4 columns
+  const peaksB = new Float32Array([0.5, 0.5, 0.5]); // 3 columns — distinguishable via fillRect count
+
+  beforeEach(() => {
+    fakeAppCore = new FakeAppCore({
+      featureFlags: { ...PLUME_DEFAULTS.featureFlags, waveform: true },
+      currentTime: 0,
+      duration: 100,
+    });
+  });
+
+  it("reuses the in-flight decode when the same track is triggered twice concurrently", async () => {
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    let resolveDecode!: (peaks: Float32Array | null) => void;
+    mockDecodeWaveformForCurrentTrack.mockReturnValue(new Promise((r) => (resolveDecode = r)));
+
+    // Main canvas + fullscreen clone canvas both trigger for the same track
+    const canvas1 = makeCanvas();
+    const ctx1 = makeMockCtx();
+    vi.spyOn(canvas1, "getContext").mockReturnValue(ctx1 as unknown as CanvasRenderingContext2D);
+    const canvas2 = makeCanvas();
+    const ctx2 = makeMockCtx();
+    vi.spyOn(canvas2, "getContext").mockReturnValue(ctx2 as unknown as CanvasRenderingContext2D);
+
+    const p1 = triggerWaveformDecode(canvas1);
+    const p2 = triggerWaveformDecode(canvas2);
+    resolveDecode(peaksA);
+    await Promise.all([p1, p2]);
+
+    // One fetch/decode, both canvases rendered
+    expect(mockDecodeWaveformForCurrentTrack).toHaveBeenCalledTimes(1);
+    expect(ctx1.fillRect).toHaveBeenCalledTimes(peaksA.length);
+    expect(ctx2.fillRect).toHaveBeenCalledTimes(peaksA.length);
+  });
+
+  it("aborts the in-flight decode's AbortSignal when clearWaveform is called", async () => {
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    mockDecodeWaveformForCurrentTrack.mockReturnValue(new Promise(() => {})); // never resolves
+
+    const canvas = makeCanvas();
+    vi.spyOn(canvas, "getContext").mockReturnValue(makeMockCtx() as unknown as CanvasRenderingContext2D);
+
+    void triggerWaveformDecode(canvas);
+
+    const signal = mockDecodeWaveformForCurrentTrack.mock.calls[0]![0] as AbortSignal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(false);
+
+    clearWaveform(canvas);
+
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("discards a late decode result from the previous track after a track change", async () => {
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    let resolveA!: (peaks: Float32Array | null) => void;
+    let resolveB!: (peaks: Float32Array | null) => void;
+    mockDecodeWaveformForCurrentTrack
+      .mockReturnValueOnce(new Promise((r) => (resolveA = r)))
+      .mockReturnValueOnce(new Promise((r) => (resolveB = r)));
+
+    const canvas = makeCanvas();
+    const ctx = makeMockCtx();
+    vi.spyOn(canvas, "getContext").mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+
+    const decodeA = triggerWaveformDecode(canvas); // track A decode in flight
+
+    // Track changes to B before A's decode resolves
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/b");
+    clearWaveform(canvas);
+    const decodeB = triggerWaveformDecode(canvas);
+
+    // A's decode completes late — must not reach the canvas or the cache
+    resolveA(peaksA);
+    await decodeA;
+    expect(ctx.fillRect).not.toHaveBeenCalled();
+
+    // B's decode completes — B's waveform renders
+    resolveB(peaksB);
+    await decodeB;
+    expect(ctx.fillRect).toHaveBeenCalledTimes(peaksB.length);
+
+    // A's late result was not cached: navigating back to A decodes again
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksA);
+    clearWaveform(canvas);
+    await triggerWaveformDecode(canvas);
+    expect(mockDecodeWaveformForCurrentTrack).toHaveBeenCalledTimes(3);
+  });
+
+  it("caches peaks per track URL and reuses them when navigating back", async () => {
+    const canvas = makeCanvas();
+    const ctx = makeMockCtx();
+    vi.spyOn(canvas, "getContext").mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+
+    // Decode track A
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksA);
+    await triggerWaveformDecode(canvas);
+    expect(ctx.fillRect).toHaveBeenCalledTimes(peaksA.length);
+
+    // Switch to track B — separate cache entry, separate decode
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/b");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksB);
+    clearWaveform(canvas);
+    ctx.fillRect.mockClear();
+    await triggerWaveformDecode(canvas);
+    expect(mockDecodeWaveformForCurrentTrack).toHaveBeenCalledTimes(2);
+    expect(ctx.fillRect).toHaveBeenCalledTimes(peaksB.length);
+
+    // Back to track A — cache hit, no third decode, A's peaks rendered
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    clearWaveform(canvas);
+    ctx.fillRect.mockClear();
+    mockDecodeWaveformForCurrentTrack.mockClear();
+    await triggerWaveformDecode(canvas);
+    expect(mockDecodeWaveformForCurrentTrack).not.toHaveBeenCalled();
+    expect(ctx.fillRect).toHaveBeenCalledTimes(peaksA.length);
+  });
+
+  it("restores the waveform on a rebuilt (fullscreen clone) canvas from the cache", async () => {
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksA);
+
+    // Main canvas decodes and renders
+    const mainCanvas = makeCanvas();
+    vi.spyOn(mainCanvas, "getContext").mockReturnValue(makeMockCtx() as unknown as CanvasRenderingContext2D);
+    await triggerWaveformDecode(mainCanvas);
+    mockDecodeWaveformForCurrentTrack.mockClear();
+
+    // Fullscreen enter rebuilds the canvas — same track, so the cache key matches
+    // and the clone renders immediately without a new decode
+    const fullscreenCanvas = makeCanvas();
+    const fsCtx = makeMockCtx();
+    vi.spyOn(fullscreenCanvas, "getContext").mockReturnValue(fsCtx as unknown as CanvasRenderingContext2D);
+    fullscreenCanvas.classList.add(PLUME_CSS_CLASSES.featureHidden);
+
+    await triggerWaveformDecode(fullscreenCanvas);
+
+    expect(mockDecodeWaveformForCurrentTrack).not.toHaveBeenCalled();
+    expect(fullscreenCanvas.classList.contains(PLUME_CSS_CLASSES.featureHidden)).toBe(false);
+    expect(fsCtx.fillRect).toHaveBeenCalledTimes(peaksA.length);
+  });
+
+  it("does not render the previous track's waveform on the rebuilt canvas after a track change", async () => {
+    // Track A decoded and cached while on the main canvas
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/a");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksA);
+    const mainCanvas = makeCanvas();
+    vi.spyOn(mainCanvas, "getContext").mockReturnValue(makeMockCtx() as unknown as CanvasRenderingContext2D);
+    await triggerWaveformDecode(mainCanvas);
+
+    // Track changes to B, then fullscreen opens: the clone must decode B, not show A
+    mockGetCurrentWaveformTrackKey.mockReturnValue("/track/b");
+    mockDecodeWaveformForCurrentTrack.mockResolvedValue(peaksB);
+    const fullscreenCanvas = makeCanvas();
+    const fsCtx = makeMockCtx();
+    vi.spyOn(fullscreenCanvas, "getContext").mockReturnValue(fsCtx as unknown as CanvasRenderingContext2D);
+
+    await triggerWaveformDecode(fullscreenCanvas);
+
+    expect(mockDecodeWaveformForCurrentTrack).toHaveBeenCalledTimes(2);
+    expect(fsCtx.fillRect).toHaveBeenCalledTimes(peaksB.length);
+  });
+
+  it("keeps the canvas hidden when the current track cannot be identified", async () => {
+    mockGetCurrentWaveformTrackKey.mockReturnValue(null);
+    const canvas = makeCanvas();
+    canvas.classList.remove(PLUME_CSS_CLASSES.featureHidden);
+    vi.spyOn(canvas, "getContext").mockReturnValue(makeMockCtx() as unknown as CanvasRenderingContext2D);
+
+    await triggerWaveformDecode(canvas);
+
+    expect(canvas.classList.contains(PLUME_CSS_CLASSES.featureHidden)).toBe(true);
+    expect(mockDecodeWaveformForCurrentTrack).not.toHaveBeenCalled();
   });
 });
 

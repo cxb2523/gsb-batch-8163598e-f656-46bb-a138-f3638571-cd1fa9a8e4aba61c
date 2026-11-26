@@ -53,20 +53,55 @@ const resolveCurrentTrackAudioInfo = (infos: TrackAudioInfo[]): TrackAudioInfo |
   return infos.find((info) => info.trackNumber === currentNum) ?? null;
 };
 
-export const decodeWaveformForCurrentTrack = async (): Promise<Float32Array | null> => {
-  const trackAudio = getTrackAudioInstance();
-  const infos = trackAudio.getTrackAudioInfos();
-  const currentInfo: TrackAudioInfo | null = resolveCurrentTrackAudioInfo(infos);
+const resolveCurrentTrackAudioInfoFromPage = (): TrackAudioInfo | null => {
+  const infos = getTrackAudioInstance().getTrackAudioInfos();
+  return resolveCurrentTrackAudioInfo(infos);
+};
 
-  if (!currentInfo?.audioStreamUrl) return null;
+/**
+ * Identity of the track the waveform belongs to. Based on the track URL (not the
+ * track number) so peaks cached for one track can never be attributed to another.
+ */
+export const getCurrentWaveformTrackKey = (): string | null => {
+  const info = resolveCurrentTrackAudioInfoFromPage();
+  if (!info) return null;
+  return info.trackUrl || info.audioStreamUrl || null;
+};
 
-  const { audioStreamUrl, trackUrl } = currentInfo;
+export const decodeWaveformForTrack = async (
+  info: TrackAudioInfo,
+  signal?: AbortSignal
+): Promise<Float32Array | null> => {
+  const { audioStreamUrl, trackUrl } = info;
+  if (signal?.aborted) return null;
+
   logger(CPL.INFO, getString("INFO__WAVEFORM__DECODE_START", [trackUrl]));
 
   const audioContext = new AudioContext();
+  // close() rejects when the context is already closed — guard so abort + finally don't double-close.
+  let contextClosed = false;
+  const closeContext = async (): Promise<void> => {
+    if (contextClosed) return;
+    contextClosed = true;
+    try {
+      await audioContext.close();
+    } catch {
+      // Already closed (e.g. abort raced the finally block) — nothing to release.
+    }
+  };
+  // Aborting releases the AudioContext immediately, which also rejects a pending decodeAudioData.
+  const handleAbort = (): void => {
+    void closeContext();
+  };
+  signal?.addEventListener("abort", handleAbort, { once: true });
+
   try {
     const buffer = await fetchAudioViaBackground(audioStreamUrl);
+    if (signal?.aborted) return null;
+
     const audioBuffer = await audioContext.decodeAudioData(buffer);
+    if (signal?.aborted) return null;
+
     const samples = audioBuffer.getChannelData(0);
     const peaks = downsampleToPeaks(samples, PLUME_CONSTANTS.WAVEFORM_PEAK_COLUMNS);
 
@@ -76,6 +111,15 @@ export const decodeWaveformForCurrentTrack = async (): Promise<Float32Array | nu
     logger(CPL.WARN, getString("WARN__WAVEFORM__DECODE_FAILED", [trackUrl]), error);
     return null;
   } finally {
-    await audioContext.close();
+    signal?.removeEventListener("abort", handleAbort);
+    await closeContext();
   }
+};
+
+export const decodeWaveformForCurrentTrack = async (signal?: AbortSignal): Promise<Float32Array | null> => {
+  const currentInfo: TrackAudioInfo | null = resolveCurrentTrackAudioInfoFromPage();
+
+  if (!currentInfo?.audioStreamUrl) return null;
+
+  return decodeWaveformForTrack(currentInfo, signal);
 };
