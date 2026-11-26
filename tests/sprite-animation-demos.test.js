@@ -167,7 +167,8 @@ describe('sprite animation demo catalog', () => {
       }
     };
     walk(join(ROOT, start));
-    return { files: [...seen].map((f) => f.slice(ROOT.length + 1)), bare: [...bare] };
+    //Normalize to POSIX separators so the containment assertions match on Windows.
+    return { files: [...seen].map((f) => f.slice(ROOT.length + 1).replace(/\\/g, '/')), bare: [...bare] };
   }
 
   it('the demo stage import graph never reaches Ammo', () => {

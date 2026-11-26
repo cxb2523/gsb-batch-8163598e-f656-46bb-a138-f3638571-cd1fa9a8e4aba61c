@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 import { WALK_FRAMES, WALK_HAND_FRAMES } from '@engine/meshes/character-groups/group-walk';
 import { FLINCH_FRAMES } from '@engine/meshes/character-groups/group-flinch';
 
@@ -123,8 +124,9 @@ describe('character-groups UV mapping', () => {
   });
 
   describe('idle guards use State enum, not string literals', () => {
+    const testDir = path.dirname(fileURLToPath(import.meta.url));
     const groupDir = path.resolve(
-      new URL('.', import.meta.url).pathname,
+      testDir,
       '../three-isometric-engine/meshes/character-groups'
     );
     const groupFiles = fs.readdirSync(groupDir)

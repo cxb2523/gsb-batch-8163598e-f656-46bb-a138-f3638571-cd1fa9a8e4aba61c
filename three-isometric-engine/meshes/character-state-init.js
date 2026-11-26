@@ -24,6 +24,21 @@ export function createCharacterState({
     lastFrame: -1,
     state: state ?? State.FALLING,
     action: null,
+    //NOTE(jimmylee)
+    //Transient A1 action handles. `transition()` cancels these when a
+    //priority state is entered and the walk/jump drivers key frames off
+    //them. Locked to null/undefined here so no descriptor starts with a
+    //stale action a state switch would have to chase down.
+    _jumpAction: null,
+    _attackAction: null,
+    _castAction: null,
+    _landedAt: undefined,
+    //NOTE(jimmylee)
+    //Which render branch last drew the character ('walk', 'idle', 'jump',
+    //'land', 'stab', 'cast', 'priority'). The walk driver uses transitions
+    //into/out of 'walk' to rebase `walkStart` at the actual walk-entry time
+    //instead of resuming a stale cycle phase after a jump or hit.
+    lastPose: null,
   };
   if (extras) Object.assign(ch, extras);
   return ch;

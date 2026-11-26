@@ -19,6 +19,28 @@ import { registerCharacterMode, registerBlockType } from '@engine/common/registr
 const SEQ_FRAME_MAP = [2, 1, 0, 1, 2, 3, 4, 3];
 
 //NOTE(jimmylee)
+//Priority states (hit flinch / kneel / critical / dead) preempt walk, jump,
+//cast and stab rendering for the A1 composite. The specialized H/K/D groups
+//carry the wound/death art in the full scene; within the walk composite the
+//unit collapses to the full-body idle plane with both hands and every
+//exclusive overlay hidden, so no action tile can survive the switch.
+const PRIORITY_RENDER_STATES = new Set([
+  State.KNOCKBACK,
+  State.KNEELING,
+  State.CRITICALLY_HURT,
+  State.DEAD,
+]);
+
+//Render-branch markers stored on `ch.lastPose`.
+const POSE_PRIORITY = 'priority';
+const POSE_STAB = 'stab';
+const POSE_CAST = 'cast';
+const POSE_JUMP = 'jump';
+const POSE_LAND = 'land';
+const POSE_IDLE = 'idle';
+const POSE_WALK = 'walk';
+
+//NOTE(jimmylee)
 //Per-base-frame body heights (pixels) — dynamically derived from SPRITE_MAP.
 //All walk bodies (BF1-5/BB1-5) are 40px tall — no variable heights.
 const BASE_BODY_HEIGHTS = WALK_ASSEMBLY[0].body.map((b) => SPRITE_MAP[b.id].h);
@@ -393,10 +415,57 @@ export function createWalkGroup({ node, textures, direction, directionOffset, wa
     const idx = (ch.directionOffset + step) % 8;
 
     //NOTE(jimmylee)
+    //Priority states — hit (KNOCKBACK), kneel, critical injury, dead. These
+    //win over every action branch. `transition()` has normally already
+    //cancelled the action handles and hidden the exclusive overlays, but a
+    //caller that assigned `ch.state` directly is normalized here on entry
+    //too, so a jump/cast/stab overlay can never keep drawing after the state
+    //changes. The composite presents the single full-body plane: hands
+    //hidden, standard body scale, idle frame.
+    if (PRIORITY_RENDER_STATES.has(ch.state)) {
+      if (ch.lastPose !== POSE_PRIORITY) {
+        ch._jumpAction = null;
+        ch._attackAction = null;
+        ch._castAction = null;
+        ch._landedAt = undefined;
+        ch.lastStep = -1;
+        ch.lastFrame = -1;
+        ch.lastPose = POSE_PRIORITY;
+      }
+
+      const priorityBehind = this.parent.children[1];
+      const priorityFront = this.parent.children[2];
+      priorityBehind.visible = false;
+      priorityFront.visible = false;
+      priorityBehind.renderOrder = BEHIND;
+      priorityFront.renderOrder = IN_FRONT;
+      if (ch._stabHeadMesh) ch._stabHeadMesh.visible = false;
+      if (ch._castOverlayMesh) ch._castOverlayMesh.visible = false;
+
+      this.scale.y = 1;
+      placeIdleBody(this, idx, scaleX, scaleY);
+
+      if (step !== ch.lastStep || ch.lastFrame !== -1) {
+        ch.lastStep = step;
+        ch.lastFrame = -1;
+        const priorityIdleFrame = IDLE_FRAMES[idx];
+        applySpriteFrame(this.material.map, priorityIdleFrame.id, priorityIdleFrame.reversed);
+      }
+
+      this.parent.updateMatrixWorld(true);
+      return;
+    }
+
+    //NOTE(jimmylee)
     //Stab Lv3 animation for A1 — non-looping 9-frame sequence from STAB_LV3_ASSEMBLY.
     //4-tile full-body composition: farBehind + body + head + front.
     //Reuses behind/front overlays from walk group; head overlay created at A1 registration.
     if (ch._attackAction && ch.mode === 'A1') {
+      if (ch.lastPose !== POSE_STAB) {
+        ch.lastStep = -1;
+        ch.lastFrame = -1;
+      }
+      ch.lastPose = POSE_STAB;
       const stabElapsed = (camera.userData.now - ch._attackAction.startTime) / 1000;
       const { frameIdx } = resolveVariableFrame(STAB_LV3_DELAYS_S, stabElapsed);
 
@@ -453,6 +522,11 @@ export function createWalkGroup({ node, textures, direction, directionOffset, wa
     //Cast animation for A1 — 2-frame looping from CAST_ASSEMBLY.
     //Body shows CH1-CH4 with the SR17/SR18 legs strip behind it (SHP F35-F38 order).
     if (ch._castAction && ch.mode === 'A1') {
+      if (ch.lastPose !== POSE_CAST) {
+        ch.lastStep = -1;
+        ch.lastFrame = -1;
+      }
+      ch.lastPose = POSE_CAST;
       const castElapsed = (camera.userData.now - ch._castAction.startTime) / 1000;
       const frameIdx = Math.floor(castElapsed / CAST_FRAME_S) % CAST_FRAME_COUNT;
 
@@ -505,6 +579,16 @@ export function createWalkGroup({ node, textures, direction, directionOffset, wa
     //those fields, so a mode check would be redundant.
     const landFrame = !ch._jumpAction && ch._landedAt !== undefined && ch.walkStopped && ch.state === State.IDLE ? playerLandFrame((camera.userData.now - ch._landedAt) / 1000) : -1;
     if (ch._jumpAction || landFrame >= 0) {
+      //Jump and landing are distinct frame domains; invalidate the UV cache
+      //when entering either one (or switching jump → land) so the first frame
+      //of the new pose is always applied even if its index matches the old.
+      const jumpPose = ch._jumpAction ? POSE_JUMP : POSE_LAND;
+      if (ch.lastPose !== jumpPose) {
+        ch.lastStep = -1;
+        ch.lastFrame = -1;
+      }
+      ch.lastPose = jumpPose;
+
       this.parent.children[1].visible = true;
       this.parent.children[2].visible = true;
       if (ch._castOverlayMesh) ch._castOverlayMesh.visible = false;
@@ -565,6 +649,15 @@ export function createWalkGroup({ node, textures, direction, directionOffset, wa
     //or player character is standing still (walkStopped).
     //Show the full idle sprite (P1-P5) with hands hidden.
     if (ch.state === State.FALLING || ch.state === State.SPAWNING || ch.walkStopped) {
+      if (ch.lastPose !== POSE_IDLE) {
+        ch.lastStep = -1;
+        ch.lastFrame = -1;
+      }
+      ch.lastPose = POSE_IDLE;
+
+      //placeIdleBody also writes scale.y = 1; set it directly first so the
+      //reset holds even under test doubles that stub placeIdleBody.
+      this.scale.y = 1;
       placeIdleBody(this, idx, scaleX, scaleY);
       this.parent.children[1].visible = false;
       this.parent.children[2].visible = false;
@@ -585,6 +678,20 @@ export function createWalkGroup({ node, textures, direction, directionOffset, wa
     //NOTE(jimmylee)
     //Walk pose — hands visible, body at identity scale. Walk bodies (BF/BB) are
     //40px = MAX_CONTAINER_H, so WALK_BODY_SCALE_Y = 1 resolves once per group.
+
+    //NOTE(jimmylee)
+    //The walk clock is rooted at walk ENTRY. When the previous render drew a
+    //different pose (idle, jump/land, cast/stab or a priority state such as
+    //hit), the old walkStart belongs to the earlier walk segment — rebase it
+    //onto this frame's timestamp and invalidate the UV cache so recovery from
+    //a jump or hit starts at cycle frame 0 instead of a stale phase.
+    if (ch.lastPose !== POSE_WALK) {
+      if (Number.isFinite(camera.userData.now)) ch.walkStart = camera.userData.now;
+      ch.lastStep = -1;
+      ch.lastFrame = -1;
+    }
+    ch.lastPose = POSE_WALK;
+
     this.parent.children[1].visible = true;
     this.parent.children[2].visible = true;
     if (ch._stabHeadMesh) ch._stabHeadMesh.visible = false;
