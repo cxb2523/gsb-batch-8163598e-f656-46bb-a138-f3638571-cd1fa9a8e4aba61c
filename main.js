@@ -41,6 +41,14 @@ let activeRelaySkinContext = null;
 let relayLiveSyncEnabled = Boolean(relayLiveSyncToggle ? relayLiveSyncToggle.checked : true);
 let relayTextureDirty = false;
 let isApplyingRemoteSync = false;
+let remoteSyncDepth = 0;
+// Monotonically increasing player-session generation. Every skin request /
+// player switch / disconnect bumps it; stale skin responses captured under an
+// older generation are discarded wholesale.
+let activeSkinSessionSeq = 0;
+// Serializes skin-response application so a slow in-flight render can never
+// interleave with a newer player's render.
+let skinSessionQueue = Promise.resolve();
 let liveBoneSyncTimer = null;
 let liveSkinApplyTimer = null;
 let lastBoneSyncSentAt = 0;
@@ -1372,6 +1380,9 @@ function main() {
 
     function requestPlayerSkin(player) {
         if (!player || !player.online) return;
+        // Every selection invalidates in-flight responses and pending live-sync
+        // work from the previously selected player.
+        beginNewSkinSession();
         selectedRelayPlayerKey = getRelayPlayerKey(player);
         setRelayPlayersInfo(relayPlayersSnapshot);
         const ok = sendRelayMessage("player.skin.request", {
@@ -1426,6 +1437,75 @@ function main() {
             activeRelaySkinContext?.geometryName ||
             "geometry.humanoid.custom"
         );
+    }
+
+    function beginRemoteSync() {
+        remoteSyncDepth += 1;
+        isApplyingRemoteSync = true;
+    }
+
+    function endRemoteSync() {
+        if (remoteSyncDepth > 0) {
+            remoteSyncDepth -= 1;
+        }
+        if (remoteSyncDepth === 0) {
+            isApplyingRemoteSync = false;
+        }
+    }
+
+    // Tear down every artifact of the previous player session so delayed
+    // timers/messages from the old player can never reach the new one.
+    function resetPlayerSessionState() {
+        if (liveBoneSyncTimer) {
+            clearTimeout(liveBoneSyncTimer);
+            liveBoneSyncTimer = null;
+        }
+        if (liveSkinApplyTimer) {
+            clearTimeout(liveSkinApplyTimer);
+            liveSkinApplyTimer = null;
+        }
+        pendingBoneSyncNames.clear();
+        pendingFullSkinSync = false;
+        lastTransformFingerprint = "";
+    }
+
+    // Start a new player session: invalidate all in-flight skin responses and
+    // clear pending live-sync work belonging to the previous session.
+    function beginNewSkinSession() {
+        activeSkinSessionSeq += 1;
+        resetPlayerSessionState();
+        return activeSkinSessionSeq;
+    }
+
+    function isSkinSessionCurrent(sessionSeq) {
+        return Number.isInteger(sessionSeq) && sessionSeq === activeSkinSessionSeq;
+    }
+
+    // Run a skin-response job through a serial queue, capturing the session
+    // generation (and optionally the selected player key) at enqueue time.
+    // Stale jobs bail out before touching any model/texture/highlight/context
+    // state. Callers pass the seq they captured synchronously at dispatch so
+    // two responses handled back-to-back keep their distinct sessions even
+    // though the actual render runs later on the queue.
+    function enqueueSkinSessionJob(label, job, expectedPlayerKey = null, capturedSessionSeq = activeSkinSessionSeq) {
+        const sessionSeq = capturedSessionSeq;
+        const expectedKey = expectedPlayerKey !== null ? expectedPlayerKey : selectedRelayPlayerKey;
+        const run = skinSessionQueue.then(() => {
+            const seqStale = !isSkinSessionCurrent(sessionSeq);
+            const playerChanged = expectedKey !== "" && expectedKey !== selectedRelayPlayerKey;
+            if (seqStale || playerChanged) {
+                console.log(
+                    `[Bedrock3DLab Relay] Stale skin session discarded (${label}, seq=${sessionSeq}, current=${activeSkinSessionSeq}, expectedKey=${expectedKey}, currentKey=${selectedRelayPlayerKey}).`
+                );
+                return;
+            }
+            return job(sessionSeq);
+        });
+        // Keep the chain alive regardless of individual job failures.
+        skinSessionQueue = run.catch((error) => {
+            console.error(`[Bedrock3DLab Relay] Skin session job failed (${label}):`, error);
+        });
+        return run;
     }
 
     function canLiveSyncToRelay() {
@@ -1516,11 +1596,11 @@ function main() {
     }
 
     function applyRemoteBoneTransforms(bones) {
-        isApplyingRemoteSync = true;
+        beginRemoteSync();
         try {
             applyBoneTransformsToScene(bones, true);
         } finally {
-            isApplyingRemoteSync = false;
+            endRemoteSync();
         }
     }
 
@@ -1856,6 +1936,9 @@ function main() {
         clearRelayPayloadInfo();
         clearRelayPlayersInfo();
         relayPluginOnline = false;
+        // New socket = new player session: invalidate in-flight skin responses
+        // and any queued live-sync work from the previous connection.
+        beginNewSkinSession();
         bedrock3dRelaySocket = new WebSocket(wsUrl);
         setRelayStatus("connecting...");
         if (relayConnectBtn) relayConnectBtn.disabled = true;
@@ -1865,7 +1948,13 @@ function main() {
             setRelayStatus("connected");
             updateRelayActionButtons();
         });
-        bedrock3dRelaySocket.addEventListener("message", handleBedrock3DRelayMessage);
+        bedrock3dRelaySocket.addEventListener("message", (event) => {
+            // Capture the active player session synchronously, the instant the
+            // frame arrives. The handler body is async, so reading the seq inside
+            // it would race with player switches that happen between frames.
+            const dispatchSessionSeq = activeSkinSessionSeq;
+            return handleBedrock3DRelayMessage(event, dispatchSessionSeq);
+        });
         bedrock3dRelaySocket.addEventListener("error", () => {
             setRelayStatus("error, check console");
             console.error("[Bedrock3DLab Relay] WebSocket error");
@@ -1873,14 +1962,10 @@ function main() {
         bedrock3dRelaySocket.addEventListener("close", (event) => {
             relayPluginOnline = false;
             relayClientId = null;
-            if (liveBoneSyncTimer) {
-                clearTimeout(liveBoneSyncTimer);
-                liveBoneSyncTimer = null;
-            }
-            if (liveSkinApplyTimer) {
-                clearTimeout(liveSkinApplyTimer);
-                liveSkinApplyTimer = null;
-            }
+            // Invalidate every pending player session and clear its timers,
+            // pending bone sets and full-sync flags so nothing from the old
+            // connection can be sent once a new one opens.
+            beginNewSkinSession();
             setRelayPeersCount(1);
             const reasonText = event?.reason ? ` (${event.reason})` : "";
             setRelayStatus(`disconnected${reasonText}`);
@@ -1899,9 +1984,18 @@ function main() {
         bedrock3dRelaySocket.close();
     }
 
-    async function handlePlayerSkinResponseFromRelay(message, options = {}) {
+    async function handlePlayerSkinResponseFromRelay(message, options = {}, sessionSeq = activeSkinSessionSeq) {
+        // Stale session (player switched / socket disconnected while the
+        // response was in flight): drop the whole payload without touching the
+        // model, texture, player highlight or activeRelaySkinContext.
+        if (!isSkinSessionCurrent(sessionSeq)) {
+            console.log(
+                `[Bedrock3DLab Relay] Stale skin response ignored (seq=${sessionSeq}, current=${activeSkinSessionSeq}).`
+            );
+            return;
+        }
         const data = message.data || {};
-        isApplyingRemoteSync = true;
+        beginRemoteSync();
         try {
             if (!data.skinData) {
                 throw new Error("player.skin.response tidak punya skinData.");
@@ -1912,6 +2006,14 @@ function main() {
             const decodedTexture = skinDataBase64ToPngDataUrl(data.skinData);
             const decodedTextureDataUrl = decodedTexture.dataUrl;
             const { geometryJson, usedFallback } = await loadGeometryJsonForSkinResponse(data);
+            // Re-check after the async geometry fetch: the player may have
+            // been switched while the default geometry was loading.
+            if (!isSkinSessionCurrent(sessionSeq)) {
+                console.log(
+                    `[Bedrock3DLab Relay] Stale skin response discarded after geometry load (seq=${sessionSeq}).`
+                );
+                return;
+            }
             const geometries = geometryJson["minecraft:geometry"];
             const selectedGeometryIndex = findGeometryIndexForSkinResponse(
                 geometries,
@@ -1925,6 +2027,14 @@ function main() {
             const geometryLabel = usedFallback
                 ? `${selectedGeometryIdentifier} fallback`
                 : selectedGeometryIdentifier;
+            // Final gate before any state mutation / scene rebuild. A stale
+            // render must never replace the current player's model or texture.
+            if (!isSkinSessionCurrent(sessionSeq)) {
+                console.log(
+                    `[Bedrock3DLab Relay] Stale skin response discarded before render (seq=${sessionSeq}).`
+                );
+                return;
+            }
             modelData = geometryJson;
             textureDataURL = decodedTextureDataUrl;
             loadedJsonFileName = data.geometryName
@@ -1947,6 +2057,14 @@ function main() {
                 geometrySelector.value = String(selectedGeometryIndex);
             }
             await loadAndRender(selectedGeometry, textureDataURL, selectedGeometryIndex, options);
+            // loadAndRender awaits texture loading and a macrotask; verify the
+            // session is still the active one before writing results back.
+            if (!isSkinSessionCurrent(sessionSeq)) {
+                console.log(
+                    `[Bedrock3DLab Relay] Stale skin response discarded after render (seq=${sessionSeq}).`
+                );
+                return;
+            }
             if (Array.isArray(data.bones) && data.bones.length > 0) {
                 applyBoneTransformsToScene(data.bones, true);
             }
@@ -1990,10 +2108,12 @@ function main() {
                 selectedGeometryIndex,
             });
         } catch (error) {
-            setRelayStatus(`failed to render PMMP skin: ${error?.message || "unknown error"}`);
+            if (isSkinSessionCurrent(sessionSeq)) {
+                setRelayStatus(`failed to render PMMP skin: ${error?.message || "unknown error"}`);
+            }
             console.error("[Bedrock3DLab Relay] Failed to render PMMP skin:", error);
         } finally {
-            isApplyingRemoteSync = false;
+            endRemoteSync();
         }
     }
 
@@ -2005,7 +2125,7 @@ function main() {
         setRelayStatus(`live synced (${data.playerName || activeRelaySkinContext.playerName || "player"})`);
     }
 
-    async function handleRemoteSkinApply(data) {
+    async function handleRemoteSkinApply(data, enqueuedPlayerKey = null, enqueuedSessionSeq = activeSkinSessionSeq) {
         if (!activeRelaySkinContext || !isSameRelayPlayer(activeRelaySkinContext, data)) {
             return;
         }
@@ -2032,12 +2152,26 @@ function main() {
                     bones: Array.isArray(data.bones) ? data.bones : [],
                 },
             };
-            await handlePlayerSkinResponseFromRelay(syntheticMessage, {
-                preserveCamera: true,
-                preservePanels: true,
-                preserveSelection: true,
-                remoteSync: true,
-            });
+            // Enqueue behind any in-flight skin response and pin the current
+            // session seq. Local change reporting stays suppressed for the
+            // whole reload (beginRemoteSync inside the handler), so the
+            // server-pushed bones are never echoed back as a user edit.
+            await enqueueSkinSessionJob(
+                "remote skin apply",
+                (sessionSeq) =>
+                    handlePlayerSkinResponseFromRelay(
+                        syntheticMessage,
+                        {
+                            preserveCamera: true,
+                            preservePanels: true,
+                            preserveSelection: true,
+                            remoteSync: true,
+                        },
+                        sessionSeq
+                    ),
+                enqueuedPlayerKey,
+                enqueuedSessionSeq
+            );
             return;
         }
         if (Array.isArray(data.bones)) {
@@ -2056,7 +2190,7 @@ function main() {
         setRelayStatus(`live synced (${data.playerName || activeRelaySkinContext.playerName || "player"})`);
     }
 
-    async function handleBedrock3DRelayMessage(event) {
+    async function handleBedrock3DRelayMessage(event, dispatchSessionSeq = activeSkinSessionSeq) {
         let envelope;
         try {
             envelope = JSON.parse(event.data);
@@ -2116,7 +2250,16 @@ function main() {
                 return;
             }
             if (peerMessage.type === "player.skin.apply") {
-                await handleRemoteSkinApply(peerMessage.data || {});
+                const applyData = peerMessage.data || {};
+                const applyPlayerKey = getRelayPlayerKey({
+                    name: applyData.playerName || "",
+                    uuid: applyData.playerUuid || "",
+                });
+                // Use the session generation captured synchronously when the
+                // frame arrived, so a player switch during processing cannot make
+                // this reload masquerade as the newer session.
+                const applySessionSeq = dispatchSessionSeq;
+                await handleRemoteSkinApply(applyData, applyPlayerKey, applySessionSeq);
             }
             return;
         }
@@ -2146,21 +2289,48 @@ function main() {
             if (targetClientId && relayClientId && targetClientId !== relayClientId) {
                 return;
             }
+            // Use the session generation captured synchronously when the frame
+            // arrived so the queued job can never be confused with a newer
+            // player selection that happens while it waits in the queue.
+            const responseSessionSeq = dispatchSessionSeq;
             if (message.data?.syncMode === "revert") {
                 if (!activeRelaySkinContext || !isSameRelayPlayer(activeRelaySkinContext, message.data || {})) {
                     return;
                 }
                 console.log("[Bedrock3DLab Relay] Revert skin sync received:", message.data);
-                await handlePlayerSkinResponseFromRelay(message, {
-                    preserveCamera: true,
-                    preservePanels: true,
-                    preserveSelection: true,
-                    remoteSync: true,
+                const revertPlayerKey = getRelayPlayerKey({
+                    name: message.data?.playerName || "",
+                    uuid: message.data?.playerUuid || "",
                 });
+                await enqueueSkinSessionJob(
+                    "revert sync",
+                    (sessionSeq) =>
+                        handlePlayerSkinResponseFromRelay(
+                            message,
+                            {
+                                preserveCamera: true,
+                                preservePanels: true,
+                                preserveSelection: true,
+                                remoteSync: true,
+                            },
+                            sessionSeq
+                        ),
+                    revertPlayerKey,
+                    responseSessionSeq
+                );
                 return;
             }
             console.log("[Bedrock3DLab Relay] Skin response received:", message.data);
-            await handlePlayerSkinResponseFromRelay(message);
+            const responsePlayerKey = getRelayPlayerKey({
+                name: message.data?.playerName || "",
+                uuid: message.data?.playerUuid || "",
+            });
+            await enqueueSkinSessionJob(
+                "player skin response",
+                (sessionSeq) => handlePlayerSkinResponseFromRelay(message, {}, sessionSeq),
+                responsePlayerKey,
+                responseSessionSeq
+            );
             return;
         }
         if (message.type === "player.skin.apply.result") {
