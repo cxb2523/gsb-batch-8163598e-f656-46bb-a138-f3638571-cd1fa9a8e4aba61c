@@ -192,22 +192,28 @@ export const useCreateScene = () => {
         for (const measure of measureGroup) {
           const object = await loader.loadAsync(ENDPOINT + measure.objectPath).catch((error) => {
             console.log(error);
-            dispatch(dispatchError("Error loading files"));
+            dispatch(dispatchError(`Error loading the file of ${measure.objectName}`));
           });
-          groupMeasure.add(object);
+          // If the file is missing shows an error but keeps loading the other objects
+          if (object) groupMeasure.add(object);
         }
 
         // set the points with the position of the point objects of the measure
-        point1 = groupMeasure.children.filter((item) => item.name.includes("start"))[0].position;
-        point2 = groupMeasure.children.filter((item) => item.name.includes("end"))[0].position;
+        const startPoint = groupMeasure.children.filter((item) => item.name.includes("start"))[0];
+        const endPoint = groupMeasure.children.filter((item) => item.name.includes("end"))[0];
 
-        const distance = point1.distanceTo(point2).toFixed(2);
+        if (startPoint && endPoint) {
+          point1 = startPoint.position;
+          point2 = endPoint.position;
 
-        // create the label with the distance
-        for (const mesh of groupMeasure.children) {
-          if (mesh.type === "LineSegments") {
-            mesh.children = [];
-            createLabelMeasure(mesh, distance, measureCounter, point1, point2);
+          const distance = point1.distanceTo(point2).toFixed(2);
+
+          // create the label with the distance
+          for (const mesh of groupMeasure.children) {
+            if (mesh.type === "LineSegments") {
+              mesh.children = [];
+              createLabelMeasure(mesh, distance, measureCounter, point1, point2);
+            }
           }
         }
       }
@@ -218,10 +224,13 @@ export const useCreateScene = () => {
       if (!object.objectName.startsWith("Measure")) {
         const mesh = await loader.loadAsync(ENDPOINT + object.objectPath).catch((error) => {
           console.log(error);
-          dispatch(dispatchError("Error loading files"));
+          dispatch(dispatchError(`Error loading the file of ${object.objectName}`));
         });
 
-        if (mesh && mesh.name.startsWith("Group")) {
+        // If the file is missing shows an error but keeps loading the other objects
+        if (!mesh) continue;
+
+        if (mesh.name.startsWith("Group")) {
           // add bounding box for paint function
           mesh.geometry.computeBoundingBox();
           mesh.geometry.computeBoundsTree();

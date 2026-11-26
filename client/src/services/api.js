@@ -139,6 +139,18 @@ export const getOffsetMesh = async (data, offset) => {
   }
 };
 
+/**
+ * Applies the offset to the source object and persists the offset mesh on the server.
+ * The offset object is associated to the source object: applying the offset again
+ * replaces the previous offset object, an offset value of 1 removes it (undo).
+ * @param {String} projectId The id of the project
+ * @param {Object} offsetData The offset request (sourceObjectId, sourceName, offset, data)
+ * @returns The persisted offset object with the computed mesh
+ */
+export const saveOffsetObject = async (projectId, offsetData) => {
+  return await axios.post(`/offset/${projectId}`, offsetData);
+};
+
 export const deleteComment = async (commentId) => {
   try {
     const res = await axios({

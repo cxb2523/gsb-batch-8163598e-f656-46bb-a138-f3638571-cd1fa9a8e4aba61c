@@ -56,6 +56,47 @@ class ObjectsController {
   static deleteObject(id) {
     return ObjectsModel.query().deleteById(id);
   }
+
+  /**
+   * Gets the offset object associated to a source object of a project
+   * @param {String} projectId The id of the project
+   * @param {String} sourceObjectId The id of the source object the offset was generated from
+   * @returns The offset object or undefined
+   */
+  static getOffsetBySourceId(projectId, sourceObjectId) {
+    return ObjectsModel.query().findOne("objects.project_id", projectId).where("objects.source_object_id", sourceObjectId);
+  }
+
+  /**
+   * Saves the offset object in the db keeping the association with the source object
+   * @param {String} objectId The id of the offset object
+   * @param {String} objectName The name of the offset object
+   * @param {String} projectId The id of the project
+   * @param {String} filepath The path of the offset file
+   * @param {String} sourceObjectId The id of the source object
+   * @param {Number} offsetValue The offset value used to generate the mesh
+   * @returns The object inserted
+   */
+  static saveOffsetObject(objectId, objectName, projectId, filepath, sourceObjectId, offsetValue) {
+    return ObjectsModel.query().insert({
+      id: objectId,
+      project_id: projectId,
+      object_name: objectName,
+      object_path: filepath,
+      source_object_id: sourceObjectId,
+      offset_value: offsetValue,
+    });
+  }
+
+  /**
+   * Updates the offset value of an existing offset object
+   * @param {String} id The id of the offset object
+   * @param {Number} offsetValue The new offset value
+   * @returns The updated object
+   */
+  static updateOffsetObject(id, offsetValue) {
+    return ObjectsModel.query().patchAndFetchById(id, { offset_value: offsetValue });
+  }
 }
 
 module.exports = { ObjectsController };

@@ -89,6 +89,23 @@ export const addColorToClippedMesh = (scene, group, positionVector, planesNegate
 };
 
 /**
+ * Applies the clipping planes to the offset meshes of the scene, so the offset
+ * objects are cut by the same clipping planes of their source meshes.
+ * Pass an empty array to restore the full view of the offset meshes.
+ * @param {THREE.Scene} scene The scene with the offset meshes
+ * @param {Array} planes The clipping planes to set, empty array to restore
+ * @param {Boolean} clipIntersection The value of the clipIntersection property
+ */
+export const setClippingPlanesToOffsets = (scene, planes, clipIntersection = false) => {
+  scene.children
+    .filter((object) => object.name.startsWith("Offset "))
+    .forEach((object) => {
+      object.material.clippingPlanes = planes;
+      object.material.clipIntersection = clipIntersection;
+    });
+};
+
+/**
  * Creates the colored planes for the clipping
  * @param {Array} planes The list of planes used for the clipping
  * @param {THREE.Plane} plane Plane to create

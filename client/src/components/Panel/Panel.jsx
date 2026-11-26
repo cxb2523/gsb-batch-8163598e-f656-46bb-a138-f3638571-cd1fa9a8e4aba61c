@@ -124,6 +124,12 @@ export default function Panel({ type }) {
         }
       }
 
+      // the offset object associated to the mesh is removed with the mesh
+      if (offset.length > 0) {
+        const offsetObject = objects.find((item) => item.id === offset[0].uuid);
+        offsetObject !== undefined && dispatch(addObjectToRemove(offsetObject));
+      }
+
       const object = objects.find((item) => item.id === id);
       object !== undefined && dispatch(addObjectToRemove(object));
     }

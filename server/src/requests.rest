@@ -86,3 +86,26 @@ GET http://localhost:3000/api/objects/4f40ccd1-4161-4861-9c99-0bbb2a0bba8b
 
 ###
 DELETE http://localhost:3000/api/object/821DBDF7-9EDF-49FF-A642-
+### OFFSET
+
+# Computes the offset mesh without persisting it
+POST http://localhost:3000/api/offset
+Content-Type: application/json
+
+{
+  "data": "solid cube ... endsolid cube",
+  "offset": 2
+}
+
+###
+# Applies the offset and persists the offset object on the project.
+# Re-applying replaces the previous offset object, offset = 1 removes it (undo).
+POST http://localhost:3000/api/offset/4f40ccd1-4161-4861-9c99-0bbb2a0bba8b
+Content-Type: application/json
+
+{
+  "sourceObjectId": "821DBDF7-9EDF-49FF-A642-3E3B5F5ED6F4",
+  "sourceName": "GroupCube",
+  "offset": 2,
+  "data": "solid cube ... endsolid cube"
+}

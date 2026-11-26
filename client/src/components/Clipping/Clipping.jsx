@@ -3,7 +3,7 @@ import { useSelector } from "react-redux";
 import * as THREE from "three";
 import clipping from "../../assets/images/icons/white/cut-solid.svg";
 import { getGroup, getPositionVector, getScene, getSceneModified } from "../../features/scene/sceneSlice";
-import { addColorToClippedMesh } from "../../utils/functions/clippingObject";
+import { addColorToClippedMesh, setClippingPlanesToOffsets } from "../../utils/functions/clippingObject";
 import Button from "../atoms/Button/Button";
 import { Checkbox } from "../atoms/Checkbox/Checkbox";
 
@@ -40,6 +40,9 @@ export default function Clipping() {
         object.material.clipIntersection = false;
       });
 
+      // The offset meshes follow the source meshes and are cut by the same planes
+      setClippingPlanesToOffsets(scene, createdPlanes, false);
+
       // Saves the planes in another array to use it in the handleNegate function
       const planesOriginal = createdPlanes.map((item) => item.clone());
 
@@ -58,6 +61,9 @@ export default function Clipping() {
       group.children.map((mesh) => {
         mesh.material.clippingPlanes = [];
       });
+
+      // Restores the full view of the offset meshes
+      setClippingPlanesToOffsets(scene, []);
     }
 
     setClipped((prev) => !prev);
@@ -158,6 +164,8 @@ export default function Clipping() {
       group.children.map((object) => {
         object.material.clipIntersection = true;
       });
+
+      setClippingPlanesToOffsets(scene, planes, true);
     } else {
       planes.forEach((item) => item.negate());
 
@@ -167,6 +175,8 @@ export default function Clipping() {
       group.children.map((object) => {
         object.material.clipIntersection = false;
       });
+
+      setClippingPlanesToOffsets(scene, planesOriginal, false);
     }
   };
 

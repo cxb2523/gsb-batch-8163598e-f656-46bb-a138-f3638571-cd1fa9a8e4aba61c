@@ -7,7 +7,7 @@ import { getGroup, getPositionVector, getScene, getSelectedMesh, setSelectedMesh
 import ChangeColor from "../ChangeColor/ChangeColor";
 import Modal from "../Modal/Modal";
 import Offset from "../Offset/Offset";
-import { addColorToClippedMesh } from "../../utils/functions/clippingObject";
+import { addColorToClippedMesh, setClippingPlanesToOffsets } from "../../utils/functions/clippingObject";
 import { findById } from "../../utils/common-utils";
 import PanelObjectInfo from "../Panel/PanelObjectInfo/PanelObjectInfo";
 import ScaleScrew from "../ScaleScrew/ScaleScrew";
@@ -121,6 +121,9 @@ export default function PanelItem({ uuid, type, name, deleteClick, meshSelected 
       let planes = [plane];
 
       addColorToClippedMesh(scene, group, positionVector, planes, planes);
+
+      // The offset meshes follow the source meshes and are cut by the same plane
+      setClippingPlanesToOffsets(scene, planes);
     } else {
       scene.children
         .filter((object) => object.name.startsWith("Clipping"))
@@ -131,6 +134,9 @@ export default function PanelItem({ uuid, type, name, deleteClick, meshSelected 
       group.children.map((mesh) => {
         mesh.material.clippingPlanes = [];
       });
+
+      // Restores the full view of the offset meshes
+      setClippingPlanesToOffsets(scene, []);
     }
   };
 

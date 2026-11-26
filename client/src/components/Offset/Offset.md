@@ -6,18 +6,22 @@
 2. The button opens an input and a button
 3. The user chooses the offset to add to the mesh
 4. The user clicks the button
-5. The system applies the offset to the mesh
+5. The system applies the offset to the mesh and saves it on the project
 
 ### How offset works
 
-When the user chooses the mesh, the system takes the uuid the selected mesh and searches the mesh object in the scene object through the function findById. When the system returns the selected mesh object, the system takes the offset that the user has selected and then checks if it is the first time the offset is applied to the mesh. If it is then the system creates a new mesh cloning the geometry and the material of the selected mesh.
+When the user chooses the mesh, the system takes the uuid of the selected mesh and searches the mesh object in the scene object through the function findById. When the user applies the offset, the source mesh is exported as an ascii STL file and sent to the server (`POST /api/offset/:projectId`) together with the offset value and the id of the source mesh.
 
-It was decided to use the following code `const newMesh = new THREE.Mesh(meshToOffset.geometry.clone(), meshToOffset.material.clone());` instead of `const newMesh = meshToOffset.clone()`, because the last command create a new mesh with references to the cloned mesh. It is problem because when we apply updates on the new mesh them are replied on the original one.
+The server computes the offset mesh from the STL data: for every vertex it sums the normals of all the faces that share the vertex, normalizes the result and moves the vertex along it by the offset value. A positive offset expands the mesh, a negative offset shrinks it.
 
-To offset a mesh the system applies a scale method to the mesh. To do that the system has to take the center of the original mesh and applies it to the new mesh and set a new position based on the center of the mesh. Then it sets the offset to the scale of the mesh. At the end the system adds the mesh to the scene.
+The offset mesh is persisted as a standalone object of the project: the server saves a THREE.ObjectLoader compatible JSON file in the uploads folder of the project and a row in the `objects` table (reusing the `objectPath`/`objectName` structure). The row keeps the association with the source mesh through the `source_object_id` column and stores the applied value in `offset_value`, so the offset object is saved, shared and exported like every other object of the project and is restored when the project is loaded.
 
-It was decided to change the opacity and transparency of the mesh to render the new mesh more readable.
+The offset object is linked to its source mesh:
 
-If in the scene is already present a mesh with the offset and if the user wants to change the offset of this mesh, the system, without creating a new mesh, will apply the same algorithm as above on the existing mesh.
+- applying the offset again on the same mesh **replaces** the previous offset object (the id is kept, the file is overwritten) instead of stacking a new one
+- an offset value equal to **1** removes (undoes) the offset object: the row and the file are deleted and the offset mesh is removed from the scene
+- deleting the source mesh deletes its offset object as well
 
-If the user chooses an offset equal 1, the mesh, if presents, it is removed
+When the clipping is enabled, the offset mesh is cut by the same clipping planes of its source mesh; when the clipping is disabled the offset mesh is shown again in its full form.
+
+If the file of an offset object is missing when the project is loaded, an error is shown but the loading of the other objects continues.
