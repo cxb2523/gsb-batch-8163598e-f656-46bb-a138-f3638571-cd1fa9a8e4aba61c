@@ -95,7 +95,10 @@ export function regressionScreenLines(
   const bars = barsBetween(coords.bars(), t0, t1);
   const src = d.style.regressionSource ?? "close";
   const fit = linregress(bars.map((b) => sourcePrice(b, src)));
-  if (!fit) return null;
+  // A symbol / interval switch can leave the drawing's range without a single
+  // bar: degrade to the stored screen segment instead of indexing the empty
+  // array (the hit test and the scene share this fallback).
+  if (!fit || bars.length === 0) return null;
   const n = bars.length;
   const yFit0 = fit.b;
   const yFit1 = fit.b + fit.m * (n - 1);

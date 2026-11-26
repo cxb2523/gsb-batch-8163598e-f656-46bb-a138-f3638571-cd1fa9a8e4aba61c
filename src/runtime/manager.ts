@@ -33,6 +33,7 @@ import { anchorCursor, applyDrag, type DragState } from "../core/interact/drag";
 import { toggleAnchored as toggleAnchoredDrawing } from "../core/interact/anchor";
 import { makeCoords } from "./coords";
 import { drawScene } from "./scene-canvas";
+import { PriceLineRegistry, type PriceLineLabel } from "./price-lines";
 
 export type MagnetMode = "off" | "weak" | "strong";
 
@@ -89,6 +90,15 @@ export type DrawingManagerOptions = {
    *  stays held (no pan, no pinch) until every finger has lifted, so the pinch that cancelled does not also zoom.
    *  The same applies to a second finger during a drag. true = the chart gets pan and pinch back at once (0.11.0). */
   secondFingerPinch?: boolean;
+  /** Draw the drawings' price-axis labels with series price lines (one handle
+   *  per visible label, reconciled every frame) instead of the primitive axis
+   *  views. The handles are created through `Coords.addPriceLine` and released
+   *  the moment their label goes away (a zoom that drops it off the scale, a
+   *  hidden / deleted / cleared drawing, `destroy()`), so repeated viewport
+   *  changes never stack or leak them. Default false (primitive axis views,
+   *  which carry the same labels). Turn it on when the host needs real
+   *  price-line handles (e.g. to keep the labels with a custom price scale). */
+  priceLineLabels?: boolean;
 };
 
 export type DrawingManagerEvents = {
@@ -135,6 +145,9 @@ export class DrawingManager {
   private readonly opts: DrawingManagerOptions;
   private readonly coords: Coords;
   private readonly primitive: DrawingsPrimitive;
+  /** Handles of the price-line axis labels (only with priceLineLabels),
+   *  reconciled on every chart update so they track the current viewport. */
+  private readonly priceLines: PriceLineRegistry;
   private readonly el: HTMLElement;
   private readonly listeners: Listeners = { change: new Set(), add: new Set(), update: new Set(), remove: new Set(), selection: new Set(), tool: new Set(), visibility: new Set(), textEdit: new Set(), gestureEnd: new Set(), tableEdit: new Set() };
   private list: Drawing[] = [];
@@ -142,6 +155,11 @@ export class DrawingManager {
   /** TV "Hide all drawings": off = nothing is drawn or hit (not saved). */
   private visible = true;
   private hovered: { id: string; anchor: number } | null = null;
+  /** Last pointer position in pane coords and its kind, so a viewport change
+   *  can re-run the hover hit test on the re-projected scenes. */
+  private lastPointer: Pt | null = null;
+  private lastPointerTouch = false;
+  private lastPointerTouchLike = false;
   private spec: OverlaySpec | null = null;
   private glyph: string | undefined;
   private pending: DataPoint[] = [];
@@ -184,13 +202,19 @@ export class DrawingManager {
     const bars = opts.bars ?? (() => seriesBars(series));
     this.coords = makeCoords(chart, series, bars, () => [], opts.timeInfo);
     if (opts.formatLabel) this.coords.formatLabel = opts.formatLabel;
+    this.priceLines = new PriceLineRegistry(this.coords);
     this.primitive = new DrawingsPrimitive(this);
     series.attachPrimitive(this.primitive as ISeriesPrimitive<Time>);
     this.el = chart.chartElement();
     this.listen(this.el, "pointerdown", (e) => this.onPointerDown(e as PointerEvent), true);
     this.listen(this.el, "pointermove", (e) => this.onHover(e as PointerEvent));
-    this.listen(this.el, "pointerleave", () => { this.hoverCursor = null; this.setHover(null); });
+    this.listen(this.el, "pointerleave", () => { this.hoverCursor = null; this.lastPointer = null; this.setHover(null); });
     this.listen(this.el, "dblclick", (e) => this.onDoubleClick(e as MouseEvent), true);
+    // The chart pans / zooms without a pointer event reaching the manager, so
+    // the hovered drawing (screen-space state) can stay anchored to a pixel the
+    // drawing has since left. Re-validate the hover against the new projection
+    // on every viewport change instead of waiting for the next pointer move.
+    this.subscribeViewport();
     if (opts.keyboard !== false) {
       this.listen(window, "keydown", (e) => this.onKey(e as KeyboardEvent));
       this.listen(window, "keyup", (e) => this.onKey(e as KeyboardEvent));
@@ -445,6 +469,7 @@ export class DrawingManager {
   destroy(): void {
     this.endGesture();
     this.releaseChart(true);
+    this.priceLines.clear();
     for (const f of [...this.gestureOff]) f();
     for (const f of this.off) f();
     this.series.detachPrimitive(this.primitive as ISeriesPrimitive<Time>);
@@ -479,27 +504,45 @@ export class DrawingManager {
   }
   /** Axis labels of the visible drawings (core drawingAxisLabels) as
    *  lightweight-charts axis views: prices formatted by the series, times by
-   *  the chart's time formatter. */
+   *  the chart's time formatter. Recomputed from the current projection on
+   *  every chart update, so a pan / zoom / data reload can never leave a label
+   *  on an old viewport. With `priceLineLabels`, the price labels are carried
+   *  by reconciled series price lines instead and are excluded here (the time
+   *  labels stay axis views), so each label appears exactly once. */
   axisViews(): { price: ISeriesPrimitiveAxisView[]; time: ISeriesPrimitiveAxisView[] } {
     const price: ISeriesPrimitiveAxisView[] = [];
     const time: ISeriesPrimitiveAxisView[] = [];
+    const lineLabels: PriceLineLabel[] = [];
     const c = this.coords;
     const pane = this.paneSize();
     const fmt = this.series.priceFormatter();
     for (const d of this.list) {
       if (!this.shown(d)) continue;
-      const pts = screenPoints(c, d, pane);
-      if (!pts) continue;
-      const l = drawingAxisLabels(d, pts, c);
-      for (const p of l.price) {
-        const y = c.priceToY(p.price);
-        if (y != null) price.push(axisView(y, fmt.format(p.price), p.back, p.color));
-      }
-      for (const t of l.time) {
-        const x = c.timeToX(t.time);
-        if (x != null) time.push(axisView(x, c.formatTime(t.time), t.back, t.color));
+      try {
+        const pts = screenPoints(c, d, pane);
+        if (!pts) continue;
+        const l = drawingAxisLabels(d, pts, c);
+        l.price.forEach((p, role) => {
+          const y = c.priceToY(p.price);
+          if (y == null) return;
+          if (this.opts.priceLineLabels) {
+            lineLabels.push({ key: `${d.id}:${role}`, price: p.price, back: p.back, color: p.color });
+          } else {
+            price.push(axisView(y, fmt.format(p.price), p.back, p.color));
+          }
+        });
+        for (const t of l.time) {
+          const x = c.timeToX(t.time);
+          if (x != null) time.push(axisView(x, c.formatTime(t.time), t.back, t.color));
+        }
+      } catch {
+        // A data reload can leave a drawing on bars the new series does not
+        // know: skip its labels this frame rather than breaking every label.
       }
     }
+    // Reconcile the price-line handles with this frame's labels (creates,
+    // moves and removes); a no-op registry when the option is off.
+    this.priceLines.sync(this.opts.priceLineLabels ? lineLabels : []);
     return { price, time };
   }
   /** The cursor at a pane point, for the primitive hitTest (lightweight-
@@ -548,6 +591,66 @@ export class DrawingManager {
   }
   private shown(d: Drawing): boolean {
     return this.visible && !d.hidden && (this.opts.interval == null || isVisibleOnInterval(d.visibility, this.opts.interval));
+  }
+  /** Subscribe to the chart's viewport changes (logical / time range and pane
+   *  size). The primitive's own update only repaints; screen-space interaction
+   *  state (the hover) and the price-line label handles have to follow the new
+   *  projection explicitly. The time-range subscription also covers a data
+   *  reload whose logical range event does not fire. Missing APIs (a test
+   *  double) are tolerated. */
+  private subscribeViewport(): void {
+    const ts = (typeof this.chart.timeScale === "function" ? this.chart.timeScale() : null) as unknown as {
+      subscribeVisibleLogicalRangeChange?: (h: () => void) => void;
+      unsubscribeVisibleLogicalRangeChange?: (h: () => void) => void;
+      subscribeVisibleTimeRangeChange?: (h: () => void) => void;
+      unsubscribeVisibleTimeRangeChange?: (h: () => void) => void;
+      subscribeSizeChange?: (h: () => void) => void;
+      unsubscribeSizeChange?: (h: () => void) => void;
+    } | null;
+    if (!ts) return;
+    if (ts.subscribeVisibleLogicalRangeChange) {
+      ts.subscribeVisibleLogicalRangeChange(this.onViewportChange);
+      this.off.push(() => ts.unsubscribeVisibleLogicalRangeChange?.(this.onViewportChange));
+    }
+    if (ts.subscribeVisibleTimeRangeChange) {
+      ts.subscribeVisibleTimeRangeChange(this.onViewportChange);
+      this.off.push(() => ts.unsubscribeVisibleTimeRangeChange?.(this.onViewportChange));
+    }
+    if (ts.subscribeSizeChange) {
+      ts.subscribeSizeChange(this.onViewportChange);
+      this.off.push(() => ts.unsubscribeSizeChange?.(this.onViewportChange));
+    }
+  }
+  /** A pan, zoom or resize: re-validate the hover against the re-projected
+   *  scenes and repaint so the canvas, the hit tests and the axis labels all
+   *  describe the same viewport. */
+  private readonly onViewportChange = (): void => {
+    this.refreshHover();
+    this.redraw();
+  };
+  /** Re-run the hover hit test at the last known pointer position with the
+   *  current projection, dropping or moving a hover the viewport left behind.
+   *  A press / drag in progress keeps its state (its gesture owns the
+   *  pointer). */
+  private refreshHover(): void {
+    if (!this.hovered || this.gesture || this.spec) return;
+    const p = this.lastPointer;
+    if (!p) {
+      this.hoverCursor = null;
+      this.setHover(null);
+      return;
+    }
+    const hit = this.hitTopmost(p, this.lastPointerTouch, this.lastPointerTouchLike);
+    const next = hit ? { id: hit.drawing.id, anchor: hit.mode.hit === "handle" ? hit.mode.handleIndex : -1 } : null;
+    if (next?.id === this.hovered.id && next.anchor === this.hovered.anchor) return;
+    this.hoverCursor = !hit
+      ? null
+      : hit.drawing.locked
+        ? "default"
+        : hit.mode.hit === "handle"
+          ? anchorCursor(hit.pts[hit.mode.handleIndex] ?? p, hit.pts)
+          : this.selected.includes(hit.drawing.id) ? "move" : "pointer";
+    this.setHover(next);
   }
   /** Drawings that are no longer shown leave the selection and the hover:
    *  Delete must not remove a drawing the user cannot see. */
@@ -769,6 +872,9 @@ export class DrawingManager {
     this.pointerMods(e);
     if (this.opts.interactive === false || this.gesture || e.buttons) return;
     const sp = this.panePoint(e);
+    this.lastPointer = sp;
+    this.lastPointerTouch = e.pointerType === "touch";
+    this.lastPointerTouchLike = isTouchLike(e);
     if (this.spec) {
       this.cursor = this.placementPoint(sp);
       this.redraw();

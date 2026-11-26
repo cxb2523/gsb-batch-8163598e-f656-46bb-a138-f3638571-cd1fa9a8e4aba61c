@@ -71,13 +71,46 @@ export function setup(managerOpts: DrawingManagerOptions = {}) {
     localization: {},
     timeScale: {},
   };
+  const timeScaleHandlers = new Set<() => void>();
+  const sizeHandlers = new Set<() => void>();
   const chart = {
     chartElement: () => el,
     options: () => opts,
     applyOptions: vi.fn(),
     paneSize: () => ({ width: 800, height: 500 }),
     priceScale: () => ({ width: () => 0 }),
-    timeScale: () => ({ timeToCoordinate: (t: number) => t, coordinateToTime: (x: number) => x, height: () => 0, width: () => 800 }),
+    timeScale: () => ({
+      timeToCoordinate: (t: number) => t,
+      coordinateToTime: (x: number) => x,
+      getVisibleRange: () => ({ from: 0, to: 1000 }),
+      height: () => 0,
+      width: () => 800,
+      subscribeVisibleLogicalRangeChange: (h: () => void) => timeScaleHandlers.add(h),
+      unsubscribeVisibleLogicalRangeChange: (h: () => void) => timeScaleHandlers.delete(h),
+      subscribeSizeChange: (h: () => void) => sizeHandlers.add(h),
+      unsubscribeSizeChange: (h: () => void) => sizeHandlers.delete(h),
+    }),
+    /** Test helper: fire every viewport (visible range / size) subscriber. */
+    _fireViewport: () => {
+      for (const h of [...timeScaleHandlers, ...sizeHandlers]) h();
+    },
+  };
+  type FakePriceLine = {
+    options: Record<string, unknown>;
+    applyOptions: (patch: Record<string, unknown>) => void;
+    removed: boolean;
+  };
+  const priceLines: FakePriceLine[] = [];
+  const createFakePriceLine = (o: Record<string, unknown>): FakePriceLine => {
+    const line: FakePriceLine = {
+      options: { ...o },
+      applyOptions(patch) {
+        Object.assign(line.options, patch);
+      },
+      removed: false,
+    };
+    priceLines.push(line);
+    return line;
   };
   const series = {
     attachPrimitive() {},
@@ -87,12 +120,19 @@ export function setup(managerOpts: DrawingManagerOptions = {}) {
     priceToCoordinate: (p: number) => 500 - p,
     coordinateToPrice: (y: number) => 500 - y,
     priceScale: () => ({ options: () => ({ mode: 0 }) }),
+    priceFormatter: () => ({ format: (p: number) => String(p) }),
     options: () => ({}),
+    createPriceLine: (o: never) => createFakePriceLine(o as never),
+    removePriceLine: (line: (typeof priceLines)[number]) => {
+      line.removed = true;
+      const i = priceLines.indexOf(line);
+      if (i >= 0) priceLines.splice(i, 1);
+    },
   };
   const dm = new DrawingManager(chart as never, series as never, managerOpts);
   // Listeners of the constructor stay out of the gesture counts.
   const base = { win: win.liveTotal(), doc: doc.liveTotal(), el: el.liveTotal() };
-  return { win, doc, el, chart, dm, base };
+  return { win, doc, el, chart, series, dm, base, priceLines };
 }
 
 /** A selected trend line with its anchors at pixels (100, 200) and (300, 300). */

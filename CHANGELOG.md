@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `DrawingManager` option `priceLineLabels`: draw the drawings' price-axis labels with series
+  price lines instead of the primitive axis views. The handles are reconciled on every chart
+  update — one per visible label, moved in place on a scale change, released as soon as the
+  label disappears (a drawing deleted, hidden, cleared or scrolled off the scale), so repeated
+  pan / zoom cycles can no longer stack or leak axis labels. `destroy()` removes them all.
+- The manager now subscribes to the chart's visible-range and pane-size changes: the hovered
+  drawing and its cursor are re-validated against the re-projected scenes on every pan / zoom,
+  so a hover can no longer stay pinned to a pixel the drawing has left.
+
+### Fixed
+
+- Viewport consistency: hit tests, the canvas scenes, the placement preview and the axis
+  labels are all computed from the current projection, so after a zoom / pan the drawing's old
+  screen position misses and its new position hits (the hit path never cached screen points).
+- Data reload hardening: a data-driven drawing (regression trend, anchored VWAP, volume
+  profiles) whose bars the reloaded series no longer has degrades safely — the regression fit
+  returns to the stored segment instead of indexing an empty range, the per-drawing axis-label
+  computation is isolated so one failed label cannot break the frame, and no hit test throws or
+  false-hits while the drawing has no projectable points.
+
 ## 0.11.1 (19/11/2026)
 
 ### Added
