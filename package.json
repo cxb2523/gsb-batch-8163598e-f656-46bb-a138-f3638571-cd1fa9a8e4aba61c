@@ -1,0 +1,39 @@
+{
+  "name": "bilibili-volume-balancer",
+  "version": "0.2.1",
+  "private": true,
+  "description": "B站网页视频响度均衡扩展（Chrome / Edge / Firefox）",
+  "author": "axggdzz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axggdzz/bilibili-volume-balancer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/axggdzz/bilibili-volume-balancer/issues"
+  },
+  "homepage": "https://github.com/axggdzz/bilibili-volume-balancer#readme",
+  "keywords": [
+    "bilibili",
+    "chrome-extension",
+    "edge-extension",
+    "firefox-extension",
+    "webextension",
+    "loudness",
+    "ebu-r128",
+    "web-audio"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --experimental-test-isolation=none test/loudness.test.mjs",
+    "test:e2e": "node test/e2e/run.mjs",
+    "test:e2e:firefox": "node test/e2e/run-firefox.mjs",
+    "pack": "node tools/pack.mjs",
+    "check": "node --check src/content.js && node --check src/loudness-worklet.js"
+  },
+  "devDependencies": {
+    "web-ext": "^10.8.0"
+  }
+}

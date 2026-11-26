@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>BVB E2E harness</title>
+  <style>
+    html, body { margin: 0; background: #0d0e13; color: #ddd; font-family: sans-serif; }
+    video { display: block; width: 640px; height: 360px; margin: 40px auto; background: #000; }
+    p { text-align: center; color: #888; }
+  </style>
+</head>
+<body>
+  <video id="video" src="level-test.webm" width="640" height="360" autoplay playsinline controls></video>
+  <p>前 10 秒 -41.7 LUFS，后 20 秒 -11.8 LUFS</p>
+  <script>
+    window.__BVB_TEST__ = true;
+    window.__BVB_WORKLET_URL__ = '../../src/loudness-worklet.js';
+    window.__bvbTimeline = [];
+  </script>
+  <script src="../../src/content.js"></script>
+  <script>
+    // 模拟一次用户手势，让 AudioContext 可以启动。
+    setTimeout(() => {
+      document.body.dispatchEvent(new PointerEvent('pointerdown', {
+        bubbles: true,
+        cancelable: true,
+        pointerType: 'mouse',
+      }));
+    }, 600);
+  </script>
+</body>
+</html>

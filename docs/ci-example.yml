@@ -1,0 +1,30 @@
+# 用法：复制到 .github/workflows/tests.yml
+# 注意：通过 GitHub OAuth App 推送 workflow 文件需要额外的 `workflow` scope。
+# 也可以在 GitHub 网页端直接新建 .github/workflows/tests.yml 并粘贴本文件内容。
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+      - run: npm run check
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # 打两个发布包，并用 web-ext 校验 Firefox 清单（只报错时才失败）
+      - run: node tools/pack.mjs
+      - run: npx --yes web-ext@10 lint --source-dir dist/firefox

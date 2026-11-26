@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>BVB Firefox E2E harness</title>
+  <style>
+    html, body { margin: 0; background: #0d0e13; color: #ddd; font-family: sans-serif; }
+    video { display: block; width: 640px; height: 360px; margin: 40px auto; background: #000; }
+    p { text-align: center; color: #888; }
+  </style>
+</head>
+<body>
+  <!--
+    Firefox 端到端测试页：不手动注入 content.js，而是让真正的扩展内容脚本来接管。
+    runner 会把测试用的 manifest（matches 换成 http://127.0.0.1/）打进临时 XPI，
+    因此这里验证的是"扩展清单 + 内容脚本 + browser.* 存储 + AudioWorklet 加载"整条链路。
+  -->
+  <video id="video" src="level-test.webm" width="640" height="360" autoplay playsinline></video>
+  <p id="hint">等待扩展接管播放器…</p>
+  <script>
+    const started = performance.now();
+    let posted = 0;
+
+    function readPanel() {
+      const host = document.getElementById('bvb-panel-host');
+      if (!host || !host.shadowRoot) return null;
+      const $ = (id) => host.shadowRoot.getElementById(id);
+      return {
+        status: ($('bvb-status') || {}).textContent || '',
+        foot: ($('bvb-foot') || {}).textContent || '',
+        lufs: ($('bvb-lufs') || {}).textContent || '',
+        gain: ($('bvb-gain') || {}).textContent || '',
+      };
+    }
+
+    async function post(snapshot) {
+      try {
+        await fetch('/__bvb', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(snapshot),
+        });
+      } catch {
+        // 测试服务器已经退出时忽略
+      }
+    }
+
+    async function tick() {
+      const video = document.getElementById('video');
+      const panel = readPanel();
+      posted += 1;
+      await post({
+        t: Math.round(performance.now() - started),
+        vt: Number.isFinite(video.currentTime) ? Number(video.currentTime.toFixed(2)) : -1,
+        paused: video.paused,
+        muted: video.muted,
+        volume: video.volume,
+        panel: Boolean(panel),
+        status: panel ? panel.status : '',
+        foot: panel ? panel.foot : '',
+        lufs: panel ? panel.lufs : '',
+        gain: panel ? panel.gain : '',
+      });
+      document.getElementById('hint').textContent = panel
+        ? `扩展已接管：${panel.status}`
+        : '等待扩展接管播放器…';
+      setTimeout(tick, 400);
+    }
+
+    addEventListener('load', () => {
+      setTimeout(() => {
+        // 模拟用户手势，满足自动播放/音频上下文策略。
+        document.body.dispatchEvent(new PointerEvent('pointerdown', {
+          bubbles: true,
+          cancelable: true,
+          pointerType: 'mouse',
+        }));
+      }, 400);
+      setTimeout(() => {
+        document.getElementById('video').play().catch(() => {});
+      }, 600);
+      tick();
+    });
+  </script>
+</body>
+</html>

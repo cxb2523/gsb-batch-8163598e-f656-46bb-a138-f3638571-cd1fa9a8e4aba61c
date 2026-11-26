@@ -1,0 +1,20 @@
+# 依赖和构建产物
+node_modules/
+dist/
+*.zip
+*.crx
+*.pem
+
+# 测试临时文件
+test/e2e/.edge-profile/
+test/e2e/.firefox-ext/
+test/e2e/.firefox-e2e.log
+.edge-profile/
+coverage/
+
+# 系统和编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
