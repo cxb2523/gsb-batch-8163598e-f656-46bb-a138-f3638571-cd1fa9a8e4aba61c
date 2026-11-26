@@ -10,8 +10,20 @@ import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { Scene } from "@babylonjs/core/scene";
 import type { GameCallbacks, InputState } from "./types";
 import { GameWorld } from "./GameWorld";
+import { RunGate, BLOCK_REASONS } from "./runGate";
 
-export type GameHandle = { scene: Scene; world: GameWorld; setInput: (input: Partial<InputState>) => void; press: (action: "pause" | "restart") => void; start: () => void; dispose: () => void };
+export type GameHandle = {
+  scene: Scene;
+  world: GameWorld;
+  gate: RunGate;
+  setInput: (input: Partial<InputState>) => void;
+  press: (action: "pause" | "restart") => void;
+  start: () => void;
+  /** Block/unblock one named interruption reason (settings/hidden/blurred; pause is reconciled from world status). */
+  setBlocked: (reason: string, blocked: boolean) => void;
+  clearInput: () => void;
+  dispose: () => void;
+};
 
 export function createGameScene(engine: Engine, _canvas: HTMLCanvasElement, callbacks: GameCallbacks): GameHandle {
   const scene = new Scene(engine);
@@ -24,7 +36,29 @@ export function createGameScene(engine: Engine, _canvas: HTMLCanvasElement, call
   const material = new StandardMaterial("bytebound-screen-material", scene);
   material.diffuseTexture = texture; material.emissiveTexture = texture; material.emissiveColor = Color3.White(); material.disableLighting = true; plane.material = material;
   const world = new GameWorld(texture.getContext() as unknown as CanvasRenderingContext2D, callbacks);
-  let last = performance.now(); let active = true;
-  engine.runRenderLoop(() => { if (!active) return; const now = performance.now(); world.tick((now - last) / 1000); last = now; texture.update(false); scene.render(); });
-  return { scene, world, setInput: (input) => world.setInput(input), press: (action) => world.press(action), start: () => world.start(), dispose: () => { active = false; plane.dispose(); material.dispose(); texture.dispose(); scene.dispose(); } };
+  // Single advancement authority shared by the frame loop, GameCanvas DOM events, and audio.
+  const gate = new RunGate();
+  let active = true;
+  engine.runRenderLoop(() => {
+    if (!active) return;
+    // Reconcile the manual-pause reason from authoritative world status every frame so
+    // restart-while-paused and other status transitions can never leave a stale block.
+    gate.setReason(BLOCK_REASONS.pause, world.getStatus() === "paused");
+    // The gate owns the time baseline: blocked/suspended frames yield 0 and resume re-baselines.
+    const dt = gate.sample(performance.now());
+    world.tick(dt);
+    texture.update(false);
+    scene.render();
+  });
+  return {
+    scene,
+    world,
+    gate,
+    setInput: (input) => world.setInput(input),
+    press: (action) => world.press(action),
+    start: () => world.start(),
+    setBlocked: (reason, blocked) => gate.setReason(reason, blocked),
+    clearInput: () => world.clearInput(),
+    dispose: () => { active = false; plane.dispose(); material.dispose(); texture.dispose(); scene.dispose(); },
+  };
 }

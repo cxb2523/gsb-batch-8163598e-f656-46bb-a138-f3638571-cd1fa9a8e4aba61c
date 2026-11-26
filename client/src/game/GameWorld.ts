@@ -10,6 +10,10 @@ const MAX_SPEED = 3.5;
 const ACCEL = 0.38;
 const FRICTION = 0.78;
 const JUMP = -8.8;
+// Upper bound for a single simulation delta. The scene's RunGate already clamps and
+// re-baselines after suspensions; this is the world-level guard against any large dt
+// reaching tick() directly (e.g. a backgrounded tab or a long frame hitch in tests).
+const MAX_FRAME_DELTA = 0.05;
 
 export class GameWorld {
   readonly width = W;
@@ -42,6 +46,25 @@ export class GameWorld {
     if (this.status === "dead" && next.jump) this.restartAfterDeath();
   }
 
+  /**
+   * Drop all held inputs and buffered presses. Used when the window loses focus or the
+   * tab is hidden, because the matching keyup/pointerup can be missed off-window and
+   * would otherwise leave the player running after the player returns.
+   */
+  clearInput() {
+    this.input = { left: false, right: false, jump: false };
+    this.wasJump = false;
+    this.jumpBuffer = 0;
+  }
+
+  getStatus(): GameStatus {
+    return this.status;
+  }
+
+  isPlaying(): boolean {
+    return this.status === "playing";
+  }
+
   press(action: "pause" | "restart") {
     if (action === "pause") {
       if (this.status === "playing") this.status = "paused";
@@ -69,7 +92,19 @@ export class GameWorld {
     this.callbacks.onHud(snapshot);
   }
 
-  tick(dtSeconds: number) { const step = Math.min(2.2, Math.max(0.4, dtSeconds * 60)); this.time += dtSeconds; if (this.status === "playing") this.update(step); this.draw(); }
+  tick(dtSeconds: number) {
+    // dt is already jump-free from RunGate. Defensively normalise here too: while not
+    // playing (menu/paused/dead/complete) or when the gate reports 0 (settings/hidden/
+    // blurred/resume-baseline), no physics and no in-game time may advance. draw() still
+    // runs so the frozen frame stays on screen and resize/redraw remain live.
+    if (this.status === "playing" && dtSeconds > 0 && Number.isFinite(dtSeconds)) {
+      const safeDt = Math.min(MAX_FRAME_DELTA, Math.max(0, dtSeconds));
+      const step = Math.min(2.2, Math.max(0.4, safeDt * 60));
+      this.time += safeDt;
+      this.update(step);
+    }
+    this.draw();
+  }
 
   private update(step: number) {
     this.jumpBuffer = Math.max(0, this.jumpBuffer - step);
