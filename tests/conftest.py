@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shlex
 import subprocess
@@ -14,11 +15,11 @@ collect_ignore = ["test_urls.py"]
 FAKES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The fake mpv serves a Unix socket; its Windows named-pipe server is written
-# but has not been run on a real Windows machine, so tests that play skip there.
+# fake_mpv serves a Unix socket on POSIX and a named pipe on Windows; the pipe
+# path needs pywin32, so playback tests skip on a Windows without it.
 needs_fake_mpv = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="fake_mpv's Windows named-pipe IPC is unverified; playback tests run on POSIX",
+    sys.platform == "win32" and not importlib.util.find_spec("win32pipe"),
+    reason="fake_mpv's Windows named-pipe IPC needs pywin32",
 )
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only behaviour")
 

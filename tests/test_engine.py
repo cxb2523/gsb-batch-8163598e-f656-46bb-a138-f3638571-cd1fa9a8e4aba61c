@@ -2,15 +2,23 @@
 
 Durations are encoded in the file names (``fake-dur-<s>``, see
 tests/fakes/fake_mpv.py), so a test picks how long each "track" plays.
+
+The player-lifecycle tests below also look at the processes the fake mpv
+leaves behind: ``FAKE_MPV_LOG`` gets one JSON line per launch with its pid,
+which they use to check that a fast next/jump/stop never leaves two mpvs alive
+or a temp IPC/log directory behind.
 """
 
+import glob
 import json
+import os
+import tempfile
 import threading
 import time
 
 import pytest
 
-from conftest import needs_fake_mpv
+from conftest import needs_fake_mpv, pid_alive
 from tunetape import config, history, sources
 from tunetape.engine import Engine, EngineError
 
@@ -43,6 +51,32 @@ def engine(data_dir):
     eng.events = events
     yield eng
     eng.shutdown()
+
+
+def launches(log_path):
+    """Every fake-mpv launch the log knows about: ``[{"argv", "pid"}]``."""
+    try:
+        text = log_path.read_text()
+    except OSError:
+        return []
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def live_launches(log_path):
+    """Launches whose fake mpv is still running."""
+    return [entry for entry in launches(log_path) if pid_alive(entry["pid"])]
+
+
+def tunetape_temp_dirs():
+    """The private temp dirs MPVController makes (IPC sockets, mpv logs)."""
+    return set(glob.glob(os.path.join(tempfile.gettempdir(), "tunetape_*")))
+
+
+def wait_until_no_launch(log_path, previous, timeout=10.0):
+    """Wait for every launch recorded before ``previous`` to have exited."""
+    wait_for(lambda: not [e for e in live_launches(log_path)
+                          if e["pid"] in {l["pid"] for l in previous}],
+             timeout=timeout)
 
 
 def state(eng):
@@ -360,3 +394,222 @@ def test_discover_records_the_request(engine, monkeypatch):
     with pytest.raises(EngineError) as e:
         engine.discover("rainy jazz")
     assert e.value.code == 1021
+
+
+# -- volume and mute are session state, not per-track ----------------------------
+
+
+def test_mute_survives_a_track_change(engine, audio):
+    for name in ("a", "b", "c"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    assert engine.mute(True)["muted"] is True
+
+    engine.next()  # jump the queue: a new mpv
+    wait_for(lambda: state(engine) == "playing" and engine.status()["index"] == 1)
+    assert engine.status()["muted"] is True
+
+    engine.jump(2)
+    wait_for(lambda: state(engine) == "playing" and engine.status()["index"] == 2)
+    assert engine.status()["muted"] is True
+
+
+def test_mute_holds_when_playback_stops_and_restarts(engine, audio):
+    # From idle (stop) and from idle (the queue ran out) the next mpv starts
+    # muted too: mute is session state, not a per-mpv setting.
+    engine.add(audio("a-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    engine.mute(True)
+    engine.stop()
+    assert engine.status()["muted"] is True
+    engine.add(audio("b-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    assert engine.status()["muted"] is True
+
+
+def test_volume_survives_a_track_change(engine, audio):
+    for name in ("a", "b"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    engine.set_volume(value=37)
+    engine.next()
+    wait_for(lambda: state(engine) == "playing" and engine.status()["index"] == 1)
+    assert engine.status()["volume"] == 37
+
+
+def test_mute_started_at_launch(engine, audio, monkeypatch, tmp_path):
+    # Not just tracked in the engine's status: the player that takes over is
+    # told to be muted from the start (the fake honors --mute=yes on its argv).
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    config.set_setting("normalize_volume", False)
+    engine.add(audio("a-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    engine.mute(True)
+    engine.add(audio("b-fake-dur-30.mp3"), at="now")
+    wait_for(lambda: state(engine) == "playing" and engine.status()["length"] == 1)
+    argv = launches(log)[-1]["argv"]
+    assert "--mute=yes" in argv
+    assert "--volume=100" in argv
+
+
+def test_volume_change_during_a_launch_is_not_rolled_back(engine, audio, monkeypatch):
+    """A volume change made while the next mpv is starting must win.
+
+    The launch reads the session only after its generation is confirmed; the
+    change lands on the player right after it registers, so the level the
+    user set is the one both the status and the new mpv end up with.
+    """
+    for name in ("a", "b"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+
+    real_resolve = sources.resolve
+    resolving = threading.Event()
+    release = threading.Event()
+
+    def slow_resolve(track, kind):
+        if track.name.startswith("b-"):
+            resolving.set()
+            release.wait(10)
+        return real_resolve(track, kind)
+
+    monkeypatch.setattr(sources, "resolve", slow_resolve)
+    engine.next()  # index 1's worker now blocks in resolve, launch not yet done
+    assert resolving.wait(10)
+    engine.set_volume(value=42)
+    release.set()
+    wait_for(lambda: state(engine) == "playing" and engine.status()["index"] == 1)
+    assert engine.status()["volume"] == 42
+    # mpv itself agrees, not just the engine's bookkeeping.
+    assert engine._controller.get_volume() == 42
+
+
+def test_volume_change_while_mpv_is_starting_is_not_rolled_back(audio, data_dir):
+    """Same race, in the other window: the factory (mpv launch) is in flight.
+
+    The engine serializes session changes with launches and reconciles the new
+    player against the session once it registers, so a level set mid-launch is
+    neither lost nor overwritten when the launch completes.
+    """
+    from tunetape.player import MPVController
+
+    starting = threading.Event()
+    release = threading.Event()
+
+    def factory(stream_url, normalize=False, volume=None, muted=False):
+        starting.set()
+        release.wait(10)
+        return MPVController(stream_url, normalize=normalize, volume=volume, muted=muted)
+
+    events = []
+    eng = Engine(lambda t, d: events.append((t, d)), controller_factory=factory)
+    try:
+        eng.add(audio("a-fake-dur-30.mp3"))
+        assert starting.wait(10)
+        eng.set_volume(value=42)
+        eng.mute(True)
+        release.set()
+        wait_for(lambda: state(eng) == "playing")
+        assert eng.status()["volume"] == 42
+        assert eng.status()["muted"] is True
+        assert eng._controller.get_volume() == 42
+        assert eng._controller.is_muted() is True
+    finally:
+        release.set()
+        eng.shutdown()
+
+
+# -- the player lifecycle -------------------------------------------------------
+
+
+def test_fast_next_leaves_exactly_one_player(engine, audio, monkeypatch, tmp_path):
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    for name in ("a", "b", "c", "d"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    before = launches(log)
+
+    # Fast successive skips, ending on a known item.
+    for index in (1, 2, 3, 0, 1, 2):
+        engine.jump(index)
+        time.sleep(0.02)
+    wait_for(lambda: state(engine) == "playing" and engine.status()["index"] == 2)
+    wait_until_no_launch(log, before)
+    # Every earlier player is gone; one mpv (for the current item) is alive.
+    assert len(live_launches(log)) == 1
+    assert engine.status()["state"] == "playing"
+
+
+def test_fast_jump_and_stop_leave_nothing_behind(engine, audio, monkeypatch, tmp_path):
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    before_dirs = tunetape_temp_dirs()
+    for name in ("a", "b", "c"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+
+    engine.jump(1)
+    engine.jump(2)
+    engine.jump(0)
+    assert engine.stop()["state"] == "idle"
+    # stop() returns only once every player is fully torn down.
+    assert live_launches(log) == []
+    # …and their private temp dirs (IPC sockets, mpv logs) are removed with it.
+    assert tunetape_temp_dirs() - before_dirs == set()
+
+
+def test_stop_leaves_no_temp_dirs_and_play_again_works(engine, audio, monkeypatch, tmp_path):
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    before_dirs = tunetape_temp_dirs()
+    engine.add(audio("a-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    engine.set_volume(value=55)
+    engine.mute(True)
+
+    assert engine.stop()["state"] == "idle"
+    assert live_launches(log) == []
+    assert tunetape_temp_dirs() - before_dirs == set()
+
+    # Same queue, started again from the front: a clean launch that still has
+    # the session's volume and mute.
+    engine.add(audio("b-fake-dur-30.mp3"), at="now")
+    wait_for(lambda: state(engine) == "playing")
+    assert engine.status()["volume"] == 55
+    assert engine.status()["muted"] is True
+    engine.stop()
+    assert tunetape_temp_dirs() - before_dirs == set()
+
+
+def test_stop_waits_for_a_slow_player_to_exit(engine, audio, monkeypatch, tmp_path):
+    """With a wedged mpv, stop() still waits for the complete teardown.
+
+    The old design returned at once and tore the player down in the background,
+    which is how a restart right afterwards could meet the previous mpv.
+    """
+    monkeypatch.setenv("FAKE_MPV_SLOW_QUIT", "2")
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    before_dirs = tunetape_temp_dirs()
+    engine.add(audio("a-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+
+    assert engine.stop()["state"] == "idle"
+    # mpv ignored SIGTERM and lingered, but stop() waited for the kill.
+    assert live_launches(log) == []
+    assert tunetape_temp_dirs() - before_dirs == set()
+
+
+def test_clear_leaves_nothing_behind(engine, audio, monkeypatch, tmp_path):
+    log = tmp_path / "mpv-argv.jsonl"
+    monkeypatch.setenv("FAKE_MPV_LOG", str(log))
+    before_dirs = tunetape_temp_dirs()
+    for name in ("a", "b"):
+        engine.add(audio(f"{name}-fake-dur-30.mp3"))
+    wait_for(lambda: state(engine) == "playing")
+    assert engine.clear() == {"items": [], "index": -1}
+    assert live_launches(log) == []
+    assert tunetape_temp_dirs() - before_dirs == set()
+

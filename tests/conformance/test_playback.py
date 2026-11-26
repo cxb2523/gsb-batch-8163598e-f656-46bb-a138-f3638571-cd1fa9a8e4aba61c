@@ -4,7 +4,7 @@ Uses the fake mpv: a track "plays" for FAKE_MPV_DURATION seconds, and a media
 path containing ``fake-fail`` fails to start.
 """
 
-from .wire import add, first_item, item_status, queue_items, wait_for, wait_idle, wait_playing
+from .wire import add, first_item, item_status, queue_items, status, wait_for, wait_idle, wait_playing
 
 
 def test_auto_advance_to_the_end_keeps_the_queue(daemon_factory, media):
@@ -94,3 +94,54 @@ def test_history_limit(conn, media):
         wait_playing(conn, first_item(req))
     wait_for(lambda: len(conn.result("history.list")["entries"]) >= 3, timeout=5, what="3 history entries")
     assert len(conn.result("history.list", {"limit": 2})["entries"]) == 2
+
+
+# -- volume and mute are session state (protocol §4.2, §6) ---------------------
+
+
+def test_mute_and_volume_survive_track_changes(conn, media):
+    ids = [first_item(add(conn, media(f"{n}.mp3"))) for n in ("a", "b", "c")]
+    wait_playing(conn, ids[0])
+
+    conn.result("player.mute", {"muted": True})
+    conn.result("player.volume", {"value": 40})
+    assert status(conn)["muted"] is True and status(conn)["volume"] == 40
+
+    conn.result("player.next")
+    wait_playing(conn, ids[1])
+    s = status(conn)
+    assert s["muted"] is True and s["volume"] == 40
+
+    conn.result("queue.jump", {"index": 2})
+    wait_playing(conn, ids[2])
+    s = status(conn)
+    assert s["muted"] is True and s["volume"] == 40
+
+
+def test_stop_then_play_keeps_the_session_and_starts_cleanly(conn, media):
+    req = add(conn, media("first.mp3"))
+    wait_playing(conn, first_item(req))
+    conn.result("player.mute", {"muted": True})
+    conn.result("player.volume", {"value": 35})
+
+    assert conn.result("player.stop")["state"] == "idle"
+    assert status(conn)["muted"] is True and status(conn)["volume"] == 35
+
+    req = add(conn, media("second.mp3"), at="now")
+    wait_playing(conn, first_item(req))
+    s = status(conn)
+    assert s["muted"] is True and s["volume"] == 35
+
+
+def test_rapid_skips_leave_one_player(conn, media):
+    ids = [first_item(add(conn, media(f"skip{i}.mp3"))) for i in range(4)]
+    wait_playing(conn, ids[0])
+
+    for index in (1, 2, 3, 0, 1, 2):
+        conn.result("queue.jump", {"index": index})
+    wait_playing(conn, ids[2])
+    s = status(conn)
+    assert s["state"] == "playing" and s["current"]["id"] == ids[2]
+    # The daemon is still responsive and the queue is intact: no second player
+    # fighting for the IPC endpoint.
+    assert [it["id"] for it in queue_items(conn)] == ids

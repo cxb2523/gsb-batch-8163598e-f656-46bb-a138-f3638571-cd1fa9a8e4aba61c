@@ -36,6 +36,7 @@ class FakePlayer:
         self.volume = 100.0
         self.filters = []
         self.media = None
+        self.muted = False  # set before the argv scan; --mute=yes may override
         rest = list(argv)
         while rest:
             arg = rest.pop(0)
@@ -49,6 +50,9 @@ class FakePlayer:
                 self.volume = float(arg.split("=", 1)[1])
             elif arg.startswith("--af="):
                 self.filters = [f for f in arg.split("=", 1)[1].split(",") if f]
+            elif arg.startswith("--mute="):
+                value = arg.split("=", 1)[1].strip().lower()
+                self.muted = value in ("yes", "true", "1")
             elif not arg.startswith("--") and self.media is None:
                 self.media = arg
         media = self.media or ""
@@ -56,7 +60,6 @@ class FakePlayer:
         self.duration = float(m.group(1).rstrip(".")) if m else float(
             os.environ.get("FAKE_MPV_DURATION", "2"))
         self.paused = False
-        self.muted = False
         self.position = 0.0
         self._clock = time.monotonic()
         self.lock = threading.Lock()

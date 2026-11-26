@@ -304,6 +304,15 @@ Volume is clamped to 0–130 and persisted to the user config, as today.
 `player.volume` also works with nothing playing: it sets the level the next
 item starts at.
 
+Volume and mute are *session* state, not per-track: every new player (after a
+`next`/`prev`/`queue.jump`, an auto-advance, or a restart from idle) starts
+with the volume and mute the daemon currently records, and the `volume` and
+`muted` in `Status` are what mpv actually reports. A `player.volume` or
+`player.mute` made while the next track is still resolving or starting is
+applied to that player as it comes up, never rolled back by the launch
+finishing. `player.mute` while an item is loading (no mpv yet) records the
+state and still fails only when the queue is idle or empty.
+
 `levels` is `[[rms_dbfs, peak_dbfs], …]` per channel, or `null` (silence is
 `-Infinity` in mpv; on the wire it is sent as `-200.0`). `stats` is the object
 `MPVController.get_stats()` returns today (`codec`, `bitrate`, `samplerate`,
@@ -379,9 +388,14 @@ and safe to show as is.
 These move out of the TUI's flow (`tunetape/__main__.py`) into the daemon and
 keep working as they do today:
 
-- **One mpv per item**, started with the user's volume and the normalize
-  setting read from `config.json` when the item starts; volume carries across
-  items and is persisted.
+- **One mpv per item**, started with the session's volume and mute and the
+  normalize setting read from `config.json` when the item starts; volume and
+  mute carry across items, restarts and idle, and volume is persisted.
+- **Clean player replacement**: a player that is replaced (skipped past,
+  stopped, cleared, or exited on its own) is fully torn down — process exited,
+  IPC endpoint and private temp log dir removed — before the next one starts.
+  After a burst of `next`/`queue.jump`/`player.stop`, at most one mpv is alive,
+  no temp dirs remain, and playing again from idle works as before.
 - **Auto-advance**: when mpv exits at the end of an item, the next item starts;
   after the last one the player goes `idle` and the queue is kept.
 - **Fail forward**: an item that fails to resolve or start is marked `failed`

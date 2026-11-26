@@ -319,7 +319,8 @@ def fetch_youtube_playlist(url: str) -> Album:
 class MPVController:
     """Controls an mpv instance via IPC socket."""
 
-    def __init__(self, stream_url: str, normalize: bool = False, volume: float = None):
+    def __init__(self, stream_url: str, normalize: bool = False, volume: float = None,
+                 muted: bool = False):
         # [#5] IPC endpoint (Unix socket in a private temp dir, or a named pipe on
         # Windows) — platform detail lives in tunetape.ipc.
         self._ipc = create_ipc()
@@ -335,23 +336,29 @@ class MPVController:
         self._lock = threading.RLock()
         self._proc = None
         self._closed = False  # [#16] Idempotent quit guard
+        # Set once quit() has finished tearing mpv down. A second caller that
+        # finds the first quit already under way waits on this instead of
+        # returning early, so "quit returned" always means "mpv is gone, IPC
+        # endpoint and log dir removed" — the engine relies on that to replace
+        # one player with the next without ever having two alive at once.
+        self._quit_done = threading.Event()
         self._buf = b""  # [#3] Persistent read buffer for IPC
         self._req_id = 0  # Monotonic IPC request id for response matching
         # Seed the cached reading with the launch volume so the meter shows the
         # restored level immediately, before the first IPC poll lands.
         self._last_volume = 100.0 if volume is None else float(volume)
-        self._last_muted = False
+        self._last_muted = bool(muted)
 
-        if not self._spawn_and_connect(stream_url, normalize, volume):
+        if not self._spawn_and_connect(stream_url, normalize, volume, muted):
             # The audio filters may be unavailable on a minimal mpv build; retry
             # once without them before giving up so playback isn't blocked.
-            if not self._spawn_and_connect(stream_url, False, volume, meter=False):
+            if not self._spawn_and_connect(stream_url, False, volume, muted, meter=False):
                 self._ipc.cleanup()
                 self._cleanup_log()
                 raise RuntimeError("Could not connect to the player. Try again.")
 
     def _spawn_and_connect(self, stream_url: str, normalize: bool, volume: float = None,
-                           meter: bool = True) -> bool:
+                           muted: bool = False, meter: bool = True) -> bool:
         """Launch mpv and connect to its IPC socket. Returns True on success.
 
         On failure, reaps the spawned process so a retry can start cleanly.
@@ -385,6 +392,11 @@ class MPVController:
         if volume is not None:
             # Start at the user's last-set level instead of mpv's default 100%.
             args.append(f"--volume={int(round(float(volume)))}")
+        if muted:
+            # Start muted (mpv's startup mute option), so a session that is
+            # muted stays silent across the track change: not a blip of the
+            # new track before the IPC command lands.
+            args.append("--mute=yes")
         # [#11] Use -- separator so stream_url can't be interpreted as mpv flag
         args += ["--", stream_url]
 
@@ -410,6 +422,11 @@ class MPVController:
         # Wait (up to 5s) for mpv to create its IPC endpoint, then connect. An
         # mpv that has already exited never will, so stop waiting at once.
         if self._ipc.connect(5.0, alive=lambda: self._proc.poll() is None):
+            # --mute=yes covers a real mpv; a fake or older player that ignores
+            # it still starts live, so set it over IPC too before this returns
+            # and the caller can report "now playing".
+            if muted and not self.set_mute(True):
+                debug.log("mpv rejected the launch mute command", "WARN")
             return True
 
         # [#10] Reap zombie on this attempt's failure
@@ -516,18 +533,22 @@ class MPVController:
     def set_volume_relative(self, delta: float):
         self._send(["add", "volume", str(delta)])
 
-    def set_volume(self, value: float):
+    def set_volume(self, value: float) -> bool:
         resp = self._send(["set_property", "volume", float(value)])
         if resp.get("error") == "success":
             self._last_volume = float(value)
+            return True
+        return False
 
     def toggle_mute(self):
         self._send(["cycle", "mute"])
 
-    def set_mute(self, muted: bool):
+    def set_mute(self, muted: bool) -> bool:
         resp = self._send(["set_property", "mute", bool(muted)])
         if resp.get("error") == "success":
             self._last_muted = bool(muted)
+            return True
+        return False
 
     def exit_code(self):
         """mpv's exit status once it has exited, else None."""
@@ -620,12 +641,25 @@ class MPVController:
         return self._proc is not None and self._proc.poll() is None
 
     def quit(self):
-        # [#16] Idempotent quit — safe to call multiple times / from signal handler
+        # [#16] Idempotent quit — safe to call multiple times / from signal handler.
+        # A caller that arrives while another thread is already tearing mpv down
+        # waits for it to finish rather than returning early, so "quit returned"
+        # always means mpv has exited and its endpoint and log dir are gone.
         with self._lock:
             if self._closed:
-                return
-            self._closed = True
+                already = True
+            else:
+                already = False
+                self._closed = True
+        if already:
+            self._quit_done.wait()
+            return
+        try:
+            self._teardown()
+        finally:
+            self._quit_done.set()
 
+    def _teardown(self):
         asked = False
         try:
             if self._ipc.connected:
@@ -637,15 +671,25 @@ class MPVController:
         try:
             if self._proc is not None:
                 # mpv normally exits on the quit command at once; give it a
-                # moment to, then insist, then kill — teardown stays bounded.
+                # moment to, then insist, then kill — teardown stays bounded
+                # but short, since the next player waits for this one to go.
                 if asked:
                     try:
-                        self._proc.wait(timeout=0.5)
+                        self._proc.wait(timeout=0.4)
                     except subprocess.TimeoutExpired:
                         pass
                 if self._proc.poll() is None:
                     self._proc.terminate()
-                    self._proc.wait(timeout=1.5)
+                    try:
+                        self._proc.wait(timeout=0.4)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                    try:
+                        self._proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
         except Exception:
             try:
                 self._proc.kill()

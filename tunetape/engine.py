@@ -18,6 +18,7 @@ these calls and forwards what the ``listener(type, data)`` callback emits as
 ``event`` notifications (docs/protocol.md §4.4).
 """
 
+import inspect
 import itertools
 import math
 import threading
@@ -142,14 +143,33 @@ def _num_param(name, value):
     return float(value)
 
 
+def _factory_takes_muted(factory) -> bool:
+    """Whether a controller factory accepts a ``muted`` keyword.
+
+    The engine starts every player already muted when the session is muted, so
+    no audio slips out between mpv's launch and the first IPC command. Factories
+    that predate that keyword (test doubles, mostly) get a ``set_mute`` call
+    right after the player registers instead.
+    """
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):  # builtins, or a signature we can't read
+        return False
+    return "muted" in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
 class Engine:
     """The queue and the player. Every public method is thread-safe."""
 
     def __init__(self, listener=None, *, controller_factory=MPVController):
         self._listener = listener
         self._factory = controller_factory
+        self._factory_takes_muted = _factory_takes_muted(controller_factory)
         # One lock guards all state below. It is never held across a resolver,
-        # an mpv launch or an mpv quit — those run on worker threads.
+        # an mpv launch or an mpv quit — those run on worker threads. The one
+        # exception is a launch under _spawn_lock (see below), which is only
+        # entered after its generation was re-checked.
         self._lock = threading.RLock()
         self._requests = []          # oldest first
         self._items = []
@@ -167,12 +187,22 @@ class Engine:
         self._closed = False
         self._threads = set()
         self._item_ids = itertools.count(1)
-        # Serializes launches so a superseded worker's mpv is gone before the
-        # next one starts, and event publishing so snapshots go out in order.
-        self._spawn_lock = threading.Lock()
+        # Serializes player lifecycle: a replaced mpv is fully torn down (exit,
+        # IPC endpoint, temp log dir) before the next one starts, and a session
+        # volume/mute change is applied to a player under the same lock, so a
+        # launch that is still in flight can never overwrite it. Re-entrant
+        # because a launch under the lock may itself tear down a stale player.
+        # Event publishing has a lock of its own, so snapshots go out in order.
+        self._spawn_lock = threading.RLock()
         self._publish_lock = threading.Lock()
         self._published = None
         self._track_seq = 0          # bumped whenever an item (re)starts
+        # Players waiting for a full teardown. A launch drains this list (under
+        # _spawn_lock) before it starts mpv, so an old player is always gone —
+        # process reaped, IPC endpoint and log dir removed — before a new one
+        # takes over, however fast next/jump/stop arrive.
+        self._retiring = []          # guarded by _lock
+        self._retirer_running = False
 
     # -- events -----------------------------------------------------------------
 
@@ -224,11 +254,71 @@ class Engine:
 
     @staticmethod
     def _quit(controller) -> None:
+        """Tear a player down completely (mpv exited, IPC endpoint and log dir gone).
+
+        :meth:`MPVController.quit` is idempotent and does not return before mpv
+        has exited and its endpoint and log dir are removed, so two threads
+        racing to quit the same player both end up with it gone.
+        """
         if controller is not None:
             try:
                 controller.quit()
             except Exception as e:
                 debug.exception("Stopping mpv failed", e)
+
+    def _retire(self, controller) -> None:
+        """Hand a superseded player to the teardown worker; never blocks.
+
+        Teardown is serialized on ``_spawn_lock`` with launches and with an
+        in-place volume/mute change, so a player is fully gone before anything
+        else touches the session, and the caller (a state transition) returns
+        at once even when mpv is slow to exit.
+        """
+        if controller is None:
+            return
+        with self._lock:
+            self._retiring.append(controller)
+            if self._retirer_running:
+                return
+            self._retirer_running = True
+        self._spawn(self._retire_worker)
+
+    def _drain_retired(self) -> None:
+        """Quit every player waiting for teardown. Caller holds ``_spawn_lock``."""
+        while True:
+            with self._lock:
+                if not self._retiring:
+                    self._retirer_running = False
+                    return
+                controller = self._retiring.pop(0)
+            self._quit(controller)
+
+    def _retire_worker(self) -> None:
+        with self._spawn_lock:
+            self._drain_retired()
+
+    def _flush_retired(self) -> None:
+        """Fully tear down every superseded player before returning.
+
+        Used by stop/clear and by shutdown so that after those calls return no
+        mpv is alive and no IPC endpoint or temp log dir remains. A launch that
+        was already in flight (for a now-superseded item) is also fenced out:
+        it aborts on its generation check and cleans up what it started.
+        """
+        with self._spawn_lock:
+            self._drain_retired()
+
+    def _quit_and_wait(self, controller) -> None:
+        """Quit ``controller`` completely before returning (caller not holding locks).
+
+        Holds ``_spawn_lock`` while quitting and drains any other retired
+        players first, so an old mpv never survives next to a new one.
+        """
+        if controller is None:
+            return
+        with self._spawn_lock:
+            self._drain_retired()
+            self._quit(controller)
 
     # -- requests ---------------------------------------------------------------
 
@@ -337,7 +427,7 @@ class Engine:
                 self._failures = 0
                 self._begin_locked(start, old)
                 old = None
-        self._quit(old)
+        self._retire(old)
         self._request_changed(req)
         req.settled.set()
         self._publish(queue=True)
@@ -393,7 +483,7 @@ class Engine:
                         self._gen += 1
                         self._set_idle_locked()
                     self._index = min(pos, len(self._items) - 1)
-        self._quit(old)
+        self._retire(old)
         self._publish(queue=True)
         return self.queue_list()
 
@@ -404,7 +494,8 @@ class Engine:
             self._set_idle_locked()
             self._items = []
             self._index = -1
-        self._quit(old)
+        self._retire(old)
+        self._flush_retired()
         self._publish(queue=True)
         return self.queue_list()
 
@@ -434,6 +525,12 @@ class Engine:
     def _begin_locked(self, index, old=None) -> None:
         """Make item ``index`` current and start a play worker for it."""
         previous = self._leave_current_locked()
+        # Detach the replaced players right here, while the transition is still
+        # atomic: their teardown runs in the background, but no later caller of
+        # stop()/shutdown() can miss them because a play worker never got round
+        # to handing them over.
+        for controller in (old, previous):
+            self._retire(controller)
         self._gen += 1
         self._track_seq += 1
         self._index = index
@@ -443,14 +540,9 @@ class Engine:
         item.error = None
         self._state = "loading"
         self._message = self._loading_message(item)
-        self._spawn(self._play_worker, self._gen, item, [c for c in (old, previous) if c])
+        self._spawn(self._play_worker, self._gen, item)
 
-    def _play_worker(self, gen, item, to_quit) -> None:
-        # The old mpv is told to quit at once but torn down on the side, so a
-        # slow exit never holds the next item in "loading".
-        for c in to_quit:
-            self._spawn(self._quit, c)
-
+    def _play_worker(self, gen, item) -> None:
         try:
             stream = sources.resolve(item.track, item.kind)
         except Exception as e:
@@ -467,33 +559,49 @@ class Engine:
         # Read the settings when the item starts, as the TUI always has, so a
         # change made elsewhere (Settings screen, another client) applies next.
         normalize = bool(config.get_setting("normalize_volume"))
-        volume = config.get_volume()
         with self._spawn_lock:
+            # Any player still waiting for teardown goes first, so this launch
+            # can never put a second mpv next to a live one.
+            self._drain_retired()
             with self._lock:
                 if gen != self._gen:
                     return
+                launch_volume = self._volume
+                launch_muted = self._muted
             try:
-                controller = self._factory(stream, normalize=normalize, volume=volume)
+                controller = self._factory(
+                    stream, normalize=normalize, volume=launch_volume,
+                    **({"muted": launch_muted} if self._factory_takes_muted else {}))
             except Exception as e:
                 debug.exception("Track playback failed to start", e)
                 self._fail(gen, item, f"Could not start player: {e}")
                 return
-
-        with self._lock:
-            current = gen == self._gen and not self._closed
-            if current:
-                self._controller = controller
-                self._state = "playing"
-                self._message = None
-                self._volume = volume
-                self._failures = 0
-                item.status = "playing"
-                muted = self._muted
-        if not current:
-            self._quit(controller)
-            return
-        if muted:
-            controller.set_mute(True)
+            with self._lock:
+                current = gen == self._gen and not self._closed
+                if current:
+                    self._controller = controller
+                    self._state = "playing"
+                    self._message = None
+                    self._failures = 0
+                    item.status = "playing"
+                    # What the session asks for as the player goes live. It is
+                    # read under the lock set_volume/mute take, so a change made
+                    # while this launch was in flight is in here, not lost.
+                    volume = self._volume
+                    muted = self._muted
+            if not current:
+                # This launch lost its generation (a fast next/jump/stop). Quit
+                # it now, still under _spawn_lock, so it leaves neither a live
+                # mpv nor an IPC endpoint / log dir behind.
+                self._quit(controller)
+                return
+            # Reconcile the player with the session in case volume or mute
+            # changed between the launch snapshot and registration: what the
+            # status reports and what mpv does can never diverge that way.
+            if volume != launch_volume:
+                controller.set_volume(volume)
+            if muted or muted != launch_muted:
+                controller.set_mute(muted)
         debug.log(f"Now playing: {item.title}")
         self._record_history(item)
         self._publish(queue=True)
@@ -514,7 +622,10 @@ class Engine:
             if gen != self._gen:
                 return
             self._controller = None
-        self._quit(controller)  # closes the IPC endpoint, copies mpv's log
+            # Hand the exited player to teardown while still holding the lock,
+            # so a concurrent stop()/shutdown() flush can't miss it and return
+            # while its IPC endpoint and log dir are still on disk.
+            self._retire(controller)
         if code != 0:
             self._fail(gen, item, f"Playback failed (mpv exited with status {code}).")
             return
@@ -582,12 +693,21 @@ class Engine:
                 "muted": self._muted,
             }
         position = duration = 0.0
+        volume = base["volume"]
+        muted = base["muted"]
         if controller is not None:
             position = _finite(controller.get_position())
             duration = _finite(controller.get_duration())
             if duration > 0 and item is not None:
                 with self._lock:
                     item.duration = duration
+            # Report what the player actually does, not just what the session
+            # asked for: a launch or a volume/mute command that failed leaves
+            # mpv at another level, and the status must tell the truth about
+            # it (the readings are cached inside the controller, so a slow or
+            # gone mpv falls back to its last known value).
+            volume = controller.get_volume()
+            muted = controller.is_muted()
         elif item is not None and item.duration:
             duration = item.duration
         with self._lock:
@@ -595,7 +715,7 @@ class Engine:
         result = {
             "state": base["state"], "message": base["message"],
             "position": position, "duration": duration,
-            "volume": base["volume"], "muted": base["muted"],
+            "volume": volume, "muted": bool(muted),
             "current": current, "index": index if item is not None else -1,
             "length": length,
             "has_next": item is not None and index < length - 1,
@@ -658,7 +778,11 @@ class Engine:
             old = self._leave_current_locked()
             self._gen += 1
             self._set_idle_locked()
-        self._quit(old)
+        # Stop is the user asking for silence now: return only once the player
+        # is fully gone (no mpv, no IPC endpoint, no temp log dir), so a later
+        # play starts from a clean slate.
+        self._retire(old)
+        self._flush_retired()
         self._publish(queue=True)
         return self.status()
 
@@ -678,7 +802,12 @@ class Engine:
             self._volume = target
             controller = self._controller
         if controller is not None:
-            controller.set_volume(target)
+            # Same lock a launch takes before it snapshots volume/mute, so a
+            # change made while a new player is starting is either part of that
+            # player's launch settings or lands on it right after — the launch
+            # can never finish and put the old level back.
+            with self._spawn_lock:
+                controller.set_volume(target)
         config.set_volume(target)
         self._publish()
         return self.status()
@@ -686,11 +815,21 @@ class Engine:
     def mute(self, muted=None) -> dict:
         if muted is not None and not isinstance(muted, bool):
             raise EngineError(ERR_INVALID_PARAMS, "Invalid params: 'muted' must be a boolean.")
-        controller = self._playing_controller()
         with self._lock:
+            if self._controller is None and (self._state == "idle" or self._index < 0):
+                # Nothing to mute (protocol §4.2). While an item is loading
+                # there is no live mpv yet, but the mute is session state: it
+                # is recorded and the launch picks it up as the player starts.
+                raise EngineError(ERR_NOTHING_PLAYING, "Nothing is playing.")
             target = (not self._muted) if muted is None else muted
             self._muted = target
-        controller.set_mute(target)
+            controller = self._controller
+        if controller is not None:
+            # Serialized with launches and with the launch's post-registration
+            # reconcile, so a mute made mid-track-change is never undone by the
+            # new player starting.
+            with self._spawn_lock:
+                controller.set_mute(target)
         self._publish()
         return self.status()
 
@@ -731,7 +870,8 @@ class Engine:
             old = self._leave_current_locked()
             self._gen += 1
             self._set_idle_locked()
-        self._quit(old)
+        self._quit_and_wait(old)
+        self._flush_retired()
         deadline = time.monotonic() + timeout
         while True:
             with self._lock:

@@ -146,10 +146,14 @@ started).
   `--input-ipc-server` endpoint (`get_property`/`set_property`/`cycle`/`seek`/
   `quit` for `time-pos`, `duration`, `pause`, `volume`, `mute`,
   `af-metadata/…`, `audio-params`, …), "plays" for `FAKE_MPV_DURATION` seconds
-  (default `2`) and then exits 0. A media argument containing `fake-fail` exits
-  with status 2 before opening the IPC endpoint; one containing
-  `fake-dur-<seconds>` plays that long instead; `FAKE_MPV_LOG=<file>` appends
-  each launch's argv as a JSON line.
+  (default `2`) and then exits 0. It honors `--volume=` and `--mute=yes` from
+  the command line, so a test can check the settings a launch was given. A
+  media argument containing `fake-fail` exits with status 2 before opening the
+  IPC endpoint; one containing `fake-dur-<seconds>` plays that long instead;
+  `FAKE_MPV_LOG=<file>` appends each launch's argv and pid as a JSON line, so a
+  test can also check that no superseded player is left running.
+  `FAKE_MPV_SLOW_QUIT=<seconds>` makes the fake ignore SIGTERM and linger that
+  long after a `quit`, for teardown-ordering tests.
 - `tests/fakes/fake_ytdlp.py` answers `--get-url --get-title` and
   `--flat-playlist` without the network (input containing `fake-unavailable`
   fails), for `TUNETAPE_YTDLP`.
