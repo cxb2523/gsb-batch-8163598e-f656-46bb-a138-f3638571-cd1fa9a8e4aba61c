@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4188",
     "audit": "node audit-regressions.mjs && node audit-constructions.mjs",
-    "audit:opening": "node audit-opening.mjs"
+    "audit:opening": "node audit-opening.mjs",
+    "audit:shape": "node audit-shape-integrity.mjs"
   },
   "dependencies": {
     "jspdf": "^3.0.0",

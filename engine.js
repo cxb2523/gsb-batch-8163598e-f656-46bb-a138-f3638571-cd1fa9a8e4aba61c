@@ -12,6 +12,7 @@ import {uprightNet} from './upright-net.js';
 import {finishNet} from './net-layout.js';
 import {openingSpec,applyOpening,advanceOpening} from './box-opening.js';
 import {hasOverlapEdge,overlapProfile} from './paper-edges.js';
+import {ShapeIntegrityGuard,shapeSignature} from './shape-integrity.js';
 
 // Adapted from Boo-tique: hinged panel trees, shared face textures, and projection
 // of the flattened model into physical print coordinates. See upstream/README.md.
@@ -82,7 +83,10 @@ export function makeSpec(config=state){
 const verificationCache=new Map();
 export function constructionCheck(config=state){const key=JSON.stringify([config.shape,config.width,config.depth,config.height,config.thickness,config.window]);if(verificationCache.has(key))return verificationCache.get(key);let result;try{result=validateSpec(makeSpec(config),config);}catch(e){result={status:'blocked',printable:false,physicalTested:false,issues:['Construction geometry could not be verified: '+e.message],checks:{}};}verificationCache.set(key,result);return result;}
 export function rebuild(){
- if(state.designAtlas&&state.designAtlas.manifest?.signature!==designSignature()){state.designAtlas=null;state.undoDesign=null;callbacks.onNotice?.('The box size or construction changed. Download a new template for this layout.');}
+ // Signature change => invalidate artwork cache and undo stack together, with
+ // one notice. When the signature is unchanged nothing is cleared, so fit
+ // adjustments and local edits keep their cache and history.
+ shapeGuard.sync(state,'rebuild');
  if(!renderer)return;
  opening=openingTarget=openingVelocity=0;openingBounds=null;press=drag=orbit=null;
  if(built){built.geos.forEach(g=>g.dispose());built.mats.forEach(m=>m.dispose());Object.values(built.tex).forEach(t=>t.tex.dispose());flipper.clear();}
@@ -189,7 +193,35 @@ function move(e){if(press&&e.pointerId!==press.id)return;if(press&&Math.hypot(e.
 function cancelGesture(){press=drag=orbit=null;canvas.style.cursor='default';}
 function up(e){if(e.button!==0||!press||e.pointerId!==press.id)return;const click=press.onBox&&!press.moved&&!drag&&!!hit(e);if(drag&&press.moved)callbacks.onCommit?.();cancelGesture();if(click&&(state.simpleMode||!(state.step===2&&state.designAtlas)))toggleOpen();}
 
-export function designSignature(){return JSON.stringify([state.shape,state.width,state.depth,state.height,state.thickness,!!state.window,state.closure]);}
+// The box signature is the shared invalidation key for artwork cache and undo
+// history. shapeSignature() (shape-integrity.js) is the single source of truth.
+export function designSignature(){return shapeSignature(state);}
+
+// One guard for the session. A signature change invalidates the artwork cache
+// (state.designAtlas), drops stale image assets and clears the undo stack via
+// the history callback registered from app.js.
+export const shapeGuard=new ShapeIntegrityGuard({onReset:(reason)=>{
+ const atlas=state.designAtlas;
+ state.designAtlas=null;
+ state.undoDesign=null;
+ state.lastDesignManifest=null;
+ state.templateMaps=[];
+ if(atlas){
+  const staleId=atlas.assetId;
+  state.assets=state.assets.filter(a=>a.id!==staleId);
+  unregisterImage(staleId);
+ }
+ historyReset?.();
+ callbacks.onNotice?.('The box construction changed. The previous artwork and its undo history were cleared — upload a new image for this box.');
+}});
+let historyReset=null;
+export function onShapeHistoryReset(fn){historyReset=typeof fn==='function'?fn:null;}
+// Used when opening a saved project: the incoming state is authoritative, so
+// adopt its signature without firing an invalidation.
+export function adoptShapeSignature(){shapeGuard.adopt(state);}
+export function beginArtworkUpload(){return shapeGuard.beginUpload();}
+export function resolveArtworkUpload(token,preparedSignature){return shapeGuard.resolveArtworkUpload(token,state,preparedSignature);}
+export function unregisterImage(id){assets.delete(id);}
 export function flatPieces(){
  const keepAngle=angle,keepFold=flatness;turntable.rotation.y=0;pose(0);turntable.rotation.y=0;scene.updateMatrixWorld(true);
  // Snap numerical transform noise so shared edges union into one cut contour.

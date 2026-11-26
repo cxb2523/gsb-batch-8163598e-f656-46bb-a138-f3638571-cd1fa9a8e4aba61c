@@ -62,10 +62,15 @@ At handoff 2026-11-16: build and all following commands passed:
 ```powershell
 npm.cmd run audit
 npm.cmd run audit:opening
+npm.cmd run audit:shape
 node audit-face-fit.mjs
 node audit-artwork-transform.mjs
 node audit-template-prompt.mjs
 ```
+`audit:shape` (audit-shape-integrity.mjs) verifies the box signature
+(shape/width/depth/height/thickness/window/closure) invalidates both the artwork
+cache and the undo stack together, that stale in-flight uploads are discarded, and
+that fit adjustments with an unchanged signature keep their cache and history.
 Computational geometry checks do not establish real paper buildability. Physical assembly, stock, glue, load and closure fit need testing.
 Print at 100% / Actual size. PDF is RGB, not certified CMYK/prepress output.
 AI may shift boundaries, distort text/logos or ignore orientation; fitting cannot repair illustration content.
