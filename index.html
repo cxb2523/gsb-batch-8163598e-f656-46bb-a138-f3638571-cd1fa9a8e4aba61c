@@ -511,8 +511,28 @@ const strength = c => armyOf(c) + Math.max(0, G.gold[c]) * 40 + incomeOf(c) * 12
 const devCost = i => Math.max(20, Math.round(baseOf(G.pop[i], P[i].eco) * 5 * (G.dev[i] + 1)));
 const canDev = i => G.dev[i] < MAXDEV && G.devT[i] === 0;
 function recruitMax(i) { return Math.max(0, Math.floor(G.pop[i] * 1e6 * 0.01 * G.stab[i] / 100 / 100) * 100 - G.recd[i]); }
-function availAt(i) { let a = G.army[i]; for (const o of G.orders) if (o.from === i && o.c === G.owner[i]) a -= o.n; return a; }
-function availShips(i) { let a = G.fleet[i]; for (const o of G.orders) if (o.naval && o.from === i && o.c === G.owner[i]) a -= o.ships; return a; }
+// Available forces are the single source of truth: at any moment
+//   available(i) = garrison(i) - every unsettled claim on i
+// Claims are live orders from i and marches currently sitting in i. A march
+// whose hop order is still pending claims its men through that order, so it is
+// never counted twice. Every path (march, instant reinforcement, gather,
+// cancel, save/load) goes through these two functions.
+function marchReserveAt(i) {
+  let a = 0;
+  for (const m of G.marches) {
+    if (m.at !== i) continue;
+    if (G.orders.some(o => o.m === m.id && o.from === i)) continue;   // already claimed by its pending hop order
+    a += m.n;
+  }
+  return a;
+}
+function reservedAt(i) {
+  const c = G.owner[i]; let a = 0;
+  for (const o of G.orders) if (o.from === i && o.c === c) a += o.n;
+  return a + marchReserveAt(i);
+}
+function availAt(i) { return Math.max(0, G.army[i] - reservedAt(i)); }
+function availShips(i) { let a = G.fleet[i]; for (const o of G.orders) if (o.naval && o.from === i && o.c === G.owner[i]) a -= o.ships; return Math.max(0, a); }
 function defMult(i) { return 1.1 + (G.cap[G.owner[i]] === i ? 0.15 : 0); }
 function note(html, cls) { G.log.push({ t: G.turn, h: html, c: cls || '' }); if (G.log.length > 80) G.log.shift(); }
 
@@ -676,6 +696,11 @@ function navalClash(c, t, g) {
     if (involved) { note(c === G.player ? `Naval defeat off <b>${esc(P[t].name)}</b>: your ${fmt(S)} ${S > 1 ? 'ships' : 'ship'} and ${fmt(lost)} soldiers were lost.` : `Your fleet held <b>${esc(P[t].name)}</b> against <b>${cname(c)}</b>. Lost ${fmt(lossD)}, sank ${fmt(S)}.`, c === G.player ? 'war' : 'good'); flashes.push({ p: t, t: performance.now(), win: d === G.player }); }
   }
 }
+// March id -> { from, to, n } actually moved since the last reconciliation.
+// updateMarches() is the only consumer and clears the record, so the double
+// resolveMoves() in a peace turn (endTurn -> enemyMoves) cannot erase it, and
+// calling updateMarches twice per war turn can never reconcile a hop twice.
+const marchMoves = new Map();
 function resolveMoves() {
   const arr = new Map();
   for (const o of G.orders) {
@@ -683,6 +708,7 @@ function resolveMoves() {
     const n = Math.min(o.n, G.army[o.from]), sh = o.naval ? Math.min(o.ships, G.fleet[o.from]) : 0;
     if (o.naval ? sh <= 0 : n <= 0) continue;
     G.army[o.from] -= n; G.fleet[o.from] -= sh;
+    if (o.m != null) { const r = marchMoves.get(o.m) || { from: o.from, to: o.to, n: 0 }; r.n += n; marchMoves.set(o.m, r); }
     if (!arr.has(o.to)) arr.set(o.to, new Map());
     const m = arr.get(o.to); if (!m.has(o.c)) m.set(o.c, { c: o.c, n: 0, src: [], sea: true, ships: 0, fsrc: [] });
     const g = m.get(o.c); g.n += n; if (n) g.src.push([o.from, n]); g.ships += sh; if (sh) g.fsrc.push([o.from, sh]);
@@ -734,38 +760,74 @@ function ownPath(from, dest) {   // shortest route that stays inside your own la
 const isFront = d => G.owner[d] === G.player && P[d].nb.some(j => atWar(G.owner[j], G.player));
 const instantOK = (f, d) => G.owner[f] === G.player && G.owner[d] === G.player && f !== d && P[f].nb.includes(d) && isFront(d);   // reinforce the front line at once
 function instantMove(f, d, n) {
-  n = Math.min(n, availAt(f)); if (n <= 0 || !instantOK(f, d)) return false;
+  n = Math.min(n, availAt(f));   // soldiers already claimed by orders or waiting marches cannot be used
+  if (n <= 0 || !instantOK(f, d)) return false;   // only an adjacent move into a genuine front-line province
   G.army[f] -= n; G.army[d] += n; mapDirty = true; return true;
 }
+// In the enemy phase ordinary marches may only cross our own land; attacking
+// across the border has to wait for our next End move.
+const marchRoute = (from, dest) => G.phase === 1 ? ownPath(from, dest) : pathTo(from, dest, G.player);
 function startMarch(from, dest, n, path, free) {
-  const pl = G.player, ord = { c: pl, from, to: path[1], n };
+  const pl = G.player;
+  if (G.over || G.owner[from] !== pl) return false;
+  if (G.phase === 1 && G.owner[dest] !== pl) return false;   // no cross-border marches while the enemy waits
+  if (!path || path.length < 2 || path[0] !== from) return false;
+  if (G.phase === 1 && path.some(j => G.owner[j] !== pl)) return false;
+  n = Math.min(n, availAt(from));
+  if (n <= 0) return false;
+  if (!free && G.mp < 1) return false;   // the first hop is paid for; continuation hops are free
+  const ord = { c: pl, from, to: path[1], n };
   if (free) ord.free = true;
-  if (path.length > 2) { const id = G.mid++; ord.m = id; G.marches.push({ id, at: from, next: path[1], dest, n, path, sent: true }); }
+  if (path.length > 2) {   // a real multi-province march; a one-hop move is just an order
+    const id = G.mid++; ord.m = id;
+    G.marches.push({ id, at: from, next: path[1], dest, n, path: path.slice() });
+  }
   G.orders.push(ord);
+  if (!free) G.mp--;
+  return true;
 }
 function updateMarches() {
   const pl = G.player, keep = [];
   if (pl >= 0 && G.alive[pl]) for (const m of G.marches) {
-    if (!m.sent) { keep.push(m); continue; }
-    if (G.owner[m.next] === pl) {
-      m.at = m.next; m.n = Math.min(m.n, G.army[m.at]);
-      if (m.n <= 0) continue;
-      if (m.at === m.dest) { note(`Your army of ${fmt(m.n)} reached <b>${esc(P[m.dest].name)}</b>.`, 'me'); continue; }
-      keep.push(m);
-    } else note(`The march to <b>${esc(P[m.dest].name)}</b> was stopped at ${esc(P[m.next].name)}.`, 'war');
+    const r = marchMoves.get(m.id);
+    if (!r) { keep.push(m); continue; }   // its hop order was skipped or already reconciled: no change, planMarches() retries it
+    const n = r.n;
+    if (G.owner[m.next] !== pl) { note(`The march to <b>${esc(P[m.dest].name)}</b> was stopped at ${esc(P[m.next].name)}.`, 'war'); continue; }
+    m.at = m.next; m.n = n;
+    if (m.at === m.dest) { note(`Your army of ${fmt(n)} reached <b>${esc(P[m.dest].name)}</b>.`, 'me'); continue; }
+    if (m.path && m.path[1] === m.next) m.path = m.path.slice(1);
+    m.next = -1;   // no pending hop until planMarches() plans the next one
+    keep.push(m);
   }
   G.marches = keep;
+  marchMoves.clear();   // this function is the only consumer; make repeated calls harmless
 }
 function planMarches() {
   const pl = G.player, keep = [];
-  if (pl >= 0 && G.alive[pl] && !G.over) for (const m of G.marches) {
-    m.sent = false;
-    if (G.owner[m.at] !== pl) continue;
-    const path = pathTo(m.at, m.dest, pl), n = Math.min(m.n, availAt(m.at));
-    if (!path) { note(`No route is left to <b>${esc(P[m.dest].name)}</b>. The march was called off.`, 'war'); continue; }
-    if (n <= 0) continue;
-    m.path = path; m.next = path[1]; m.n = n; m.sent = true;
-    G.orders.push({ c: pl, from: m.at, to: m.next, n, m: m.id, free: true }); keep.push(m);
+  if (pl >= 0 && G.alive[pl] && !G.over) {
+    // Free pool per province: the garrison minus claims that are NOT the
+    // marches being planned here (live orders and any foreign reservations).
+    // Each march then draws from its province pool in turn, so several
+    // marches sharing a province can never reserve more men than it holds.
+    const pool = new Map();
+    const claimOf = (i, selfId) => {
+      let a = 0;
+      for (const o of G.orders) if (o.from === i && o.c === pl) a += o.n;
+      for (const m of G.marches) if (m.at === i && m.id !== selfId && !G.orders.some(o => o.m === m.id)) a += m.n;
+      return a;
+    };
+    for (const m of G.marches) {
+      if (G.owner[m.at] !== pl) continue;   // the province was lost: the march dissolves with its claim
+      if (!pool.has(m.at)) pool.set(m.at, Math.max(0, G.army[m.at] - claimOf(m.at, m.id)));
+      const path = pathTo(m.at, m.dest, pl);
+      if (!path) { note(`No route is left to <b>${esc(P[m.dest].name)}</b>. The march was called off.`, 'war'); continue; }
+      const n = Math.min(m.n, pool.get(m.at));
+      if (n <= 0) continue;   // no unclaimed soldiers left here; the march waits another turn
+      pool.set(m.at, pool.get(m.at) - n);
+      m.path = path; m.next = path[1]; m.n = n;
+      G.orders.push({ c: pl, from: m.at, to: m.next, n, m: m.id, free: true });
+      keep.push(m);
+    }
   }
   G.marches = keep;
 }
@@ -774,10 +836,26 @@ function gatherAll(dest) {
   for (const i of ownedBy(pl)) {
     if (i === dest) continue; const n = availAt(i); if (n <= 0) continue;
     if (instantOK(i, dest) && instantMove(i, dest, n)) { cnt++; men += n; continue; }   // reinforcing the front line: at once
-    const path = G.phase === 1 ? ownPath(i, dest) : pathTo(i, dest, pl); if (!path) continue;
-    startMarch(i, dest, n, path, true); cnt++; men += n;
+    const path = marchRoute(i, dest); if (!path) continue;
+    if (startMarch(i, dest, n, path, true)) { cnt++; men += n; }
   }
   return { cnt, men };
+}
+// Cancelling one order restores its action point unless the order was a free
+// march hop (only the first hop is paid for).
+function cancelOrder(idx) {
+  const q = G.orders[idx]; if (!q) return;
+  if (q.m != null) G.marches = G.marches.filter(x => x.id !== q.m);
+  G.orders.splice(idx, 1);
+  if (!q.free) G.mp = Math.min(maxMP(q.c), G.mp + 1);
+}
+// Cancelling a whole march removes every pending order of it. The action point
+// is given back only while the paid initial hop order is still un-resolved.
+function cancelMarch(id) {
+  const paid = G.orders.some(o => o.m === id && !o.free);
+  G.marches = G.marches.filter(x => x.id !== id);
+  G.orders = G.orders.filter(o => o.m !== id);
+  if (paid) G.mp = Math.min(maxMP(G.player), G.mp + 1);
 }
 function borderOf(pl) {
   const en = new Set(enemiesOf(pl)), front = [], border = [];
@@ -1023,7 +1101,33 @@ function restore(s, slot) {
     owner: Int16Array.from(s.owner), army: Int32Array.from(s.army), fleet: s.fleet ? Int16Array.from(s.fleet) : new Int16Array(NP), pendF: s.pendF ? Int16Array.from(s.pendF) : new Int16Array(NP), dev: Uint8Array.from(s.dev), devT: s.devT ? Uint8Array.from(s.devT) : new Uint8Array(NP), stab: Uint8Array.from(s.stab),
     pop: Float32Array.from(s.pop), pend: Int32Array.from(s.pend), recd: Int32Array.from(s.recd), gold: Float64Array.from(s.gold), alive: Uint8Array.from(s.alive), cap: Int16Array.from(s.cap),
     aggr: Float32Array.from(s.aggr), prov0: Int16Array.from(s.prov0), rel: Int8Array.from(s.rel), wars: new Map(s.wars), allies: new Set(s.allies), truces: new Map(s.truces), orders: s.orders || [], log: s.log || [], marches: s.marches || [], mid: s.mid || 1, dp: s.dp != null ? s.dp : 1, phase: s.phase || 0, lostCap: s.lostCap ? Uint8Array.from(s.lostCap) : new Uint8Array(NC) };
+  normalizeOrders();
   return true;
+}
+// Rebuilds the order/march ledger after a load so the two never disagree:
+// orders must belong to a living nation and leave one of its provinces, march
+// orders must point at a known march, and marches carry no stale hop state.
+function normalizeOrders() {
+  const pl = G.player;
+  const marches = [];
+  for (const m of G.marches) {
+    if (!m || m.id == null || G.owner[m.at] !== pl) continue;
+    marches.push({ id: m.id, at: m.at, next: m.next || -1, dest: m.dest, n: Math.max(0, +m.n || 0), path: Array.isArray(m.path) ? m.path.slice() : [m.at, m.dest] });
+  }
+  const ids = new Set(marches.map(m => m.id));
+  const orders = [];
+  for (const o of G.orders) {
+    if (!o || !G.alive[o.c] || G.owner[o.from] !== o.c) continue;
+    if (o.m != null && !ids.has(o.m)) continue;   // hop order whose march is gone
+    orders.push(o);
+  }
+  G.marches = marches;
+  G.orders = orders;
+  marchMoves.clear();
+  for (const m of G.marches) {
+    const live = G.orders.some(o => o.m === m.id);
+    if (!live) m.next = -1;   // no pending hop: availAt() counts the march itself
+  }
 }
 
 // ============================================================ map view
@@ -1486,13 +1590,13 @@ $('panel').addEventListener('click', e => {
   if (G.over) return;
   const a = b.dataset.a, i = UI.sel, pl = G.player, o = G.owner[i];
   if (G.phase === 1 && ['nvok', 'naval'].includes(a)) { toast('Enemy phase: ships and attacks wait. Press End turn.'); return; }
-  if (a === 'mvok') { const m = UI.move; if (!m) return; if (G.phase === 1 && G.owner[m.dest] !== pl) { toast('Enemy phase: your armies can move only inside your own land.'); return; } if (!spend(1)) return; if (instantOK(m.from, m.dest)) { if (instantMove(m.from, m.dest, clamp(m.n, 1, availAt(m.from)))) { toast(`${fmt(m.n)} soldiers moved up to the front at ${P[m.dest].name}.`); UI.sel = m.dest; } else { G.mp++; toast('No route through your own land.'); } } else startMarch(m.from, m.dest, clamp(m.n, 1, availAt(m.from)), m.path); UI.move = null; }
+  if (a === 'mvok') { const m = UI.move; if (!m) return; if (G.phase === 1 && G.owner[m.dest] !== pl) { toast('Enemy phase: your armies can move only inside your own land.'); return; } const n = clamp(m.n, 1, availAt(m.from)); if (instantOK(m.from, m.dest)) { if (!spend(1)) { UI.move = null; return; } if (instantMove(m.from, m.dest, n)) { toast(`${fmt(n)} soldiers moved up to the front at ${P[m.dest].name}.`); UI.sel = m.dest; } else { G.mp++; toast('No free soldiers or no route through your own land.'); } } else if (!startMarch(m.from, m.dest, n, m.path)) { toast('No free soldiers, no actions left or no route through your own land.'); } UI.move = null; }
   else if (a === 'nvok') { const m = UI.move; if (!m || !m.naval) return; if (!spend(1)) return; G.orders.push({ c: pl, from: m.from, to: m.to, n: clamp(m.n, 0, availAt(m.from)), ships: clamp(m.ships, 1, availShips(m.from)), naval: true }); UI.move = null; }
   else if (a === 'naval') { UI.pickNaval = i; UI.pickFrom = -1; UI.move = null; cv.classList.add('aim'); toast('Click a highlighted coast to sail to. Esc cancels.'); }
   else if (a === 'shok') { const n = +$('sh').value, c = n * SHIP_COST; if (G.gold[pl] < c || !spend(1)) return; G.gold[pl] -= c; G.fleet[i] += n; toast(`${n} ${n > 1 ? 'ships are' : 'ship is'} ready now.`); }
   else if (a === 'mvno') UI.move = null;
-  else if (a === 'del') { const q = G.orders[+b.dataset.k]; if (!q) return; if (q.m) G.marches = G.marches.filter(x => x.id !== q.m); G.orders.splice(+b.dataset.k, 1); if (!q.free) G.mp = Math.min(maxMP(pl), G.mp + 1); }
-  else if (a === 'mdel') { const id = +b.dataset.k; G.marches = G.marches.filter(x => x.id !== id); G.orders = G.orders.filter(x => x.m !== id); }
+  else if (a === 'del') cancelOrder(+b.dataset.k);
+  else if (a === 'mdel') cancelMarch(+b.dataset.k);
   else if (a === 'march') { UI.pickFrom = i; UI.move = null; cv.classList.add('aim'); toast('Click the destination province. Esc cancels.'); }
   else if (a === 'gather') { if (!spend(2)) return; const r = gatherAll(i); if (!r.cnt) { G.mp += 2; toast('No other free armies can reach this province.'); } else toast(`${r.cnt} ${r.cnt > 1 ? 'armies' : 'army'} (${fmt(r.men)} soldiers) set out for ${P[i].name}.`); }
   else if (a === 'rcok') { const n = +$('rc').value; if (n / 100 > G.gold[pl] + 1e-6) return; if (!spend(1)) return; G.gold[pl] -= n / 100; G.army[i] += n; G.recd[i] += n; G.pop[i] -= n / 1e6; toast(`${fmt(n)} recruits are ready now.`); }
@@ -1747,7 +1851,10 @@ function start(data) {
 if (window.claude && window.claude.hot) { try { window.claude.hot.snapshot(() => (G && !UI.picking ? { save: serialize() } : {})); } catch (e) {} }
 if (window.claude && window.claude.hot && window.claude.hot.ready) window.claude.hot.ready(start); else start((window.claude && window.claude.hot && window.claude.hot.data) || {});
 UI.pickFrom = -1;
-window.__game = { get G() { return G; }, get T() { return T; }, STEPS, tutGo, UI, P, CN, endTurn, clickProv, view, byId };
+window.__game = { get G() { return G; }, get T() { return T; }, STEPS, tutGo, UI, P, CN, D, endTurn, clickProv, planMove, planNaval, view, byId,
+  newGame, declareWar, makePeace, pathTo, ownPath, startMarch, updateMarches, planMarches, resolveMoves, gatherAll, instantMove,
+  instantOK, isFront, availAt, availShips, reservedAt, marchReserveAt, cancelMarch, cancelOrder, serialize, restore, normalizeOrders,
+  spend, maxMP, atWar, enemiesOf, ownedBy, marchMoves, get seed() { return seed; }, set seed(v) { seed = v; } };
 
 </script>
 </body>

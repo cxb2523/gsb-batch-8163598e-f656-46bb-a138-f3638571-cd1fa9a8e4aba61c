@@ -1,0 +1,8 @@
+{
+  "name": "borders-crowns-movement-tests",
+  "private": true,
+  "description": "Local verification for the march / reinforcement / order ledger. Run: node tests/run.js",
+  "scripts": {
+    "test": "node tests/run.js"
+  }
+}
