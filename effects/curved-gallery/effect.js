@@ -472,7 +472,9 @@
     let back = null,
       swipe = null;
     element.classList.add('arc-stage');
-    element.innerHTML = '<div class="arc-viewport" aria-hidden="true"><div class="arc-fallback"></div></div>';
+    element.innerHTML =
+      '<div class="arc-viewport" aria-hidden="true"><div class="arc-fallback"></div></div>' +
+      '<div class="arc-caption" aria-hidden="true"><strong>01 / 06</strong></div>';
     if (cardGL)
       element
         .querySelector('.arc-viewport')
@@ -482,13 +484,17 @@
       viewport = element.querySelector('.arc-viewport'),
       slider = element.querySelector('input'),
       caption = element.querySelector('.arc-caption strong');
+    // Optional outer mount element (mountCurvedGallery passes its own stage). Live state dataset is
+    // mirrored there as well so either element documented by data-arc or the caller's root can be read.
+    const stateRoot = options.stateRoot && options.stateRoot !== element ? options.stateRoot : null;
     let renderer = null,
       scene,
       camera,
       meshes = [],
       textures = [],
-      geometry,
+      geometry = null,
       materials = [],
+      glGeneration = 0,
       offset = 0,
       target = 0,
       velocity = 0,
@@ -496,20 +502,76 @@
       targetProgress = 0,
       drag = null,
       lastActive = -1,
+      activeIndex = 0,
       contextLost = false;
     const css = getComputedStyle(element),
       tok = (n, f) => css.getPropertyValue(n).trim() || f;
     const INK = tok('--ink', '#17181a'),
       ACC = tok('--accent', '#4559ff'),
       INK3 = tok('--ink-3', '#9a9993');
-    const originals = [];
     const fallbacks = Array.from({ length: 6 }, (_, i) => {
       const frame = document.createElement('div');
       frame.className = 'arc-flat-card';
+      frame.dataset.index = String(i);
       frame.innerHTML = cardOpt.item(i);
       fallback.append(frame);
       return frame;
     });
+    // One generation of GPU resources. A context restore disposes the dead generation once and builds
+    // exactly one fresh generation; destroy() disposes the live generation once. Empty arrays plus a
+    // null geometry are the "nothing to release" state, so neither path can double-dispose or leak.
+    function buildResources() {
+      geometry = new THREE.PlaneGeometry(1.8, 2.25, 16, 8);
+      meshes = [];
+      textures = [];
+      materials = [];
+      for (let i = 0; i < 6; i++) {
+        const texture = new THREE.CanvasTexture(cardOpt.texture(i));
+        texture.encoding = THREE.sRGBEncoding;
+        textures.push(texture);
+        const material = new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.DoubleSide,
+          transparent: true,
+          depthWrite: false,
+        });
+        materials.push(material);
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+        meshes.push(mesh);
+      }
+      glGeneration++;
+    }
+    // Disposes the current GPU generation exactly once. Idempotent: after the first call the arrays
+    // are empty and geometry is null, so later destroy/restore paths cannot double-release anything.
+    function disposeResources() {
+      const alive =
+        textures.length > 0 || materials.length > 0 || geometry || meshes.length > 0;
+      if (!alive) return;
+      textures.forEach((t) => {
+        try {
+          t.dispose();
+        } catch {}
+      });
+      materials.forEach((m) => {
+        try {
+          m.dispose();
+        } catch {}
+      });
+      if (geometry)
+        try {
+          geometry.dispose();
+        } catch {}
+      meshes.forEach((m) => {
+        try {
+          if (scene) scene.remove(m);
+        } catch {}
+      });
+      meshes = [];
+      textures = [];
+      materials = [];
+      geometry = null;
+    }
     if (cardGL)
       try {
         if (new URLSearchParams(location.search).has('fallback')) throw new Error('Explicit fallback preview.');
@@ -519,49 +581,59 @@
         scene = new THREE.Scene();
         camera = new THREE.PerspectiveCamera(40, 1, 0.1, 50);
         camera.position.z = 6.5;
-        geometry = new THREE.PlaneGeometry(1.8, 2.25, 16, 8);
-        for (let i = 0; i < 6; i++) {
-          const texture = new THREE.CanvasTexture(cardGL ? cardOpt.texture(i) : originals[i]);
-          texture.encoding = THREE.sRGBEncoding;
-          textures.push(texture);
-          const material = new THREE.MeshBasicMaterial({
-            map: texture,
-            side: THREE.DoubleSide,
-            transparent: true,
-            depthWrite: false,
-          });
-          materials.push(material);
-          const mesh = new THREE.Mesh(geometry, material);
-          scene.add(mesh);
-          meshes.push(mesh);
-        }
+        buildResources();
         fallback.hidden = true;
       } catch (error) {
+        disposeResources();
         if (renderer) {
-          renderer.dispose();
-          renderer.forceContextLoss();
+          try {
+            renderer.dispose();
+          } catch {}
+          try {
+            renderer.forceContextLoss();
+          } catch {}
           renderer = null;
         }
         canvas.hidden = true;
         fallback.hidden = false;
       }
     function sizing() {
-      if (renderer && !contextLost) {
-        renderer.setSize(viewport.clientWidth, viewport.clientHeight, false);
-        camera.aspect = viewport.clientWidth / viewport.clientHeight;
-        camera.updateProjectionMatrix();
-      }
+      if (api.destroyed || !renderer || contextLost) return;
+      renderer.setSize(viewport.clientWidth, viewport.clientHeight, false);
+      camera.aspect = viewport.clientWidth / viewport.clientHeight;
+      camera.updateProjectionMatrix();
     }
     api.on('resize', sizing);
     if (cardGL && renderer) {
       api.listen(canvas, 'webglcontextlost', (event) => {
         event.preventDefault();
+        if (api.destroyed) return;
         contextLost = true;
         canvas.hidden = true;
         fallback.hidden = false;
+        // Paint synchronously: the CSS cards must match the last WebGL frame (offset, fold progress
+        // and active number) in the very same task, before the browser gets a chance to present.
         api.paint();
       });
       api.listen(canvas, 'webglcontextrestored', () => {
+        if (api.destroyed || !renderer) return;
+        // Ignore a duplicate/late restore that has no matching loss transition.
+        if (!contextLost) return;
+        // State variables are intentionally untouched here: any drag/wheel edits made through the CSS
+        // fallback while the context was gone are the current state and WebGL must continue from them.
+        // The GPU-side generation died with the old context; release its wrappers once and rebuild only
+        // the per-card textures/materials plus the shared geometry the renderer cannot reuse.
+        disposeResources();
+        try {
+          buildResources();
+        } catch (error) {
+          // If rebuilding fails, stay on the CSS path instead of throwing into the restored event.
+          contextLost = true;
+          canvas.hidden = true;
+          fallback.hidden = false;
+          api.paint();
+          return;
+        }
         contextLost = false;
         canvas.hidden = false;
         fallback.hidden = true;
@@ -579,10 +651,24 @@
       }
       api.wake();
     }
+    // Pointer capture can legitimately fail for synthetic/non-active pointers; never let cleanup or a
+    // pointer handler throw over it. Every successful capture is released through releasePointer().
+    function capturePointer(target, pointerId) {
+      if (pointerId == null || pointerId === -1) return;
+      try {
+        if (target && !target.hasPointerCapture(pointerId)) target.setPointerCapture(pointerId);
+      } catch {}
+    }
+    function releasePointer(target, pointerId) {
+      if (pointerId == null || pointerId === -1 || !target) return;
+      try {
+        if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+      } catch {}
+    }
     api.listen(viewport, 'pointerdown', (event) => {
       if (event.button !== 0 || api.paused || api.reduced) return;
       grab(event.pointerId, event.clientX, performance.now());
-      viewport.setPointerCapture(event.pointerId);
+      capturePointer(viewport, event.pointerId);
       viewport.classList.add('is-dragging');
     });
     api.listen(viewport, 'pointermove', (event) => {
@@ -605,6 +691,7 @@
     }
     function release(event) {
       if (!drag || event.pointerId !== drag.id) return;
+      releasePointer(viewport, drag.id);
       drag = null;
       viewport.classList.remove('is-dragging');
       api.wake();
@@ -729,7 +816,7 @@
         back = null;
         if (api.reduced) {
           swipe = { id: event.pointerId, x: event.clientX };
-          viewport.setPointerCapture(event.pointerId);
+          capturePointer(viewport, event.pointerId);
         }
       });
       api.listen(viewport, 'pointermove', (event) => {
@@ -738,6 +825,7 @@
       api.listen(viewport, 'pointerup', (event) => {
         if (!swipe || swipe.id !== event.pointerId) return;
         const dx = event.clientX - swipe.x;
+        releasePointer(viewport, swipe.id);
         swipe = null;
         if (Math.abs(dx) > 24) {
           target = Math.round(target) + (dx < 0 ? 1 : -1);
@@ -751,10 +839,12 @@
         swipe = null;
       });
       api.restore = () => {
+        if (api.destroyed) return;
+        if (swipe) releasePointer(viewport, swipe.id);
         swipe = null;
         if (drag) {
           const id = drag.id;
-          if (id !== -1 && viewport.hasPointerCapture(id)) viewport.releasePointerCapture(id);
+          releasePointer(viewport, id);
           release({ pointerId: id });
         }
         velocity = 0;
@@ -794,6 +884,10 @@
         scale = R.mix(mobile ? 1 : 1.18, mobile ? 0.82 : 0.8, mix),
         columns = mobile ? 2 : 3;
       if (camera) camera.position.z = cameraZ;
+      // The card nearest the front at the current offset. Computed before the per-card loop so the
+      // fallback card, caption and dataset all publish the same number in this same frame.
+      const active = ((Math.round(offset + 2.5) % 6) + 6) % 6;
+      activeIndex = active;
       for (let i = 0; i < 6; i++) {
         const rel = ((((i - 2.5 - offset + 9) % 6) + 6) % 6) - 3,
           theta = (rel * params.curvature * Math.PI) / 180;
@@ -827,6 +921,8 @@
           perspective +
           ')';
         el.style.zIndex = String(Math.round(100 + z * 10));
+        if (i === active) el.setAttribute('data-active', 'true');
+        else el.removeAttribute('data-active');
       }
       if (geometry) {
         const positions = geometry.attributes.position;
@@ -837,15 +933,31 @@
         positions.needsUpdate = true;
       }
       if (renderer && !contextLost) renderer.render(scene, camera);
-      const active = ((Math.round(offset + 2.5) % 6) + 6) % 6;
-      if (active !== lastActive && caption) {
-        caption.textContent = String(active + 1).padStart(2, '0') + ' / 06';
+      const activeNumber = String(active + 1).padStart(2, '0');
+      if (active !== lastActive) {
+        if (caption) caption.textContent = activeNumber + ' / 06';
         lastActive = active;
       }
+      const rendererMode = renderer && !contextLost ? 'webgl' : 'css';
+      const phase = progress > 0.98 ? 'grid' : 'arc';
+      // Canonical state output. data-active/data-index are the 0-based selected card, data-number the
+      // 1-based padded label (matching the optional .arc-caption strong text "NN / 06").
       element.dataset.progress = progress.toFixed(4);
       element.dataset.offset = offset.toFixed(4);
-      element.dataset.renderer = renderer && !contextLost ? 'webgl' : 'css';
-      element.dataset.phase = progress > 0.98 ? 'grid' : 'arc';
+      element.dataset.renderer = rendererMode;
+      element.dataset.phase = phase;
+      element.dataset.active = String(active);
+      element.dataset.index = String(active);
+      element.dataset.number = activeNumber;
+      if (stateRoot) {
+        stateRoot.dataset.progress = element.dataset.progress;
+        stateRoot.dataset.offset = element.dataset.offset;
+        stateRoot.dataset.renderer = rendererMode;
+        stateRoot.dataset.phase = phase;
+        stateRoot.dataset.active = String(active);
+        stateRoot.dataset.index = String(active);
+        stateRoot.dataset.number = activeNumber;
+      }
       return (
         !!back ||
         !!drag ||
@@ -855,19 +967,45 @@
       );
     });
     api.on('destroy', () => {
-      if (drag && viewport.hasPointerCapture(drag.id)) viewport.releasePointerCapture(drag.id);
+      // Release pointer capture for both the free drag and the reduced-motion swipe while the
+      // viewport is still attached, and drop every interaction/animation field.
+      if (drag) releasePointer(viewport, drag.id);
+      if (swipe) releasePointer(viewport, swipe.id);
       drag = null;
-      textures.forEach((t) => t.dispose());
-      materials.forEach((m) => m.dispose());
-      if (geometry) geometry.dispose();
+      swipe = null;
+      back = null;
+      velocity = 0;
+      offset = target = progress = targetProgress = 0;
+      activeIndex = 0;
+      lastActive = -1;
+      try {
+        viewport.classList.remove('is-dragging');
+      } catch {}
+      // Dispose the live resource generation exactly once. Restore-rebuilt generations are tracked by
+      // the same arrays, so there is no double release and no leaked generation.
+      disposeResources();
       if (renderer) {
-        renderer.dispose();
-        renderer.forceContextLoss();
+        try {
+          renderer.dispose();
+        } catch {}
+        try {
+          renderer.forceContextLoss();
+        } catch {}
+        renderer = null;
       }
-      meshes = [];
-      textures = [];
-      materials = [];
-      if (canvas) canvas.width = canvas.height = 1;
+      contextLost = false;
+      if (canvas) {
+        try {
+          canvas.width = canvas.height = 1;
+        } catch {}
+      }
+      // Remove live-state attributes from the inner node as well; the outer mount restores the
+      // caller's element wholesale, this only keeps a retained inner node from advertising state.
+      ['progress', 'offset', 'renderer', 'phase', 'active', 'index', 'number'].forEach((key) => {
+        try {
+          delete element.dataset[key];
+        } catch {}
+      });
     });
     const status = api.status;
     api.status = () => ({
@@ -877,8 +1015,14 @@
       velocity,
       progress,
       targetProgress,
+      active: activeIndex,
+      dragging: !!drag,
+      contextLost,
+      glGeneration,
       renderer: renderer && !contextLost ? 'webgl' : 'css',
-      resources: api.destroyed ? 0 : meshes.length + textures.length + materials.length,
+      resources: api.destroyed
+        ? 0
+        : meshes.length + textures.length + materials.length + (geometry ? 1 : 0),
     });
     return api;
   }
@@ -1023,6 +1167,7 @@
     observer0.observe(stage);
     const inst = mount(box, {
       params: options.params,
+      stateRoot: stage,
       card: {
         interactive: true,
         texture,
@@ -1046,15 +1191,23 @@
       setParams: inst.setParams,
       setPaused: inst.setPaused,
       reset() {
+        if (inst.destroyed) return;
         inst.setParams(inst.defaults);
         if (inst.restore) inst.restore();
         else inst.replay();
       },
       setReducedMotion: inst.setReduced,
+      status() {
+        return typeof inst.status === 'function' ? inst.status() : null;
+      },
       destroy() {
         if (mounted.done) return;
-        inst.destroy();
-        mounted.restore();
+        // Restore the caller's DOM/attributes even if an inner teardown step reports an error.
+        try {
+          inst.destroy();
+        } finally {
+          mounted.restore();
+        }
       },
     };
   }

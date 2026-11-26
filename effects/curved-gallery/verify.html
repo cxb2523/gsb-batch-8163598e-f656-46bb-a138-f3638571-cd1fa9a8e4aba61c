@@ -1,0 +1,684 @@
+<!doctype html>
+<!--
+  Curved Gallery — local state-consistency & lifecycle verification sample.
+
+  Open this file directly (double-click / file://); no server or network needed.
+  It mounts real galleries, drives pointer/wheel/context-loss events, and checks:
+    A1 drag / wheel update dataset.offset/progress and the selected number
+    A2 webglcontextlost synchronously puts the pre-loss offset/progress/active on CSS cards
+    A3 edits made during loss survive webglcontextrestored (no snap-back), resources rebuild once
+    A4 destroy() mid-drag / mid-fold / while lost releases capture, listeners, observers and GPU
+       resources and restores the mount element's DOM/attributes
+    A5 context-restored / resize after destroy never restarts the rAF loop
+
+  The same assertions are exposed for automation:
+    window.__CURVED_VERIFY__ = { done, passed, failed, total, results }
+    document.documentElement.dataset.verify = 'pass' | 'fail' | 'running'
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Curved Gallery · 状态一致性验证</title>
+<link rel="stylesheet" href="effect.css">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 80px;
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #17181a; background: #f4f4f1;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #6b6a64; margin: 0 0 24px; }
+  a { color: #4559ff; }
+  .panel {
+    background: #fff; border: 1px solid #e6e5df; border-radius: 16px;
+    padding: 18px; margin: 18px 0; box-shadow: 0 1px 3px rgba(23,24,26,.05);
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; }
+  #demo { width: 100%; height: 460px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  button {
+    appearance: none; border: 1px solid #d8d7d0; background: #fff; color: #17181a;
+    border-radius: 999px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: #4559ff; color: #4559ff; }
+  button:disabled { opacity: .45; cursor: default; }
+  label.chk { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: #444; }
+  .readout {
+    margin-left: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #555; background: #f6f6f2; border-radius: 8px; padding: 6px 10px; white-space: nowrap;
+  }
+  #summary { font-weight: 700; font-size: 15px; padding: 10px 14px; border-radius: 10px; display: inline-block; }
+  #summary.running { background: #eef0ff; color: #3340d8; }
+  #summary.pass { background: #e7f7ec; color: #137a36; }
+  #summary.fail { background: #fdecec; color: #c62b2b; }
+  ol#results { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 6px; }
+  ol#results li {
+    display: flex; gap: 10px; align-items: baseline; padding: 7px 11px; border-radius: 8px;
+    background: #fafaf7; border: 1px solid #eeeDE6; font-size: 13px;
+  }
+  ol#results li .tag { flex: 0 0 52px; font-weight: 700; font-size: 11px; letter-spacing: .08em; }
+  ol#results li.pass .tag { color: #137a36; }
+  ol#results li.fail { background: #fdf1f1; border-color: #f3d2d2; }
+  ol#results li.fail .tag { color: #c62b2b; }
+  ol#results li .msg { color: #333; }
+  ol#results li .detail { color: #a03030; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  /* Off-screen-but-intersecting host for automated fixture stages. */
+  #fixture-host {
+    position: fixed; right: 0; bottom: 0; width: 300px; height: 180px;
+    opacity: .01; pointer-events: none; z-index: -1; overflow: hidden;
+  }
+  #fixture-host .fixture { width: 300px; height: 180px; }
+  .note { font-size: 12.5px; color: #77756d; }
+  code { background: #f1f0ea; border-radius: 5px; padding: 1px 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Curved Gallery · 跨渲染路径状态一致性验证</h1>
+  <p class="sub">
+    直接用浏览器打开本文件即可（<code>file://</code>，无需服务或联网）。上方画廊可手动拖拽 / 滚轮折展，
+    也可用按钮模拟上下文丢失与恢复；页面加载后会自动运行下列断言。对照页：<a href="index.html">index.html</a>。
+  </p>
+
+  <div class="panel">
+    <h2>手动复现</h2>
+    <div id="demo" aria-label="Curved Gallery verification demo"></div>
+    <div class="toolbar">
+      <button id="btn-lose">模拟 webglcontextlost</button>
+      <button id="btn-restore">模拟 webglcontextrestored</button>
+      <button id="btn-drag">程序拖拽一段</button>
+      <button id="btn-fold">滚轮向下折展</button>
+      <button id="btn-unfold">滚轮向上展开</button>
+      <button id="btn-destroy">destroy()</button>
+      <button id="btn-remount">重新 mount</button>
+      <label class="chk"><input type="checkbox" id="chk-reduced"> reducedMotion</label>
+      <span class="readout" id="readout">—</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>自动断言</h2>
+    <span id="summary" class="running" data-state="running">RUNNING…</span>
+    <ol id="results"></ol>
+    <p class="note" style="margin-top:14px">
+      自动化读取：<code>window.__CURVED_VERIFY__</code> 与 <code>document.documentElement.dataset.verify</code>。
+      资源断言按“每个被构造的 Texture / Material / Geometry 恰好 dispose 一次”统计；
+      监听器断言核对每次 mount 经 <code>addEventListener</code> 登记的函数在 destroy 后都已移除。
+    </p>
+  </div>
+</div>
+<div id="fixture-host" aria-hidden="true"></div>
+
+<script src="three.min.js"></script>
+<script src="effect.js"></script>
+<script>
+(function () {
+  'use strict';
+  document.documentElement.dataset.verify = 'running';
+
+  // ---------- instrumentation: pointer capture ownership (works for untrusted events too) ----------
+  const captureOwners = new WeakMap(); // element -> Set<pointerId>
+  const nativeSetCapture = Element.prototype.setPointerCapture;
+  const nativeReleaseCapture = Element.prototype.releasePointerCapture;
+  Element.prototype.setPointerCapture = function (id) {
+    let set = captureOwners.get(this);
+    if (!set) { set = new Set(); captureOwners.set(this, set); }
+    set.add(id);
+    try { nativeSetCapture.call(this, id); } catch (_) { /* synthetic pointer: no native active pointer */ }
+  };
+  Element.prototype.hasPointerCapture = function (id) {
+    const set = captureOwners.get(this);
+    return !!(set && set.has(id));
+  };
+  Element.prototype.releasePointerCapture = function (id) {
+    const set = captureOwners.get(this);
+    if (set) set.delete(id);
+    try { nativeReleaseCapture.call(this, id); } catch (_) {}
+  };
+
+  // ---------- instrumentation: event listener balance ----------
+  const activeListeners = new Map(); // target -> Map<type|cap, Set<fn>>
+  let recording = null;             // array receiving records for the mount currently tracked
+  const nativeAdd = EventTarget.prototype.addEventListener;
+  const nativeRemove = EventTarget.prototype.removeEventListener;
+  EventTarget.prototype.addEventListener = function (type, fn, opts) {
+    try {
+      const cap = !!(opts === true || (opts && opts.capture));
+      const key = type + '|' + cap;
+      let byType = activeListeners.get(this);
+      if (!byType) { byType = new Map(); activeListeners.set(this, byType); }
+      let set = byType.get(key);
+      if (!set) { set = new Set(); byType.set(key, set); }
+      set.add(fn);
+      if (recording) recording.push({ target: this, key, fn });
+    } catch (_) {}
+    return nativeAdd.call(this, type, fn, opts);
+  };
+  EventTarget.prototype.removeEventListener = function (type, fn, opts) {
+    try {
+      const cap = !!(opts === true || (opts && opts.capture));
+      const key = type + '|' + cap;
+      const byType = activeListeners.get(this);
+      const set = byType && byType.get(key);
+      if (set) set.delete(fn);
+    } catch (_) {}
+    return nativeRemove.call(this, type, fn, opts);
+  };
+  function leakedRecords(records) {
+    return records.filter((rec) => {
+      const byType = activeListeners.get(rec.target);
+      const set = byType && byType.get(rec.key);
+      return set && set.has(rec.fn);
+    });
+  }
+  function mountTracked(el, options) {
+    recording = [];
+    let handle;
+    try {
+      handle = mountCurvedGallery(el, options);
+    } finally {
+      const records = recording;
+      recording = null;
+      handle.__records = records;
+    }
+    return handle;
+  }
+
+  // ---------- instrumentation: observers ----------
+  const observerRecords = [];
+  ['ResizeObserver', 'IntersectionObserver'].forEach((name) => {
+    const Orig = window[name];
+    if (!Orig) return;
+    const Wrapped = class extends Orig {
+      constructor(cb, opts) {
+        super(cb, opts);
+        const rec = { name, disconnects: 0 };
+        observerRecords.push(rec);
+        const origDisconnect = this.disconnect.bind(this);
+        this.disconnect = function () { rec.disconnects++; return origDisconnect(); };
+      }
+    };
+    window[name] = Wrapped;
+  });
+
+  // ---------- instrumentation: THREE resources ----------
+  const stats = {
+    constructed: { texture: 0, material: 0, geometry: 0, renderer: 0 },
+    disposed: { texture: 0, material: 0, geometry: 0, renderer: 0, forceLoss: 0 },
+    blockRenderer: false,
+  };
+  function spyDispose(proto, bucket) {
+    const orig = proto.dispose;
+    proto.dispose = function () {
+      stats.disposed[bucket]++;
+      this.__disposeCount = (this.__disposeCount || 0) + 1;
+      return orig.call(this);
+    };
+  }
+  spyDispose(THREE.Texture.prototype, 'texture');
+  spyDispose(THREE.Material.prototype, 'material');
+  spyDispose(THREE.BufferGeometry.prototype, 'geometry');
+
+  function ctorSpy(Orig, bucket) {
+    const Wrapped = function (...args) {
+      const instance = new Orig(...args);
+      stats.constructed[bucket]++;
+      return instance;
+    };
+    Wrapped.prototype = Orig.prototype;
+    return Wrapped;
+  }
+  THREE.CanvasTexture = ctorSpy(THREE.CanvasTexture, 'texture');
+  THREE.MeshBasicMaterial = ctorSpy(THREE.MeshBasicMaterial, 'material');
+  THREE.PlaneGeometry = ctorSpy(THREE.PlaneGeometry, 'geometry');
+
+  const OrigWebGLRenderer = THREE.WebGLRenderer;
+  const RendererSpy = function (...args) {
+    if (stats.blockRenderer) throw new Error('blocked WebGLRenderer for fallback test');
+    const r = new OrigWebGLRenderer(...args);
+    stats.constructed.renderer++;
+    const origDispose = r.dispose;
+    r.dispose = function () { stats.disposed.renderer++; return origDispose.call(r); };
+    const origForceLoss = r.forceContextLoss;
+    r.forceContextLoss = function () { stats.disposed.forceLoss++; return origForceLoss.call(r); };
+    return r;
+  };
+  RendererSpy.prototype = OrigWebGLRenderer.prototype;
+  THREE.WebGLRenderer = RendererSpy;
+
+  // ---------- tiny test harness ----------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const results = [];
+  function check(id, name, condition, detail) {
+    results.push({ id, name, ok: !!condition, detail: condition ? null : (detail == null ? null : String(detail)) });
+  }
+  async function test(id, name, fn) {
+    try { await fn(); }
+    catch (error) { results.push({ id, name, ok: false, detail: (error && error.message) || String(error) }); }
+    render();
+  }
+  async function waitStable(datasetKey, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 5000);
+    let last = null, stableMs = 0, lastT = Date.now();
+    while (Date.now() < deadline) {
+      const box = currentBox;
+      const value = box ? box.dataset[datasetKey] : null;
+      const now = Date.now();
+      if (value === last) stableMs += now - lastT;
+      else { stableMs = 0; last = value; }
+      lastT = now;
+      if (stableMs >= 260) return value;
+      await sleep(90);
+    }
+    return last;
+  }
+  // Wait until physics has caught its targets. Reading status() avoids being fooled by a frozen
+  // dataset string during a startup frame stall.
+  async function waitConverged(handle, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 8000);
+    while (Date.now() < deadline) {
+      const s = handle.status();
+      if (s && !s.destroyed && !s.drag &&
+        Math.abs(s.offset - s.target) < 0.01 &&
+        Math.abs(s.progress - s.targetProgress) < 0.01 &&
+        Math.abs(s.velocity) < 0.05) return s;
+      await sleep(100);
+    }
+    return handle.status();
+  }
+
+  const host = document.getElementById('fixture-host');
+  let currentBox = null;
+  function createFixture(attrs) {
+    const el = document.createElement('div');
+    // Preserve the sizing .fixture class; merge any caller-supplied class instead of overwriting it,
+    // otherwise the stage collapses to zero height and IntersectionObserver sleeps the loop.
+    el.className = 'fixture' + (attrs && attrs.class ? ' ' + attrs.class : '');
+    for (const [name, value] of Object.entries(attrs || { id: 'fixture' })) {
+      if (name === 'class') continue;
+      el.setAttribute(name, value);
+    }
+    host.appendChild(el);
+    currentBox = null;
+    return el;
+  }
+  function boxOf(el) { return el.querySelector('[data-arc]'); }
+  function viewportOf(el) { return el.querySelector('.arc-viewport'); }
+  async function pointerDrag(el, fromDx, toDx, pointerId, steps) {
+    const vp = viewportOf(el);
+    const rect = vp.getBoundingClientRect();
+    const x0 = rect.left + rect.width / 2 + (fromDx || 0);
+    const y0 = rect.top + rect.height / 2;
+    const x1 = rect.left + rect.width / 2 + (toDx == null ? -120 : toDx);
+    const id = pointerId == null ? 11 : pointerId;
+    vp.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: id, clientX: x0, clientY: y0 }));
+    const n = steps || 8;
+    for (let i = 1; i <= n; i++) {
+      await sleep(18);
+      const x = x0 + ((x1 - x0) * i) / n;
+      vp.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: id, clientX: x, clientY: y0 }));
+    }
+    await sleep(18);
+    vp.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0, buttons: 0, pointerId: id, clientX: x1, clientY: y0 }));
+  }
+  function wheel(el, deltaY) {
+    viewportOf(el).dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: deltaY }));
+  }
+  function contextEvent(canvas, type) {
+    canvas.dispatchEvent(new Event(type, { cancelable: true }));
+  }
+  const activeFormula = (offset) => ((((Math.round(offset + 2.5)) % 6) + 6) % 6);
+
+  // ---------- render report progressively ----------
+  const list = document.getElementById('results');
+  const summary = document.getElementById('summary');
+  function render() {
+    list.innerHTML = '';
+    for (const r of results) {
+      const li = document.createElement('li');
+      li.className = r.ok ? 'pass' : 'fail';
+      li.innerHTML = '<span class="tag">' + (r.ok ? 'PASS' : 'FAIL') + '</span>' +
+        '<span class="msg"></span>' + (r.detail ? '<span class="detail"></span>' : '');
+      li.querySelector('.msg').textContent = r.id + ' · ' + r.name;
+      if (r.detail) li.querySelector('.detail').textContent = r.detail;
+      list.appendChild(li);
+    }
+    const failed = results.filter((r) => !r.ok).length;
+    summary.textContent = results.length + ' checks · ' + (results.length - failed) + ' passed' + (failed ? ' · ' + failed + ' failed' : '');
+    summary.className = failed ? 'fail' : (window.__CURVED_VERIFY__ && window.__CURVED_VERIFY__.done ? 'pass' : 'running');
+  }
+
+  // =====================================================================
+  // Automated scenarios
+  // =====================================================================
+  async function runSuite() {
+    // ---- T1: mount + A1 interaction state ----
+    let stage = createFixture({ id: 'fx-a1', class: 'verify-fixture', 'data-case': 'a1', 'aria-label': 'fixture A1' });
+    const originalAttrs = Array.from(stage.attributes).map((a) => [a.name, a.value]);
+    const obsStartT1 = observerRecords.length;
+    let fx = mountTracked(stage, { reducedMotion: false });
+    await sleep(250);
+    currentBox = boxOf(stage);
+    let box = currentBox;
+    const GL = fx.status().renderer === 'webgl';
+
+    check('A1', 'mounts six fallback cards and a canvas',
+      stage.querySelectorAll('.arc-flat-card').length === 6 && !!stage.querySelector('canvas.arc-webgl'));
+    check('A1', 'initial dataset semantics (offset/progress/renderer/phase)',
+      box.dataset.offset === '0.0000' && Math.abs(+box.dataset.progress) < 1e-9 &&
+      (box.dataset.renderer === 'webgl' || box.dataset.renderer === 'css') &&
+      (box.dataset.phase === 'arc' || box.dataset.phase === 'grid'),
+      JSON.stringify(box.dataset));
+    const expectedActive = activeFormula(0);
+    check('A1', 'publishes selected number data-active/data-index/data-number',
+      +box.dataset.active === expectedActive && +box.dataset.index === expectedActive &&
+      box.dataset.number === String(expectedActive + 1).padStart(2, '0'),
+      JSON.stringify({ active: box.dataset.active, expectedActive }));
+    const caption = stage.querySelector('.arc-caption strong');
+    check('A1', 'caption shows the same "NN / 06" number',
+      !!caption && caption.textContent === String(expectedActive + 1).padStart(2, '0') + ' / 06',
+      caption && caption.textContent);
+    const marked = Array.from(stage.querySelectorAll('.arc-flat-card')).findIndex((c) => c.hasAttribute('data-active'));
+    check('A1', 'exactly the active fallback card is marked', marked === expectedActive, 'marked=' + marked);
+    check('A1', 'state mirrored to the caller mount element',
+      stage.dataset.active === box.dataset.active && stage.dataset.progress === box.dataset.progress &&
+      stage.dataset.renderer === box.dataset.renderer);
+    const st0 = fx.status();
+    check('A1', 'status() exposes state and live GPU object count',
+      st0 && (GL ? (st0.renderer === 'webgl' && st0.active === expectedActive &&
+        st0.resources === 19 && st0.glGeneration === 1)
+        : (st0.renderer === 'css' && st0.resources === 0)),
+      JSON.stringify(st0 && { r: st0.resources, g: st0.glGeneration, renderer: st0.renderer }));
+
+    await pointerDrag(stage, 0, -150, 11);
+    await waitConverged(fx);
+    const offAfterDrag = +box.dataset.offset;
+    check('A1', 'drag changes dataset.offset', Math.abs(offAfterDrag) > 0.4, 'offset=' + offAfterDrag);
+
+    wheel(stage, 1800);
+    await waitConverged(fx);
+    check('A1', 'wheel folds to grid and updates progress/phase',
+      +box.dataset.progress > 0.95 && box.dataset.phase === 'grid', box.dataset.progress + ' / ' + box.dataset.phase);
+
+    // ---- T2: A2 loss sync + A3 operate-during-loss + restore continuity ----
+    const beforeLoss = {
+      offset: box.dataset.offset, progress: box.dataset.progress, active: box.dataset.active,
+      number: box.dataset.number,
+      caption: caption.textContent,
+      transforms: Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.style.transform),
+      widths: Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.style.width),
+      marks: Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.hasAttribute('data-active')),
+    };
+    const canvas = stage.querySelector('canvas.arc-webgl');
+    contextEvent(canvas, 'webglcontextlost');
+    check('A2', 'loss flips dataset.renderer to css and unhides fallback',
+      box.dataset.renderer === 'css' && stage.querySelector('.arc-fallback').hidden === false && canvas.hidden === true);
+    check('A2', 'offset synchronised immediately', box.dataset.offset === beforeLoss.offset);
+    check('A2', 'progress synchronised immediately', box.dataset.progress === beforeLoss.progress);
+    check('A2', 'active number synchronised immediately',
+      box.dataset.active === beforeLoss.active && box.dataset.number === beforeLoss.number);
+    check('A2', 'caption synchronised immediately', caption.textContent === beforeLoss.caption);
+    check('A2', 'all six card transforms identical in the loss task',
+      JSON.stringify(Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.style.transform)) ===
+      JSON.stringify(beforeLoss.transforms));
+    check('A2', 'card sizes + active marks identical',
+      JSON.stringify(Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.style.width)) === JSON.stringify(beforeLoss.widths) &&
+      JSON.stringify(Array.from(stage.querySelectorAll('.arc-flat-card')).map((c) => c.hasAttribute('data-active'))) === JSON.stringify(beforeLoss.marks));
+
+    wheel(stage, -1100);
+    await waitConverged(fx);
+    const progressDuringLoss = box.dataset.progress;
+    check('A3', 'wheel keeps working while context is lost', +progressDuringLoss < 0.6, progressDuringLoss);
+    const beforeLossOffset = +box.dataset.offset;
+    await pointerDrag(stage, 60, 220, 12);
+    await waitConverged(fx);
+    const stateDuringLoss = { offset: box.dataset.offset, progress: box.dataset.progress, active: box.dataset.active };
+    check('A3', 'drag keeps working while context is lost',
+      Math.abs(+stateDuringLoss.offset - beforeLossOffset) > 0.25,
+      beforeLossOffset + ' -> ' + stateDuringLoss.offset);
+
+    const dBeforeRestore = { ...stats.disposed };
+    contextEvent(canvas, 'webglcontextrestored');
+    await sleep(120);
+    check('A3', GL ? 'restore returns dataset.renderer to webgl' : 'stays on css renderer (WebGL unavailable)',
+      GL ? (box.dataset.renderer === 'webgl' && fx.status().contextLost === false) : box.dataset.renderer === 'css');
+    check('A3', 'offset continues from loss-time edits (no snap-back)',
+      Math.abs(+box.dataset.offset - +stateDuringLoss.offset) < 0.02,
+      box.dataset.offset + ' vs ' + stateDuringLoss.offset);
+    check('A3', 'progress continues from loss-time edits',
+      Math.abs(+box.dataset.progress - +stateDuringLoss.progress) < 0.02);
+    check('A3', 'active number continues', box.dataset.active === stateDuringLoss.active);
+    if (GL) {
+      check('A3', 'restore disposes the dead generation exactly once (6 tex/6 mat/1 geo)',
+        stats.disposed.texture - dBeforeRestore.texture === 6 &&
+        stats.disposed.material - dBeforeRestore.material === 6 &&
+        stats.disposed.geometry - dBeforeRestore.geometry === 1,
+        JSON.stringify(stats.disposed));
+      check('A3', 'restore builds one fresh generation (glGeneration=2, resources=19)',
+        fx.status().glGeneration === 2 && fx.status().resources === 19);
+      const dBeforeDup = { ...stats.disposed };
+      contextEvent(canvas, 'webglcontextrestored');
+      await sleep(60);
+      check('A3', 'a duplicate restore event does not rebuild/dispose again',
+        stats.disposed.texture === dBeforeDup.texture && stats.disposed.geometry === dBeforeDup.geometry &&
+        fx.status().glGeneration === 2);
+    }
+
+    // ---- T3: A4 destroy mid-drag + A5 post-destroy events ----
+    const vp = viewportOf(stage);
+    vp.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, pointerId: 77, clientX: 200, clientY: 90 }));
+    check('A4', 'synthetic drag captured pointer id 77', vp.hasPointerCapture(77) === true);
+    check('A4', 'is-dragging class present', vp.classList.contains('is-dragging'));
+    const dBeforeDestroy = { ...stats.disposed };
+    let rafBookings = 0;
+    const origRAF = window.requestAnimationFrame;
+    window.requestAnimationFrame = function () { rafBookings++; return 0; };
+    let destroyThrew = null;
+    try { fx.destroy(); } catch (e) { destroyThrew = e.message; }
+    window.requestAnimationFrame = origRAF; // restored below after A5 window too
+    check('A4', 'destroy() mid-drag does not throw', destroyThrew === null, destroyThrew);
+    check('A4', 'pointer capture released on destroy', vp.hasPointerCapture(77) === false);
+    check('A4', 'is-dragging class removed', vp.classList.contains('is-dragging') === false);
+    check('A4', 'mount element DOM restored to pre-mount HTML', stage.innerHTML === '');
+    const attrsAfter = Array.from(stage.attributes).map((a) => [a.name, a.value]);
+    check('A4', 'mount element attributes restored exactly',
+      JSON.stringify(attrsAfter) === JSON.stringify(originalAttrs), JSON.stringify(attrsAfter));
+    const st = fx.status();
+    check('A4', 'status reports destroyed with zero resources', st.destroyed === true && st.resources === 0);
+    check('A4', GL ? 'destroy disposes live generation once (6/6/1) and renderer once'
+      : 'css-mode destroy has no GL generation to dispose',
+      GL ? (
+        stats.disposed.texture - dBeforeDestroy.texture === 6 &&
+        stats.disposed.material - dBeforeDestroy.material === 6 &&
+        stats.disposed.geometry - dBeforeDestroy.geometry === 1 &&
+        stats.disposed.renderer - dBeforeDestroy.renderer === 1 &&
+        stats.disposed.forceLoss - dBeforeDestroy.forceLoss === 1)
+      : (
+        stats.disposed.texture - dBeforeDestroy.texture === 0 &&
+        stats.disposed.renderer - dBeforeDestroy.renderer === 0),
+      JSON.stringify({ now: stats.disposed, before: dBeforeDestroy }));
+    check('A4', 'every mount event listener removed', leakedRecords(fx.__records).length === 0,
+      JSON.stringify(leakedRecords(fx.__records).map((r) => r.key)));
+    const myObs = observerRecords.slice(obsStartT1);
+    check('A4', 'all observers disconnected (' + myObs.length + ')',
+      myObs.length >= 2 && myObs.every((o) => o.disconnects >= 1), JSON.stringify(myObs));
+
+    // A5: events / resize after destroy must not book rAF frames.
+    rafBookings = 0;
+    window.requestAnimationFrame = function () { rafBookings++; return 0; };
+    try {
+      contextEvent(canvas, 'webglcontextrestored');
+      contextEvent(canvas, 'webglcontextlost');
+      stage.style.width = '420px'; stage.style.height = '240px';
+      window.dispatchEvent(new Event('resize'));
+      await sleep(350);
+    } finally {
+      window.requestAnimationFrame = origRAF;
+    }
+    check('A5', 'context/resize after destroy starts no rAF loop', rafBookings === 0, 'raf bookings=' + rafBookings);
+    stage.remove();
+    currentBox = null;
+
+    // ---- T4: destroy while fold animating AND context lost ----
+    stage = createFixture({ id: 'fx-fold-lost', class: 'verify-fixture' });
+    fx = mountTracked(stage, {});
+    await sleep(200);
+    wheel(stage, 1800);                 // start folding, do NOT wait for settle
+    contextEvent(stage.querySelector('canvas'), 'webglcontextlost');
+    let t4Threw = null;
+    try { fx.destroy(); } catch (e) { t4Threw = e.message; }
+    check('A4', 'destroy mid-fold + context-lost is clean and restores DOM',
+      t4Threw === null && stage.innerHTML === '' && fx.status().resources === 0, t4Threw);
+    check('A4', 'T4 listeners removed', leakedRecords(fx.__records).length === 0);
+    stage.remove();
+
+    // ---- T5: reduced-motion swipe capture released ----
+    stage = createFixture({ id: 'fx-rm', class: 'verify-fixture' });
+    fx = mountTracked(stage, { reducedMotion: true });
+    await sleep(200);
+    const vpRM = viewportOf(stage);
+    check('A1', 'reduced motion dataset=true', boxOf(stage).dataset.reduced === 'true');
+    vpRM.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, pointerId: 88, clientX: 150, clientY: 90 }));
+    check('A4', 'reduced-motion swipe captured id 88', vpRM.hasPointerCapture(88) === true);
+    fx.destroy();
+    check('A4', 'reduced-motion swipe capture released', vpRM.hasPointerCapture(88) === false);
+    check('A4', 'T5 listeners removed', leakedRecords(fx.__records).length === 0);
+    let doubleThrew = null;
+    try { fx.destroy(); } catch (e) { doubleThrew = e.message; }
+    check('A4', 'double destroy() is a safe no-op', doubleThrew === null, doubleThrew);
+    stage.remove();
+
+    // ---- T6: WebGL unavailable -> CSS fallback still fully works ----
+    stats.blockRenderer = true;
+    stage = createFixture({ id: 'fx-no-webgl', class: 'verify-fixture' });
+    fx = mountTracked(stage, { reducedMotion: true });
+    stats.blockRenderer = false;
+    await sleep(150);
+    box = boxOf(stage);
+    check('A2', 'no-WebGL mount stays on css renderer with six cards',
+      box.dataset.renderer === 'css' && stage.querySelectorAll('.arc-flat-card').length === 6 &&
+      stage.querySelector('canvas').hidden === true);
+    wheel(stage, 1800);
+    await sleep(120); // reduced motion applies fold instantly
+    check('A3', 'CSS fallback wheel folds without WebGL', +box.dataset.progress > 0.95, box.dataset.progress);
+    let t6Threw = null;
+    try { fx.destroy(); } catch (e) { t6Threw = e.message; }
+    check('A4', 'fallback destroy clean', t6Threw === null && stage.innerHTML === '', t6Threw);
+    stage.remove();
+
+    // ---- T7: public setters remain functional ----
+    stage = createFixture({ id: 'fx-api', class: 'verify-fixture' });
+    fx = mountTracked(stage, {});
+    let apiThrew = null;
+    let paramsKept = false;
+    try {
+      fx.setParams({ curvature: 40, spacing: 120, damping: 8 });
+      paramsKept = fx.params.curvature === 40 && fx.params.spacing === 120 && fx.params.damping === 8;
+      fx.setPaused(true);
+      fx.setPaused(false);
+      fx.setReducedMotion(true);
+      fx.setReducedMotion(null);
+      fx.reset();
+    } catch (e) { apiThrew = e.message; }
+    check('A1', 'public setParams/setPaused/setReducedMotion/reset work', apiThrew === null, apiThrew);
+    check('A1', 'setParams value retained', paramsKept, JSON.stringify(fx.params));
+    fx.destroy();
+    stage.remove();
+
+    // ---- Global resource accounting ----
+    // Every fixture above is destroyed, so the only outstanding generation belongs to the live manual
+    // demo (6 textures / 6 materials / 1 geometry / 1 renderer in WebGL mode, nothing in css mode).
+    await nextFrame();
+    const demoWebGL = !!(demo && demo.status && !demo.status().destroyed && demo.status().renderer === 'webgl');
+    const outstanding = demoWebGL ? { texture: 6, material: 6, geometry: 1, renderer: 1 }
+      : { texture: 0, material: 0, geometry: 0, renderer: 0 };
+    check('A4', 'all constructed textures disposed exactly once (except live demo)',
+      stats.constructed.texture - stats.disposed.texture === outstanding.texture,
+      'constructed=' + stats.constructed.texture + ' disposed=' + stats.disposed.texture);
+    check('A4', 'all constructed materials disposed exactly once (except live demo)',
+      stats.constructed.material - stats.disposed.material === outstanding.material,
+      'constructed=' + stats.constructed.material + ' disposed=' + stats.disposed.material);
+    check('A4', 'all constructed geometries disposed exactly once (except live demo)',
+      stats.constructed.geometry - stats.disposed.geometry === outstanding.geometry,
+      'constructed=' + stats.constructed.geometry + ' disposed=' + stats.disposed.geometry);
+    check('A4', 'all created renderers disposed exactly once (except live demo)',
+      stats.constructed.renderer - stats.disposed.renderer === outstanding.renderer,
+      'created=' + stats.constructed.renderer + ' disposed=' + stats.disposed.renderer);
+
+    finish();
+  }
+
+  function finish() {
+    const failed = results.filter((r) => !r.ok).length;
+    window.__CURVED_VERIFY__ = {
+      done: true,
+      passed: results.length - failed,
+      failed,
+      total: results.length,
+      results: results.map((r) => ({ id: r.id, name: r.name, ok: r.ok, detail: r.detail })),
+    };
+    document.documentElement.dataset.verify = failed ? 'fail' : 'pass';
+    summary.textContent = results.length + ' checks · ' + (results.length - failed) + ' passed' + (failed ? ' · ' + failed + ' failed' : '');
+    summary.className = failed ? 'fail' : 'pass';
+    render();
+    document.title = (failed ? 'FAIL' : 'PASS') + ' · Curved Gallery 验证';
+  }
+
+  // =====================================================================
+  // Manual demo + toolbar
+  // =====================================================================
+  const demoStage = document.getElementById('demo');
+  let demo = mountCurvedGallery(demoStage);
+  const readout = document.getElementById('readout');
+  setInterval(() => {
+    const b = demoStage.querySelector('[data-arc]');
+    if (b) readout.textContent = 'offset ' + b.dataset.offset + ' · progress ' + b.dataset.progress +
+      ' · #' + b.dataset.number + ' · ' + b.dataset.renderer;
+    else readout.textContent = 'destroyed (DOM restored)';
+  }, 150);
+
+  function demoCanvas() { return demoStage.querySelector('canvas.arc-webgl'); }
+  function demoGL() {
+    const c = demoCanvas();
+    return c && (c.getContext('webgl2') || c.getContext('webgl'));
+  }
+  let demoExt = null;
+  document.getElementById('btn-lose').addEventListener('click', () => {
+    const gl = demoGL();
+    if (gl) {
+      demoExt = demoExt || gl.getExtension('WEBGL_lose_context');
+      if (demoExt) { demoExt.loseContext(); return; }
+    }
+    const c = demoCanvas();
+    if (c) contextEvent(c, 'webglcontextlost');
+  });
+  document.getElementById('btn-restore').addEventListener('click', () => {
+    if (demoExt) { try { demoExt.restoreContext(); return; } catch (_) {} }
+    const c = demoCanvas();
+    if (c) contextEvent(c, 'webglcontextrestored');
+  });
+  document.getElementById('btn-drag').addEventListener('click', () => pointerDrag(demoStage, 0, -220, 31));
+  document.getElementById('btn-fold').addEventListener('click', () => wheel(demoStage, 1600));
+  document.getElementById('btn-unfold').addEventListener('click', () => wheel(demoStage, -1600));
+  document.getElementById('btn-destroy').addEventListener('click', () => {
+    if (demo) { demo.destroy(); demo = null; }
+  });
+  document.getElementById('btn-remount').addEventListener('click', () => {
+    if (!demo) demo = mountCurvedGallery(demoStage, { reducedMotion: document.getElementById('chk-reduced').checked });
+  });
+  document.getElementById('chk-reduced').addEventListener('change', (e) => {
+    if (demo) demo.setReducedMotion(e.target.checked);
+  });
+
+  // Run automated suite after first paint so observers have delivered initial entries.
+  window.addEventListener('load', () => setTimeout(runSuite, 120));
+  render();
+})();
+</script>
+</body>
+</html>

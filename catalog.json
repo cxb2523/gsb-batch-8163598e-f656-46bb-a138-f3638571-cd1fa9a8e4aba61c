@@ -220,7 +220,8 @@
         "effect.js",
         "index.html",
         "three.LICENSE.txt",
-        "three.min.js"
+        "three.min.js",
+        "verify.html"
       ]
     },
     {

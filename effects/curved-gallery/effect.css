@@ -148,3 +148,34 @@
   transform-style: preserve-3d;
   will-change: transform;
 }
+/* Selected-card counter. pointer-events:none so it never steals drags/wheel; the translucent pill
+   keeps it legible if a grid card passes underneath on narrow layouts. */
+.arc-board .arc-caption {
+  position: absolute;
+  left: 18px;
+  bottom: 14px;
+  z-index: 200;
+  pointer-events: none;
+  padding: 5px 11px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 1px 4px rgba(23, 24, 26, 0.08);
+  backdrop-filter: blur(6px);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.18em;
+  color: var(--ink-3, #9a9993);
+  font-variant-numeric: tabular-nums;
+}
+.arc-board .arc-caption strong {
+  font-weight: 700;
+  color: var(--ink, #17181a);
+  letter-spacing: 0.12em;
+}
+@media (max-width: 650px) {
+  .arc-board .arc-caption {
+    left: 12px;
+    bottom: 10px;
+    padding: 4px 9px;
+  }
+}
