@@ -79,6 +79,31 @@ If you want a fully offline version, you would need to:
 2. Host the model weights yourself
 3. Update the import path in `app.js`
 
+### Testing without a network
+
+`app.js` checks for a global `removeBackground` function before attempting the
+CDN import. For offline/automated verification you can inject a stub that
+returns a transparent PNG for the given image blob; everything downstream
+(mask creation, brush/eraser refinement, undo, race handling, PNG export)
+runs unchanged against real canvas state:
+
+```js
+window.removeBackground = async (imageBlob, options) => {
+  const bitmap = await createImageBitmap(imageBlob);
+  const c = document.createElement('canvas');
+  c.width = bitmap.width;
+  c.height = bitmap.height;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff';                 // opaque foreground, e.g. left half
+  x.fillRect(0, 0, bitmap.width / 2, bitmap.height);
+  bitmap.close();
+  return await new Promise((r) => c.toBlob(r, 'image/png'));
+};
+```
+
+The real library is still loaded from the CDN when no stub is present, so this
+has no effect on production behaviour.
+
 ## Removed from production version
 
 This open-source demo intentionally strips:

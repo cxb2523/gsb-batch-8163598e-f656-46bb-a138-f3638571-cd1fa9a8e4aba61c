@@ -2,25 +2,45 @@
 //  Background Remover — Standalone Open Source Demo
 //  AI auto-removal + Manual brush/eraser refinement
 //  Uses @imgly/background-removal (ONNX model via WebAssembly)
+//
+//  Architecture: the alpha-channel mask canvas is the single
+//  source of truth. Preview, refine overlay, undo snapshots and
+//  the downloaded PNG are all derived from it. Async work is
+//  guarded by monotonically increasing tokens so a stale image
+//  load or a stale auto-removal run can never commit its result.
 // ============================================================
 
 const LIB_CDN = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.5';
+const MAX_UNDO = 20;
+const RED_OVERLAY_THRESHOLD = 128;
 
 // ── State ──────────────────────────────────────────────
-let originalImage = null;
-let resultBlob = null;
+let originalImage = null;   // decoded HTMLImageElement for the current upload
+let thumbUrl = null;        // object URL backing originalImage / the thumbnail
+
+// The mask canvas stores coverage in its ALPHA channel (RGB is white).
+// It is the only editable state: everything else is derived from it.
 let maskCanvas = null;
 let maskCtx = null;
-let origCanvas = null;
-let origCtx = null;
+let origCanvas = null;      // full-resolution copy of originalImage
+
+// [0] is always the auto-removal baseline; the rest are pre-stroke snapshots.
 let undoStack = [];
-const MAX_UNDO = 20;
+
+// Lifecycle tokens. Any async continuation compares its captured token
+// with the live one and bails out if a newer action has superseded it.
+let imageLoadToken = 0;
+let removalToken = 0;
+let isProcessing = false;   // an auto-removal run is in flight
+let isDrawing = false;
+let lastX = 0, lastY = 0;
 
 let currentMode = 'preview';
 let currentTool = 'brush';
-let isDrawing = false;
-let lastX = 0, lastY = 0;
+
 let removeBackgroundFn = null;
+let libraryPromise = null;
+let renderScheduled = false;
 
 // ── DOM refs ───────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -49,7 +69,9 @@ const canvasWrapper = $('canvas-wrapper');
 const previewCanvas = $('preview-canvas');
 const editCanvas = $('edit-canvas');
 const previewCtx = previewCanvas.getContext('2d');
-const editCtx = editCanvas.getContext('2d');
+// The edit overlay is read back every frame while refining, so hint the
+// browser to keep it in a CPU-friendly surface.
+const editCtx = editCanvas.getContext('2d', { willReadFrequently: true });
 
 const btnPreview = $('btn-preview');
 const btnRefine = $('btn-refine');
@@ -69,7 +91,7 @@ const brushCursor = $('brush-cursor');
 const downloadBtn = $('download-btn');
 const newBtn = $('new-btn');
 
-// ── Helpers ────────────────────────────────────────────
+// ── Small helpers ──────────────────────────────────────
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
@@ -79,6 +101,33 @@ function formatSize(bytes) {
 function show(el) { if (el) el.classList.remove('hidden'); }
 function hide(el) { if (el) el.classList.add('hidden'); }
 
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function clampInt(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Failed to decode image'));
+    img.src = src;
+  });
+}
+
+function canvasToBlob(canvas, type) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Failed to encode image'));
+    }, type);
+  });
+}
+
+// ── Overlay ────────────────────────────────────────────
 function showOverlay(title, desc) {
   overlayTitle.textContent = title || 'Loading AI Model...';
   overlayDesc.innerHTML = desc || 'First time takes ~30 seconds.<br>The model is cached for future use.';
@@ -98,6 +147,49 @@ function updateOverlayProgress(pct, status) {
   if (status) overlayStatus.textContent = status;
 }
 
+// ── Mask state ─────────────────────────────────────────
+function snapshotMask() {
+  if (!maskCanvas || !maskCtx) return null;
+  return maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+}
+
+// Drops the full-resolution buffers. Canvas backing stores are released by
+// sizing them down to zero before references are cleared.
+function disposeMaskBuffers() {
+  if (origCanvas) { origCanvas.width = 0; origCanvas.height = 0; }
+  if (maskCanvas) { maskCanvas.width = 0; maskCanvas.height = 0; }
+  origCanvas = null;
+  maskCanvas = null;
+  maskCtx = null;
+  undoStack = [];
+  isDrawing = false;
+}
+
+function clearDisplayCanvases() {
+  previewCanvas.width = 1;
+  previewCanvas.height = 1;
+  editCanvas.width = 1;
+  editCanvas.height = 1;
+  previewCtx.clearRect(0, 0, 1, 1);
+  editCtx.clearRect(0, 0, 1, 1);
+  editCanvas.style.display = 'none';
+  brushCursor.style.display = 'none';
+}
+
+// Releases everything tied to the currently loaded image: object URL,
+// canvas backing stores and undo history.
+function releaseImageResources() {
+  if (thumbUrl) {
+    URL.revokeObjectURL(thumbUrl);
+    thumbUrl = null;
+  }
+  fileThumbImg.removeAttribute('src');
+  fileThumbImg.style.display = 'none';
+  originalImage = null;
+  disposeMaskBuffers();
+  clearDisplayCanvases();
+}
+
 // ── File handling ──────────────────────────────────────
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
@@ -106,37 +198,61 @@ function handleFile(file) {
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const img = new Image();
-    img.onload = () => {
-      originalImage = img;
-      fileNameEl.textContent = file.name;
-      fileSizeEl.textContent = formatSize(file.size);
-      fileDimsEl.textContent = img.naturalWidth + '×' + img.naturalHeight;
-      fileThumbImg.src = e.target.result;
-      fileThumbImg.style.display = 'block';
+  // Invalidate any pending image load and any in-flight auto-removal for the
+  // previous image. Their continuations will see a stale token and bail.
+  const token = ++imageLoadToken;
+  invalidateRemoval();
 
-      hide(uploadZone);
-      show(fileInfo);
-      show(actionBar);
-      hide(resultArea);
-    };
-    img.src = e.target.result;
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+
+  img.onload = () => {
+    if (token !== imageLoadToken) {
+      // A newer file selection (or a reset) won the race.
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    // Commit the new image atomically, releasing the previous image's
+    // object URL, mask and canvas backing stores first.
+    releaseImageResources();
+
+    thumbUrl = url;
+    originalImage = img;
+
+    fileNameEl.textContent = file.name;
+    fileSizeEl.textContent = formatSize(file.size);
+    fileDimsEl.textContent = img.naturalWidth + '×' + img.naturalHeight;
+    fileThumbImg.src = url;
+    fileThumbImg.style.display = 'block';
+
+    hide(uploadZone);
+    show(fileInfo);
+    show(actionBar);
+    hide(resultArea);
+    hide(refineToolbar);
+    hide(refineHint);
+    setMode('preview');
   };
-  reader.readAsDataURL(file);
+
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    if (token === imageLoadToken) {
+      alert('Could not read that image. Please try another file.');
+    }
+  };
+
+  img.src = url;
 }
 
 function resetAll() {
-  originalImage = null;
-  resultBlob = null;
-  maskCanvas = null;
-  maskCtx = null;
-  origCanvas = null;
-  origCtx = null;
-  undoStack = [];
+  imageLoadToken++;         // discard a pending image decode
+  invalidateRemoval();      // discard a pending auto-removal + hide overlay
+  releaseImageResources();
+
   currentMode = 'preview';
   currentTool = 'brush';
+  isDrawing = false;
 
   show(uploadZone);
   hide(fileInfo);
@@ -144,9 +260,13 @@ function resetAll() {
   hide(resultArea);
   hide(refineToolbar);
   hide(refineHint);
-  editCanvas.style.display = 'none';
-  brushCursor.style.display = 'none';
+  clearDisplayCanvases();
   fileInput.value = '';
+
+  btnPreview.classList.add('active');
+  btnRefine.classList.remove('active');
+  toolBrush.classList.add('active');
+  toolEraser.classList.remove('active');
 }
 
 // Dropzone events
@@ -169,77 +289,111 @@ removeFileBtn.addEventListener('click', resetAll);
 newBtn.addEventListener('click', resetAll);
 
 // ── Auto removal ───────────────────────────────────────
-async function loadLibrary() {
-  if (removeBackgroundFn) return;
-  showOverlay('Loading AI Model...', 'First time takes ~30 seconds.<br>The model is cached for future use.');
-  updateOverlayProgress(5, 'Downloading library...');
-  try {
-    const module = await import(LIB_CDN + '/+esm');
-    removeBackgroundFn = module.removeBackground || module.default;
-    updateOverlayProgress(15, 'Library ready, loading model...');
-  } catch (err) {
-    hideOverlay();
-    alert('Failed to load AI model. Please check your internet connection and try again.\n\n' + err.message);
-    throw err;
+function ensureRemoveBackground() {
+  if (removeBackgroundFn) return Promise.resolve(removeBackgroundFn);
+
+  // Testing/offline seam: a locally injected implementation may be supplied
+  // on the global object before running. In production this is undefined and
+  // the real library is loaded from the CDN.
+  if (typeof window !== 'undefined' && typeof window.removeBackground === 'function') {
+    removeBackgroundFn = window.removeBackground;
+    return Promise.resolve(removeBackgroundFn);
   }
+
+  if (!libraryPromise) {
+    libraryPromise = import(LIB_CDN + '/+esm')
+      .then((module) => {
+        const fn = module.removeBackground || module.default;
+        if (typeof fn !== 'function') {
+          throw new Error('removeBackground export was not found in the loaded module');
+        }
+        removeBackgroundFn = fn;
+        return fn;
+      })
+      .catch((err) => {
+        libraryPromise = null;
+        throw err;
+      });
+  }
+  return libraryPromise;
+}
+
+// Invalidates any in-flight auto-removal. The promise itself cannot be
+// aborted (the library has no abort hook), but its continuation is fenced
+// off by the token and can never touch state again.
+function invalidateRemoval() {
+  removalToken++;
+  isProcessing = false;
+  isDrawing = false;
+  hideOverlay();
 }
 
 async function runAutoRemoval() {
-  if (!originalImage) return;
+  const image = originalImage;
+  if (!image) return;
+
+  const token = ++removalToken;
+  const isCurrent = () => token === removalToken;
+
+  isProcessing = true;
+  isDrawing = false;
 
   try {
-    await loadLibrary();
-  } catch (e) {
-    return;
-  }
+    showOverlay('Loading AI Model...', 'First time takes ~30 seconds.<br>The model is cached for future use.');
+    updateOverlayProgress(5, 'Downloading library...');
 
-  showOverlay('Removing Background...', 'AI is processing your image.<br>This may take a few seconds.');
-  updateOverlayProgress(15, 'Preparing image...');
+    const removeFn = await ensureRemoveBackground();
+    if (!isCurrent()) return;
 
-  try {
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = originalImage.naturalWidth;
-    tempCanvas.height = originalImage.naturalHeight;
-    const tCtx = tempCanvas.getContext('2d');
-    tCtx.drawImage(originalImage, 0, 0);
+    showOverlay('Removing Background...', 'AI is processing your image.<br>This may take a few seconds.');
+    updateOverlayProgress(15, 'Preparing image...');
 
-    const imageBlob = await new Promise(r => tempCanvas.toBlob(r, 'image/png'));
+    const imageBlob = await canvasToBlob(renderOriginalCanvas(image), 'image/png');
+    if (!isCurrent() || image !== originalImage) return;
 
-    let lastProgress = 15;
+    let lastProgress = 20;
     updateOverlayProgress(20, 'Starting AI model...');
 
-    resultBlob = await removeBackgroundFn(imageBlob, {
+    const resultBlob = await removeFn(imageBlob, {
       model: 'medium',
       output: { format: 'image/png' },
       progress: (key, current, total) => {
-        if (total > 0) {
-          const pct = 20 + (current / total) * 75;
-          if (pct > lastProgress) {
-            lastProgress = pct;
-            let statusMsg = 'Processing...';
-            if (key.includes('fetch') || key.includes('download') || key.includes('load')) {
-              statusMsg = 'Downloading model (' + Math.round(pct) + '%)...';
-            } else if (key.includes('inference') || key.includes('compute')) {
-              statusMsg = 'Running AI inference...';
-            }
-            updateOverlayProgress(pct, statusMsg);
-          }
+        if (!isCurrent() || !(total > 0)) return;
+        const pct = 20 + (current / total) * 75;
+        if (pct <= lastProgress) return;
+        lastProgress = pct;
+        let statusMsg = 'Processing...';
+        if (/fetch|download|load/i.test(key)) {
+          statusMsg = 'Downloading model (' + Math.round(pct) + '%)...';
+        } else if (/inference|compute/i.test(key)) {
+          statusMsg = 'Running AI inference...';
         }
+        updateOverlayProgress(pct, statusMsg);
       }
     });
 
-    updateOverlayProgress(100, 'Done!');
-    await new Promise(r => setTimeout(r, 400));
-    hideOverlay();
+    // A newer run, a new image, or a reset may have happened while the model
+    // was working. In that case this result must be discarded entirely.
+    if (!isCurrent() || image !== originalImage) return;
 
-    await buildMaskFromResult();
+    updateOverlayProgress(100, 'Done!');
+    await delay(400);
+    if (!isCurrent() || image !== originalImage) return;
+
+    const built = await buildMaskFromResult(resultBlob, image, token);
+    if (!isCurrent() || image !== originalImage) return;
+    if (!built) throw new Error('The AI result could not be read.');
+
+    isProcessing = false;
+    hideOverlay();
 
     hide(actionBar);
     show(resultArea);
     setMode('preview');
     renderPreview();
-
   } catch (err) {
+    if (!isCurrent()) return;   // superseded: a newer action owns the UI now
+    isProcessing = false;
     hideOverlay();
     console.error('Background removal failed:', err);
     alert('Background removal failed: ' + (err.message || err));
@@ -249,130 +403,173 @@ async function runAutoRemoval() {
 autoRemoveBtn.addEventListener('click', runAutoRemoval);
 btnReprocess.addEventListener('click', runAutoRemoval);
 
-// ── Mask management ────────────────────────────────────
-async function buildMaskFromResult() {
-  const w = originalImage.naturalWidth;
-  const h = originalImage.naturalHeight;
-
-  origCanvas = document.createElement('canvas');
-  origCanvas.width = w;
-  origCanvas.height = h;
-  origCtx = origCanvas.getContext('2d');
-  origCtx.drawImage(originalImage, 0, 0);
-
-  const resultImg = new Image();
-  await new Promise((resolve, reject) => {
-    resultImg.onload = resolve;
-    resultImg.onerror = reject;
-    resultImg.src = URL.createObjectURL(resultBlob);
-  });
-
-  const resultCanvas = document.createElement('canvas');
-  resultCanvas.width = w;
-  resultCanvas.height = h;
-  const rCtx = resultCanvas.getContext('2d');
-  rCtx.drawImage(resultImg, 0, 0);
-  const resultData = rCtx.getImageData(0, 0, w, h);
-
-  maskCanvas = document.createElement('canvas');
-  maskCanvas.width = w;
-  maskCanvas.height = h;
-  maskCtx = maskCanvas.getContext('2d');
-  const maskData = maskCtx.createImageData(w, h);
-
-  for (let i = 0; i < resultData.data.length; i += 4) {
-    const alpha = resultData.data[i + 3];
-    maskData.data[i] = alpha;
-    maskData.data[i + 1] = alpha;
-    maskData.data[i + 2] = alpha;
-    maskData.data[i + 3] = 255;
-  }
-  maskCtx.putImageData(maskData, 0, 0);
-
-  URL.revokeObjectURL(resultImg.src);
-  undoStack = [];
+// Draws a full-resolution copy of the current image into a fresh canvas.
+function renderOriginalCanvas(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  canvas.getContext('2d').drawImage(image, 0, 0);
+  return canvas;
 }
 
-function applyMaskToOriginal() {
+// Derives the alpha-only mask from the AI result and commits it as the new
+// editing baseline. Returns false if the run was superseded or decoding failed.
+async function buildMaskFromResult(resultBlob, image, token) {
+  const w = image.naturalWidth;
+  const h = image.naturalHeight;
+  if (!w || !h) return false;
+
+  const url = URL.createObjectURL(resultBlob);
+  try {
+    let resultImg;
+    try {
+      resultImg = await loadImageElement(url);
+    } catch (err) {
+      if (token === removalToken) console.error('Could not decode AI result:', err);
+      return false;
+    }
+
+    // Fence check after the async decode, before any state is touched.
+    if (token !== removalToken || image !== originalImage) return false;
+
+    const resultCanvas = document.createElement('canvas');
+    resultCanvas.width = w;
+    resultCanvas.height = h;
+    const rCtx = resultCanvas.getContext('2d', { willReadFrequently: true });
+    rCtx.drawImage(resultImg, 0, 0, w, h);
+    const resultData = rCtx.getImageData(0, 0, w, h);
+
+    // Alpha channel is the mask. RGB is white so the overlay can be tinted
+    // without relying on the colour channels.
+    const newMask = document.createElement('canvas');
+    newMask.width = w;
+    newMask.height = h;
+    const newMaskCtx = newMask.getContext('2d', { willReadFrequently: true });
+    const maskData = newMaskCtx.createImageData(w, h);
+    const src = resultData.data;
+    const dst = maskData.data;
+    for (let i = 0; i < src.length; i += 4) {
+      dst[i] = 255;
+      dst[i + 1] = 255;
+      dst[i + 2] = 255;
+      dst[i + 3] = src[i + 3];
+    }
+    newMaskCtx.putImageData(maskData, 0, 0);
+
+    const newOrig = document.createElement('canvas');
+    newOrig.width = w;
+    newOrig.height = h;
+    newOrig.getContext('2d').drawImage(image, 0, 0, w, h);
+
+    // Atomic commit: swap in the new mask + origin pair together and reset
+    // the undo stack so index 0 is this auto-removal result.
+    disposeMaskBuffers();
+    maskCanvas = newMask;
+    maskCtx = newMaskCtx;
+    origCanvas = newOrig;
+    undoStack = [snapshotMask()];
+    return true;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// ── Rendering (everything derives from maskCanvas) ─────
+function getDisplaySize() {
   const w = origCanvas.width;
   const h = origCanvas.height;
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = w;
-  outCanvas.height = h;
-  const oCtx = outCanvas.getContext('2d');
-
-  const origData = origCtx.getImageData(0, 0, w, h);
-  const mData = maskCtx.getImageData(0, 0, w, h);
-  const outData = oCtx.createImageData(w, h);
-
-  for (let i = 0; i < origData.data.length; i += 4) {
-    outData.data[i] = origData.data[i];
-    outData.data[i + 1] = origData.data[i + 1];
-    outData.data[i + 2] = origData.data[i + 2];
-    outData.data[i + 3] = mData.data[i];
-  }
-
-  oCtx.putImageData(outData, 0, 0);
-  return outCanvas;
+  const maxW = Math.max(1, canvasWrapper.clientWidth || w);
+  const maxH = Math.max(1, window.innerHeight * 0.7);
+  const scale = Math.min(1, maxW / w, maxH / h);
+  return { dw: Math.max(1, Math.round(w * scale)), dh: Math.max(1, Math.round(h * scale)) };
 }
 
-// ── Rendering ──────────────────────────────────────────
 function renderPreview() {
-  if (!origCanvas || !maskCanvas) return;
-
-  const maxW = canvasWrapper.clientWidth;
-  const maxH = window.innerHeight * 0.7;
-  let dw = origCanvas.width;
-  let dh = origCanvas.height;
-  const scale = Math.min(1, maxW / dw, maxH / dh);
-  dw = Math.round(dw * scale);
-  dh = Math.round(dh * scale);
-
-  previewCanvas.width = dw;
-  previewCanvas.height = dh;
-  previewCtx.clearRect(0, 0, dw, dh);
-
-  if (currentMode === 'refine') {
-    previewCtx.drawImage(originalImage, 0, 0, dw, dh);
-  } else {
-    const composite = applyMaskToOriginal();
-    previewCtx.drawImage(composite, 0, 0, dw, dh);
+  if (!origCanvas || !maskCanvas) {
+    clearDisplayCanvases();
+    return;
   }
 
-  editCanvas.width = dw;
-  editCanvas.height = dh;
+  const { dw, dh } = getDisplaySize();
+
+  if (previewCanvas.width !== dw) previewCanvas.width = dw;
+  if (previewCanvas.height !== dh) previewCanvas.height = dh;
+  previewCtx.clearRect(0, 0, dw, dh);
+  previewCtx.globalCompositeOperation = 'source-over';
+  previewCtx.drawImage(origCanvas, 0, 0, dw, dh);
+
+  if (currentMode !== 'refine') {
+    // Mask alpha gates the original: the transparent-background preview.
+    previewCtx.globalCompositeOperation = 'destination-in';
+    previewCtx.drawImage(maskCanvas, 0, 0, dw, dh);
+    previewCtx.globalCompositeOperation = 'source-over';
+  }
+
+  if (editCanvas.width !== dw) editCanvas.width = dw;
+  if (editCanvas.height !== dh) editCanvas.height = dh;
 
   if (currentMode === 'refine') {
     renderMaskOverlay();
   }
 }
 
+// Red tint over the parts of the mask that will be removed.
 function renderMaskOverlay() {
-  if (!maskCanvas) return;
   const dw = editCanvas.width;
   const dh = editCanvas.height;
-  editCtx.clearRect(0, 0, dw, dh);
+  if (!maskCanvas) {
+    editCtx.clearRect(0, 0, dw, dh);
+    return;
+  }
 
+  editCtx.globalCompositeOperation = 'source-over';
+  editCtx.clearRect(0, 0, dw, dh);
   editCtx.drawImage(maskCanvas, 0, 0, dw, dh);
+
   const overlayData = editCtx.getImageData(0, 0, dw, dh);
-  for (let i = 0; i < overlayData.data.length; i += 4) {
-    const maskVal = overlayData.data[i];
-    if (maskVal < 128) {
-      overlayData.data[i] = 220;
-      overlayData.data[i + 1] = 50;
-      overlayData.data[i + 2] = 50;
-      overlayData.data[i + 3] = 120;
+  const d = overlayData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] < RED_OVERLAY_THRESHOLD) {
+      d[i] = 220;
+      d[i + 1] = 50;
+      d[i + 2] = 50;
+      d[i + 3] = 120;
     } else {
-      overlayData.data[i + 3] = 0;
+      d[i] = 0;
+      d[i + 1] = 0;
+      d[i + 2] = 0;
+      d[i + 3] = 0;
     }
   }
   editCtx.putImageData(overlayData, 0, 0);
 }
 
+// Full-resolution composite of the current original + current mask.
+function renderCompositeAt(width, height) {
+  const out = document.createElement('canvas');
+  out.width = width;
+  out.height = height;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(origCanvas, 0, 0, width, height);
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.drawImage(maskCanvas, 0, 0, width, height);
+  ctx.globalCompositeOperation = 'source-over';
+  return out;
+}
+
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    renderPreview();
+  });
+}
+
 // ── Mode switching ─────────────────────────────────────
 function setMode(mode) {
   currentMode = mode;
-  [btnPreview, btnRefine].forEach(b => b.classList.remove('active'));
+  [btnPreview, btnRefine].forEach((b) => b.classList.remove('active'));
   if (mode === 'preview') btnPreview.classList.add('active');
   else if (mode === 'refine') btnRefine.classList.add('active');
 
@@ -414,9 +611,13 @@ brushSoftEl.addEventListener('input', () => {
 });
 
 function updateCursorSize() {
-  const sz = parseInt(brushSizeEl.value);
+  if (!maskCanvas) {
+    brushCursor.style.display = 'none';
+    return;
+  }
+  const sz = clampInt(brushSizeEl.value, 1, 1000, 30);
   const rect = editCanvas.getBoundingClientRect();
-  const displayScale = rect.width / (maskCanvas ? maskCanvas.width : 1);
+  const displayScale = rect.width > 0 ? rect.width / maskCanvas.width : 1;
   const displaySz = Math.max(4, sz * displayScale);
   brushCursor.style.width = displaySz + 'px';
   brushCursor.style.height = displaySz + 'px';
@@ -424,138 +625,178 @@ function updateCursorSize() {
 
 // Brush cursor tracking
 editCanvas.addEventListener('mouseenter', () => {
-  if (currentMode === 'refine') { brushCursor.style.display = 'block'; updateCursorSize(); }
+  if (currentMode === 'refine') {
+    brushCursor.style.display = 'block';
+    updateCursorSize();
+  }
 });
 editCanvas.addEventListener('mouseleave', () => {
   brushCursor.style.display = 'none';
-  isDrawing = false;
-});
-editCanvas.addEventListener('mousemove', (e) => {
-  brushCursor.style.left = e.clientX + 'px';
-  brushCursor.style.top = e.clientY + 'px';
-  if (isDrawing) paintOnMask(e);
+  endStroke();
 });
 
-// Drawing
-editCanvas.addEventListener('mousedown', (e) => {
-  if (currentMode !== 'refine' || !maskCanvas) return;
+// ── Drawing (mutates the mask only) ────────────────────
+function toMaskCoords(clientX, clientY) {
+  const rect = editCanvas.getBoundingClientRect();
+  const w = maskCanvas.width;
+  const h = maskCanvas.height;
+  return [
+    (clientX - rect.left) / rect.width * w,
+    (clientY - rect.top) / rect.height * h
+  ];
+}
+
+function beginStroke(clientX, clientY) {
+  if (currentMode !== 'refine' || !maskCanvas || !maskCtx || isProcessing) return false;
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+  const rect = editCanvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+
   isDrawing = true;
-  if (undoStack.length >= MAX_UNDO) undoStack.shift();
-  undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
-  const rect = editCanvas.getBoundingClientRect();
-  lastX = (e.clientX - rect.left) / rect.width * maskCanvas.width;
-  lastY = (e.clientY - rect.top) / rect.height * maskCanvas.height;
-  paintOnMask(e);
-});
-editCanvas.addEventListener('mouseup', () => {
-  if (isDrawing) { isDrawing = false; renderPreview(); }
-});
+  pushUndoSnapshot();
+  [lastX, lastY] = toMaskCoords(clientX, clientY);
+  paintOnMask(clientX, clientY);
+  return true;
+}
 
-function paintOnMask(e) {
-  if (!maskCanvas) return;
-  const rect = editCanvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) / rect.width * maskCanvas.width;
-  const y = (e.clientY - rect.top) / rect.height * maskCanvas.height;
+function endStroke() {
+  if (!isDrawing) return;
+  isDrawing = false;
+  renderPreview();
+}
 
-  const brushSize = parseInt(brushSizeEl.value);
-  const softness = parseInt(brushSoftEl.value) / 100;
+// Snapshots are taken before each stroke. Index 0 is the auto-removal
+// baseline and is never evicted, so undo can always return to it.
+function pushUndoSnapshot() {
+  const snap = snapshotMask();
+  if (!snap) return;
+  while (undoStack.length >= MAX_UNDO + 1) {
+    undoStack.splice(1, 1);
+  }
+  undoStack.push(snap);
+}
+
+function paintOnMask(clientX, clientY) {
+  if (!maskCanvas || !maskCtx || isProcessing) return;
+
+  const [x, y] = toMaskCoords(clientX, clientY);
+  const brushSize = clampInt(brushSizeEl.value, 1, 1000, 30);
+  const softness = clampInt(brushSoftEl.value, 0, 100, 0) / 100;
 
   maskCtx.save();
   maskCtx.lineCap = 'round';
   maskCtx.lineJoin = 'round';
   maskCtx.lineWidth = brushSize;
 
-  if (softness > 0) {
-    maskCtx.filter = `blur(${Math.round(brushSize * softness * 0.3)}px)`;
-  }
+  const blurPx = Math.round(brushSize * softness * 0.3);
+  maskCtx.filter = blurPx > 0 ? `blur(${blurPx}px)` : 'none';
 
-  if (currentTool === 'brush') {
-    maskCtx.globalCompositeOperation = 'lighter';
-    maskCtx.strokeStyle = '#ffffff';
-  } else {
-    maskCtx.globalCompositeOperation = 'source-over';
-    maskCtx.strokeStyle = '#000000';
-  }
+  // Brush = add coverage (opaque), eraser = subtract coverage.
+  maskCtx.globalCompositeOperation = currentTool === 'brush' ? 'source-over' : 'destination-out';
+  maskCtx.strokeStyle = '#ffffff';
+  maskCtx.fillStyle = '#ffffff';
 
   maskCtx.beginPath();
-  maskCtx.moveTo(lastX, lastY);
-  maskCtx.lineTo(x, y);
-  maskCtx.stroke();
+  if (Math.hypot(x - lastX, y - lastY) < 0.5) {
+    // A click should leave a dot even without movement.
+    maskCtx.arc(x, y, Math.max(0.5, brushSize / 2), 0, Math.PI * 2);
+    maskCtx.fill();
+  } else {
+    maskCtx.moveTo(lastX, lastY);
+    maskCtx.lineTo(x, y);
+    maskCtx.stroke();
+  }
   maskCtx.restore();
 
   lastX = x;
   lastY = y;
 
-  requestAnimationFrame(() => renderPreview());
+  // Preview (when in preview mode) and the refine overlay both read the
+  // mask, so one scheduled repaint keeps them in sync.
+  scheduleRender();
 }
 
-// Undo
-toolUndo.addEventListener('click', () => {
-  if (undoStack.length > 0 && maskCtx) {
-    maskCtx.putImageData(undoStack.pop(), 0, 0);
-    renderPreview();
-  }
+editCanvas.addEventListener('mousemove', (e) => {
+  brushCursor.style.left = e.clientX + 'px';
+  brushCursor.style.top = e.clientY + 'px';
+  if (isDrawing) paintOnMask(e.clientX, e.clientY);
 });
+
+editCanvas.addEventListener('mousedown', (e) => {
+  if (e.button !== undefined && e.button !== 0) return;
+  beginStroke(e.clientX, e.clientY);
+});
+
+window.addEventListener('mouseup', () => endStroke());
+
+// ── Undo (restores mask snapshots, bottoming out at the AI baseline) ──
+function undoMask() {
+  if (!maskCanvas || !maskCtx || isProcessing) return;
+  if (undoStack.length <= 1) return;
+  const snap = undoStack.pop();
+  if (!snap) return;
+  maskCtx.putImageData(snap, 0, 0);
+  renderPreview();
+}
+
+toolUndo.addEventListener('click', undoMask);
 
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
   if (currentMode !== 'refine') return;
   if (e.key === '[') {
-    brushSizeEl.value = Math.max(5, parseInt(brushSizeEl.value) - 5);
+    brushSizeEl.value = Math.max(5, parseInt(brushSizeEl.value, 10) - 5);
     brushSizeVal.textContent = brushSizeEl.value;
     updateCursorSize();
   } else if (e.key === ']') {
-    brushSizeEl.value = Math.min(100, parseInt(brushSizeEl.value) + 5);
+    brushSizeEl.value = Math.min(100, parseInt(brushSizeEl.value, 10) + 5);
     brushSizeVal.textContent = brushSizeEl.value;
     updateCursorSize();
   } else if (e.key === 'b' || e.key === 'B') {
     toolBrush.click();
   } else if (e.key === 'e' || e.key === 'E') {
     toolEraser.click();
-  } else if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
     e.preventDefault();
-    toolUndo.click();
+    undoMask();
   }
 });
 
 // Touch support
 editCanvas.addEventListener('touchstart', (e) => {
-  if (currentMode !== 'refine' || !maskCanvas) return;
-  e.preventDefault();
   const touch = e.touches[0];
-  isDrawing = true;
-  if (undoStack.length >= MAX_UNDO) undoStack.shift();
-  undoStack.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
-  const rect = editCanvas.getBoundingClientRect();
-  lastX = (touch.clientX - rect.left) / rect.width * maskCanvas.width;
-  lastY = (touch.clientY - rect.top) / rect.height * maskCanvas.height;
+  if (!touch) return;
+  if (beginStroke(touch.clientX, touch.clientY)) e.preventDefault();
 }, { passive: false });
 
 editCanvas.addEventListener('touchmove', (e) => {
   if (!isDrawing) return;
-  e.preventDefault();
   const touch = e.touches[0];
-  paintOnMask({ clientX: touch.clientX, clientY: touch.clientY });
+  if (!touch) return;
+  e.preventDefault();
+  paintOnMask(touch.clientX, touch.clientY);
 }, { passive: false });
 
-editCanvas.addEventListener('touchend', () => {
-  if (isDrawing) { isDrawing = false; renderPreview(); }
-});
+editCanvas.addEventListener('touchend', () => endStroke());
+editCanvas.addEventListener('touchcancel', () => endStroke());
 
-// ── Download ───────────────────────────────────────────
+// ── Download (always current original + current mask) ──
 downloadBtn.addEventListener('click', () => {
-  if (!origCanvas || !maskCanvas) return;
-  const resultCanvas = applyMaskToOriginal();
+  if (!origCanvas || !maskCanvas || isProcessing) return;
+
+  const resultCanvas = renderCompositeAt(origCanvas.width, origCanvas.height);
   resultCanvas.toBlob((blob) => {
+    if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    const baseName = (fileNameEl.textContent || 'image').replace(/\.[^.]+$/, '');
+    const baseName = (fileNameEl.textContent || 'image').replace(/\.[^.]+$/, '') || 'image';
     a.download = baseName + '-no-bg.png';
     document.body.appendChild(a);
     a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    a.remove();
+    // Give the browser time to start the download before releasing the URL.
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
   }, 'image/png');
 });
 
