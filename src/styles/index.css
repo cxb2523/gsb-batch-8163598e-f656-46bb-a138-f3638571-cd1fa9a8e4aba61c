@@ -1,0 +1,480 @@
+/*
+ * fabri-pix default styles
+ *
+ * Every selector is wrapped in :where() so it has zero specificity: any class passed through `classNames`
+ * (or your own stylesheet) overrides these rules without !important.
+ * Layout rules always apply, visual rules (colors, borders, spacing) are skipped with the `unstyled` prop.
+ * Theme through the CSS variables below (or the `theme` prop).
+ */
+
+/* ------------------------------------------------------------------ variables */
+
+:where(.fp-root) {
+	--fp-color-primary: #1677ff;
+	--fp-color-background: transparent;
+	--fp-color-surface: #f5f5f5;
+	--fp-color-text: #1f1f1f;
+	--fp-color-muted-text: rgba(16, 16, 16, 0.3);
+	--fp-color-border: #d9d9d9;
+	--fp-color-hover: #e8e8e8;
+	--fp-color-active: #f0f0f0;
+	--fp-color-danger: #eb1919;
+	--fp-color-success: #74c00d;
+	--fp-color-stage-background: transparent;
+	--fp-radius: 20px;
+	--fp-font-family: inherit;
+	--fp-font-size: 14px;
+	--fp-gap: 12px;
+	--fp-stage-min-height: 400px;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+:where(.fp-root) {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	gap: var(--fp-gap);
+	box-sizing: border-box;
+	min-width: 0;
+	/* the layout adapts to the width of the editor, not of the window */
+	container: fp-root / inline-size;
+	/* no double-tap zoom / tap delay on the buttons */
+	touch-action: manipulation;
+}
+
+:where(.fp-root *, .fp-root *::before, .fp-root *::after) {
+	box-sizing: border-box;
+}
+
+:where(.fp-header, .fp-toolbar, .fp-context-panel, .fp-actions) {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: center;
+	gap: 4px;
+}
+
+:where(.fp-actions) {
+	justify-content: flex-end;
+}
+
+/* keeps the parts below the canvas from jumping when the panel appears */
+:where(.fp-context-panel) {
+	min-height: 40px;
+}
+
+:where(.fp-body) {
+	display: flex;
+	flex: 1 1 auto;
+	gap: var(--fp-gap);
+	min-height: var(--fp-stage-min-height);
+}
+
+:where(.fp-body--menu-right) {
+	flex-direction: row-reverse;
+}
+
+:where(.fp-body--menu-top) {
+	flex-direction: column;
+}
+
+:where(.fp-body--menu-bottom) {
+	flex-direction: column-reverse;
+}
+
+:where(.fp-menu) {
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	gap: 16px;
+}
+
+:where(.fp-menu--top, .fp-menu--bottom) {
+	flex-direction: row;
+}
+
+:where(.fp-stage) {
+	position: relative;
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+}
+
+:where(.fp-stage-canvas) {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+:where(.fp-loading) {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+:where(.fp-button) {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	cursor: pointer;
+	font: inherit;
+	line-height: 1;
+}
+
+:where(.fp-button:disabled) {
+	cursor: not-allowed;
+}
+
+:where(.fp-dropdown) {
+	display: inline-flex;
+	align-items: center;
+}
+
+/* placed by the Dropdown component relative to the editor root, so scrolling bars don't cut it off */
+:where(.fp-dropdown-content) {
+	position: absolute;
+	left: 0;
+	z-index: 10;
+	max-width: 100%;
+}
+
+:where(.fp-dropdown-content--top) {
+	bottom: calc(100% + 4px);
+}
+
+:where(.fp-dropdown-content--bottom) {
+	top: calc(100% + 4px);
+}
+
+:where(.fp-dropdown-list, .fp-history-panel) {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+}
+
+:where(.fp-dropdown-list .fp-button, .fp-history-item) {
+	justify-content: flex-start;
+	white-space: nowrap;
+}
+
+:where(.fp-history-panel) {
+	width: 230px;
+	max-height: 224px;
+	overflow-y: auto;
+}
+
+:where(.fp-history-labels) {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 2px;
+}
+
+:where(.fp-field, .fp-field-label, .fp-segmented) {
+	display: inline-flex;
+	align-items: center;
+}
+
+:where(.fp-field) {
+	gap: 8px;
+}
+
+:where(.fp-field-label) {
+	gap: 4px;
+}
+
+:where(.fp-divider) {
+	align-self: stretch;
+	width: 1px;
+}
+
+:where(.fp-filter-list) {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: center;
+	gap: 4px 12px;
+	max-width: 100%;
+}
+
+:where(.fp-filter) {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+:where(.fp-icon-grid) {
+	display: grid;
+	grid-template-columns: repeat(4, auto);
+	gap: 2px;
+}
+
+:where(.fp-slider) {
+	cursor: pointer;
+}
+
+:where(.fp-object-controls) {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px;
+}
+
+:where(.fp-value) {
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ visual (skipped by `unstyled`) */
+
+:where(.fp-root:not(.fp-unstyled)) {
+	color: var(--fp-color-text);
+	background: var(--fp-color-background);
+	font-family: var(--fp-font-family);
+	font-size: var(--fp-font-size);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-stage) {
+	background: var(--fp-color-stage-background);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-loading) {
+	color: var(--fp-color-muted-text);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-button) {
+	padding: 8px 16px;
+	border: 1px solid transparent;
+	border-radius: var(--fp-radius);
+	background: transparent;
+	color: inherit;
+	transition: background-color 0.2s ease-in-out;
+}
+
+@media (hover: hover) {
+	:where(.fp-root:not(.fp-unstyled) .fp-button:hover:not(:disabled)) {
+		background: var(--fp-color-hover);
+	}
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-button--active) {
+	background: var(--fp-color-active);
+	border-color: var(--fp-color-text);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-button:disabled) {
+	color: var(--fp-color-muted-text);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-button--danger) {
+	color: var(--fp-color-danger);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-tool-button) {
+	padding-inline: 12px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-dropdown .fp-tool-button + .fp-tool-button) {
+	padding-inline: 2px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-dropdown-content) {
+	min-width: 160px;
+	padding: 8px;
+	border-radius: 10px;
+	background: var(--fp-color-surface);
+	box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-history-item) {
+	gap: 10px;
+	padding: 8px 12px;
+	border-radius: 4px;
+	font-size: 12px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-history-item.fp-button--active) {
+	border-color: transparent;
+	background: #ceeffd;
+	font-weight: bold;
+}
+
+@media (hover: hover) {
+	:where(.fp-root:not(.fp-unstyled) .fp-history-item:hover:not(:disabled)) {
+		background: #ceeffd;
+	}
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-history-check) {
+	color: var(--fp-color-success);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-divider) {
+	margin: 4px 5px;
+	background: var(--fp-color-border);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-color-picker) {
+	width: 25px;
+	height: 25px;
+	padding: 0;
+	border: none;
+	background: none;
+	cursor: pointer;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-number-input, .fp-root:not(.fp-unstyled) .fp-text-input) {
+	height: 26px;
+	border: 1px solid var(--fp-color-border);
+	border-radius: 4px;
+	background: var(--fp-color-background);
+	color: inherit;
+	font: inherit;
+	outline: none;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-number-input) {
+	width: 52px;
+	text-align: center;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-text-input) {
+	width: 150px;
+	padding: 4px 8px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-number-input:focus, .fp-root:not(.fp-unstyled) .fp-text-input:focus) {
+	border-color: var(--fp-color-primary);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-segmented) {
+	overflow: hidden;
+	border: 1px solid var(--fp-color-border);
+	border-radius: 6px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-segmented .fp-button) {
+	padding: 8px;
+	border: none;
+	border-radius: 0;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-slider) {
+	width: 120px;
+	accent-color: var(--fp-color-primary);
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-select) {
+	height: 26px;
+	padding: 0 6px;
+	border: 1px solid var(--fp-color-border);
+	border-radius: 4px;
+	background: var(--fp-color-background);
+	color: inherit;
+	font: inherit;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-filter .fp-button, .fp-root:not(.fp-unstyled) .fp-icon-grid .fp-button) {
+	padding: 6px 10px;
+}
+
+:where(.fp-root:not(.fp-unstyled) .fp-value) {
+	min-width: 36px;
+	color: var(--fp-color-muted-text);
+	font-size: 12px;
+}
+
+/* ------------------------------------------------------------------ narrow editors (phones, sidebars) */
+
+@container fp-root (max-width: 640px) {
+	/* the menu goes above the canvas */
+	:where(.fp-body--menu-left, .fp-body--menu-right) {
+		flex-direction: column;
+	}
+
+	:where(.fp-body) {
+		min-height: min(var(--fp-stage-min-height), 55vh);
+	}
+
+	/* one row per bar, scrolled sideways instead of wrapping */
+	:where(.fp-menu, .fp-header, .fp-toolbar, .fp-context-panel, .fp-actions, .fp-filter-list, .fp-object-controls) {
+		flex-direction: row;
+		flex-wrap: nowrap;
+		justify-content: safe center;
+		max-width: 100%;
+		overflow-x: auto;
+		overscroll-behavior-x: contain;
+		scrollbar-width: none;
+	}
+
+	:where(
+			.fp-menu,
+			.fp-header,
+			.fp-toolbar,
+			.fp-context-panel,
+			.fp-actions,
+			.fp-filter-list,
+			.fp-object-controls
+		)::-webkit-scrollbar {
+		display: none;
+	}
+
+	:where(.fp-menu, .fp-toolbar, .fp-context-panel, .fp-filter-list) > * {
+		flex-shrink: 0;
+	}
+
+	/* fades the side(s) with more content, so that it is clear the bar scrolls */
+	:where([data-fp-scroll-end]) {
+		mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent);
+	}
+
+	:where([data-fp-scroll-start]) {
+		mask-image: linear-gradient(to left, #000 calc(100% - 40px), transparent);
+	}
+
+	:where([data-fp-scroll-start][data-fp-scroll-end]) {
+		mask-image: linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent);
+	}
+
+	:where(.fp-button, .fp-field-label) {
+		white-space: nowrap;
+	}
+
+	:where(.fp-root:not(.fp-unstyled) .fp-menu) {
+		gap: 4px;
+	}
+
+	:where(.fp-root:not(.fp-unstyled) .fp-button) {
+		padding: 8px 12px;
+	}
+
+	:where(.fp-root:not(.fp-unstyled) .fp-dropdown-content) {
+		min-width: 0;
+	}
+}
+
+/* ------------------------------------------------------------------ touch screens */
+
+@media (pointer: coarse) {
+	/* finger sized targets */
+	:where(.fp-root:not(.fp-unstyled) .fp-button) {
+		min-height: 40px;
+	}
+
+	:where(.fp-root:not(.fp-unstyled) .fp-color-picker) {
+		width: 32px;
+		height: 32px;
+	}
+
+	:where(.fp-root:not(.fp-unstyled) .fp-number-input, .fp-root:not(.fp-unstyled) .fp-select) {
+		height: 34px;
+	}
+}

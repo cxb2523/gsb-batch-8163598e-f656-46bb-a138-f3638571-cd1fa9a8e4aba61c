@@ -1,0 +1,1202 @@
+/**
+ * @author Vikhyat Singh
+ * @description Creates (and re-creates from JSON) the objects of the built-in tools
+ */
+
+import {
+	Canvas,
+	Rect,
+	controlsUtils,
+	Triangle,
+	Polygon,
+	Polyline,
+	Path,
+	IText,
+	Textbox,
+	Circle,
+	Group,
+	Line,
+	FabricImage,
+	Control,
+	Point,
+	TransformActionHandler,
+} from 'fabric';
+
+import { ShapeType } from './constants';
+import CustomFabricPolygon from './CustomFabricPolygon';
+
+export type CanvasRef = { current: Canvas | null };
+
+export const applyBlurEffect = (canvas: CanvasRef, rect: any) => {
+	const img = canvas.current?.backgroundImage as any;
+
+	if (!img || !rect) {
+		return;
+	}
+
+	const { left, top, width, height, scaleX, scaleY } = rect;
+	const patchWidth = Math.round(width * scaleX);
+	const patchHeight = Math.round(height * scaleY);
+	if (patchWidth <= 0 || patchHeight <= 0) {
+		return;
+	}
+
+	// the photo as it is displayed (rotated, flipped, filtered), cut out at the rect position
+	const source = document.createElement('canvas');
+	source.width = patchWidth;
+	source.height = patchHeight;
+	const sourceCtx = source.getContext('2d');
+	const croppedCanvas = document.createElement('canvas');
+	croppedCanvas.width = patchWidth;
+	croppedCanvas.height = patchHeight;
+	const ctx = croppedCanvas.getContext('2d');
+	if (!sourceCtx || !ctx) {
+		return;
+	}
+	sourceCtx.translate(-left, -top);
+	sourceCtx.transform(...(img.calcTransformMatrix() as [number, number, number, number, number, number]));
+	img._render(sourceCtx);
+
+	if (typeof ctx.filter === 'string') {
+		ctx.filter = 'blur(5px)';
+		ctx.drawImage(source, 0, 0);
+	} else {
+		// ctx.filter is not supported (Safari), pixelate by down-scaling and up-scaling instead,
+		// otherwise the redacted area would be drawn without any blur
+		const pixelatedCanvas = document.createElement('canvas');
+		pixelatedCanvas.width = Math.max(1, Math.round(patchWidth / 10));
+		pixelatedCanvas.height = Math.max(1, Math.round(patchHeight / 10));
+		pixelatedCanvas.getContext('2d')?.drawImage(source, 0, 0, pixelatedCanvas.width, pixelatedCanvas.height);
+		ctx.imageSmoothingEnabled = true;
+		ctx.drawImage(pixelatedCanvas, 0, 0, patchWidth, patchHeight);
+	}
+
+	const blurredImage = new FabricImage(croppedCanvas);
+
+	blurredImage.set({
+		left,
+		top,
+		width: patchWidth,
+		height: patchHeight,
+		selectable: false,
+		evented: false,
+		excludeFromExport: true,
+		shapeType: ShapeType.BLUR_INNER_PART,
+		id: rect.id + '-blur',
+	});
+
+	canvas.current.getObjects().forEach((obj: any) => {
+		if (obj.type === 'image' && obj !== img && obj.id === rect.id + '-blur') {
+			canvas.current.remove(obj);
+		}
+	});
+
+	// right above its blur area, so that the stacking order (layers) is kept
+	const rectIndex = canvas.current.getObjects().indexOf(rect);
+	if (rectIndex >= 0) {
+		canvas.current.insertAt(rectIndex + 1, blurredImage);
+	} else {
+		canvas.current.add(blurredImage);
+	}
+	canvas.current.renderAll();
+};
+
+const addBlurEffect = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape?: boolean;
+	canvasData?: any;
+}) => {
+	const rect = new Rect({
+		id: canvasData.id,
+		left: canvasData.left,
+		top: canvasData.top,
+		width: canvasData.width,
+		height: canvasData.height,
+		scaleX: canvasData?.scaleX ?? 1,
+		scaleY: canvasData?.scaleY ?? 1,
+		fill: 'rgba(255, 255, 255, 0.3)',
+		stroke: 'transparent',
+		strokeWidth: 1,
+		cornerColor: 'blue',
+		cornerStyle: 'circle',
+		cornerSize: 8,
+		transparentCorners: false,
+		selectable: true,
+		hasBorders: true,
+		hasControls: true,
+		lockRotation: true,
+		shapeType: ShapeType.BLUR,
+	});
+
+	if (!isNewShape) {
+		let hasBeenCalled = false;
+		const handleAfterRender = () => {
+			if (hasBeenCalled) {
+				return;
+			}
+			hasBeenCalled = true;
+			applyBlurEffect(canvas, rect);
+			canvas.current.off('after:render', handleAfterRender);
+		};
+		canvas.current.on('after:render', handleAfterRender);
+	}
+
+	rect.on('modified', () => {
+		applyBlurEffect(canvas, rect);
+	});
+
+	canvas.current.add(rect);
+	canvas.current.requestRenderAll();
+};
+
+const modifyArrowHeadFirstTime = (arrowHead: Triangle, points: any) => {
+	const dx = points![1].x - points![0].x;
+	const dy = points![1].y - points![0].y;
+	const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+	arrowHead?.set({
+		left: points![1].x,
+		top: points![1].y,
+		angle: angle + 90,
+	});
+};
+
+/** the first two points of the arrow polygon in scene coordinates (oCoords are viewport coordinates) */
+export const getArrowEndpoints = (polygon: Polygon) => {
+	const matrix = polygon.calcTransformMatrix();
+	const [p0, p1] = polygon.points
+		.slice(0, 2)
+		.map((point) => new Point(point.x - polygon.pathOffset.x, point.y - polygon.pathOffset.y).transform(matrix));
+	return { p0, p1 };
+};
+
+export const positionArrowHead = (arrowHead: Triangle | undefined, polygon: Polygon) => {
+	if (!arrowHead || !polygon?.points || polygon.points.length < 2) {
+		return;
+	}
+	const { p0, p1 } = getArrowEndpoints(polygon);
+	const angle = (Math.atan2(p1.y - p0.y, p1.x - p0.x) * 180) / Math.PI;
+	arrowHead.set({ left: p1.x, top: p1.y, angle: angle + 90 });
+	arrowHead.setCoords();
+};
+
+const addAdvancedArrow = ({
+	canvas,
+	isNewShape,
+	canvasData,
+	shapeType,
+}: {
+	canvas: CanvasRef;
+	isNewShape?: boolean;
+	canvasData?: any;
+	shapeType: string;
+}) => {
+	const currentPolyline = new Polygon(canvasData.points, {
+		fill: 'transparent',
+		stroke: canvasData.stroke,
+		strokeWidth: canvasData.strokeWidth,
+		objectCaching: false,
+		cornerStyle: 'circle',
+		transparentCorners: false,
+		cornerColor: canvasData.cornerColor,
+		perPixelTargetFind: true,
+		...(isNewShape
+			? {}
+			: {
+					left: canvasData.left,
+					top: canvasData.top,
+					scaleX: canvasData.scaleX,
+					scaleY: canvasData.scaleY,
+				}),
+	});
+
+	const arrowHead = new Triangle({
+		width: canvasData.strokeWidth * 2,
+		height: canvasData.strokeWidth * 2,
+		fill: canvasData.stroke,
+		excludeFromExport: true,
+		selectable: false,
+		originX: 'center',
+		originY: 'center',
+	});
+
+	currentPolyline.set({
+		shapeType,
+		id: canvasData.id,
+	});
+
+	arrowHead.set({
+		shapeType:
+			shapeType === ShapeType.TEMP_ADVANCED_ARROW
+				? ShapeType.TEMP_ADVANCED_ARROW_HEAD
+				: ShapeType.ADVANCED_ARROW_HEAD,
+		id: `${canvasData.id}-arrowhead`,
+	});
+
+	currentPolyline.on('modifyPoly', () => {
+		positionArrowHead(arrowHead, currentPolyline);
+	});
+
+	currentPolyline.on('moving', () => {
+		positionArrowHead(arrowHead, currentPolyline);
+	});
+
+	let hasAddedRun = false;
+	currentPolyline.on('added', () => {
+		if (!hasAddedRun) {
+			if (isNewShape) {
+				modifyArrowHeadFirstTime(arrowHead, currentPolyline?.points);
+			} else {
+				positionArrowHead(arrowHead, currentPolyline);
+			}
+			hasAddedRun = true;
+		}
+	});
+
+	currentPolyline.cornerStyle = 'circle';
+	currentPolyline.cornerColor = 'rgba(0,0,255,0.5)';
+	currentPolyline.hasBorders = false;
+	currentPolyline.controls = controlsUtils.createPolyControls(currentPolyline);
+	currentPolyline.setCoords();
+
+	canvas.current.add(currentPolyline, arrowHead);
+	if (isNewShape) {
+		canvas.current.setActiveObject(currentPolyline);
+	}
+	canvas.current.requestRenderAll();
+};
+
+const addLinePath = ({
+	canvas,
+	isNewShape,
+	canvasData,
+	shapeType,
+}: {
+	canvas: CanvasRef;
+	isNewShape?: boolean;
+	canvasData?: any;
+	shapeType: string;
+}) => {
+	const currentPolyline = new Polyline(canvasData.points, {
+		fill: 'transparent',
+		stroke: canvasData.stroke,
+		strokeWidth: canvasData.strokeWidth,
+		objectCaching: false,
+		transparentCorners: false,
+		perPixelTargetFind: true,
+		cornerStyle: 'circle',
+		cornerColor: 'blue',
+		...(isNewShape
+			? {}
+			: {
+					left: canvasData.left,
+					top: canvasData.top,
+					scaleX: canvasData.scaleX,
+					scaleY: canvasData.scaleY,
+				}),
+	});
+
+	currentPolyline.set({
+		shapeType,
+		id: canvasData.id,
+	});
+
+	currentPolyline.cornerStyle = 'circle';
+	currentPolyline.cornerColor = 'rgba(0,0,255,0.5)';
+	currentPolyline.hasBorders = false;
+	currentPolyline.controls = controlsUtils.createPolyControls(currentPolyline);
+	currentPolyline.setCoords();
+
+	canvas.current.add(currentPolyline);
+	if (isNewShape) {
+		canvas.current.setActiveObject(currentPolyline);
+	}
+	canvas.current.requestRenderAll();
+};
+
+const addPencil = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape?: boolean;
+	canvasData?: any;
+}) => {
+	if (!isNewShape) {
+		const path = new Path(canvasData.path);
+		path.set({
+			left: canvasData.left,
+			top: canvasData.top,
+			scaleX: canvasData.scaleX,
+			scaleY: canvasData.scaleY,
+			width: canvasData.width,
+			height: canvasData.height,
+			stroke: canvasData.stroke,
+			perPixelTargetFind: true,
+			strokeWidth: canvasData.strokeWidth,
+			fill: canvasData.fill,
+			strokeLineCap: canvasData.strokeLineCap,
+			strokeLineJoin: canvasData.strokeLineJoin,
+			strokeMiterLimit: canvasData.strokeMiterLimit,
+			shapeType: ShapeType.DRAW,
+			id: canvasData.id,
+		});
+		canvas.current.add(path);
+		canvas.current.requestRenderAll();
+	}
+};
+
+const addText = ({ canvas, isNewShape, canvasData }: { canvas: CanvasRef; isNewShape: boolean; canvasData?: any }) => {
+	const text = new IText(canvasData.text, {
+		backgroundColor: canvasData.backgroundColor,
+		cornerColor: '#000',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+		cornerStyle: 'circle',
+		fill: canvasData.fill,
+		padding: 6,
+		fontFamily: canvasData.fontFamily ?? 'Arial',
+		fontSize: canvasData.fontSize,
+		fontStyle: canvasData.fontStyle,
+		fontWeight: canvasData.fontWeight,
+		underline: !!canvasData.underline,
+		linethrough: !!canvasData.linethrough,
+		left: canvasData.left,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		textAlign: canvasData.textAlign,
+		top: canvasData.top,
+		transparentCorners: false,
+	});
+
+	text.set({
+		shapeType: ShapeType.TEXT,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(text);
+	if (isNewShape) {
+		canvas.current.setActiveObject(text);
+	}
+};
+
+const addEmoji = ({ canvas, isNewShape, canvasData }: { canvas: CanvasRef; isNewShape: boolean; canvasData?: any }) => {
+	const emoj = new Textbox(canvasData.text, {
+		cornerColor: '#000',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+		cornerStyle: 'circle',
+		editable: false,
+		fill: '#000',
+		...(canvasData.fontSize ? { fontSize: canvasData.fontSize } : {}),
+		left: canvasData.left,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		top: canvasData.top,
+		transparentCorners: false,
+	});
+
+	emoj.set({
+		shapeType: ShapeType.EMOJI,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(emoj);
+	if (isNewShape) {
+		canvas.current.setActiveObject(emoj);
+	}
+};
+
+const addRectangle = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData?: any;
+}) => {
+	const rect = new Rect({
+		angle: canvasData.angle,
+		cornerColor: '#000',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+		cornerStyle: 'circle',
+		fill: canvasData.fill,
+		height: canvasData.height,
+		left: canvasData.left,
+		rx: canvasData.rx ?? 0,
+		ry: canvasData.ry ?? canvasData.rx ?? 0,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		stroke: canvasData.stroke,
+		strokeUniform: true,
+		strokeWidth: canvasData.strokeWidth,
+		top: canvasData.top,
+		transparentCorners: false,
+		width: canvasData.width,
+	});
+
+	rect.set({
+		shapeType: ShapeType.RECTANGLE,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(rect);
+	if (isNewShape) {
+		canvas.current.setActiveObject(rect);
+	}
+};
+
+const addCircle = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData?: any;
+}) => {
+	const circle = new Circle({
+		angle: canvasData.angle,
+		cornerColor: '#000',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+		cornerStyle: 'circle',
+		fill: canvasData.fill,
+		left: canvasData.left,
+		radius: canvasData.radius,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		stroke: canvasData.stroke,
+		strokeWidth: canvasData.strokeWidth,
+		top: canvasData.top,
+		strokeUniform: true,
+		transparentCorners: false,
+	});
+
+	circle.set({
+		shapeType: ShapeType.CIRCLE,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(circle);
+	if (isNewShape) {
+		canvas.current.setActiveObject(circle);
+	}
+};
+
+const createStarPoints = (
+	centerX: number,
+	centerY: number,
+	outerRadius: number,
+	innerRadius: number,
+	points: number,
+) => {
+	const angle = Math.PI / points;
+	const starPoints: { x: number; y: number }[] = [];
+	for (let i = 0; i < 2 * points; i++) {
+		const radius = i % 2 === 0 ? outerRadius : innerRadius;
+		const x = centerX + radius * Math.cos(i * angle);
+		const y = centerY + radius * Math.sin(i * angle);
+		starPoints.push({ x, y });
+	}
+	return starPoints;
+};
+
+const addStar = ({ canvas, isNewShape, canvasData }: { canvas: CanvasRef; isNewShape: boolean; canvasData?: any }) => {
+	const centerX = 200;
+	const centerY = 150;
+	const outerRadius = 50;
+	const innerRadius = 25;
+	const points = 5;
+
+	const starPoints = createStarPoints(centerX, centerY, outerRadius, innerRadius, points);
+
+	const star = new Polygon(starPoints, {
+		left: canvasData.left,
+		top: canvasData.top,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		width: canvasData.width,
+		height: canvasData.height,
+		angle: canvasData.angle,
+		fill: canvasData.fill,
+		stroke: canvasData.stroke,
+		strokeWidth: canvasData.strokeWidth,
+		strokeUniform: true,
+		transparentCorners: false,
+		objectCaching: false,
+		cornerColor: '#000',
+		cornerStyle: 'circle',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+	});
+
+	star.set({
+		shapeType: ShapeType.STAR,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(star);
+	if (isNewShape) {
+		canvas.current.setActiveObject(star);
+	}
+};
+
+const addArrow = ({ canvas, isNewShape, canvasData }: { canvas: CanvasRef; isNewShape: boolean; canvasData?: any }) => {
+	const line = new Line([50, 50, 100, 50], {
+		angle: canvasData.objects[0].angle,
+		fill: canvasData.objects[0].fill,
+		left: canvasData.objects[0].left,
+		stroke: canvasData.objects[0].stroke,
+		strokeWidth: canvasData.objects[0].strokeWidth,
+		top: canvasData.objects[0].top,
+		x1: canvasData.objects[0].x1,
+		x2: canvasData.objects[0].x2,
+		y1: canvasData.objects[0].y1,
+		y2: canvasData.objects[0].y2,
+	});
+	const arrowhead = new Triangle({
+		width: canvasData.objects[1].width,
+		height: canvasData.objects[1].height,
+		fill: canvasData.objects[1].fill,
+		left: canvasData.objects[1].left,
+		top: canvasData.objects[1].top,
+		angle: canvasData.objects[1].angle,
+	});
+	const arrow = new Group([line, arrowhead], {
+		angle: canvasData.angle,
+		left: canvasData.left,
+		top: canvasData.top,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+		selectable: true,
+		hasControls: true,
+		hasBorders: true,
+		strokeUniform: true,
+		transparentCorners: false,
+		cornerColor: '#000',
+		cornerStyle: 'circle',
+		cornerSize: 8,
+		cornerStrokeColor: '#1d7bb9',
+	});
+
+	arrow.set({
+		shapeType: ShapeType.ARROW,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(arrow);
+	if (isNewShape) {
+		canvas.current.setActiveObject(arrow);
+	}
+};
+
+const addCustomShape = async ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData?: any;
+}) => {
+	const img = await FabricImage.fromURL(canvasData.src, { crossOrigin: 'anonymous' });
+	if (!canvas.current) {
+		return;
+	}
+
+	let { left, top, scaleX, scaleY } = canvasData;
+	if (isNewShape) {
+		// fit big uploads into half of the canvas and center them
+		const canvasWidth = canvasData.sceneWidth ?? canvas.current.getWidth();
+		const canvasHeight = canvasData.sceneHeight ?? canvas.current.getHeight();
+		const scale = Math.min(1, canvasWidth / 2 / img.width, canvasHeight / 2 / img.height);
+		scaleX = scale;
+		scaleY = scale;
+		left = (canvasWidth - img.width * scale) / 2;
+		top = (canvasHeight - img.height * scale) / 2;
+	}
+
+	img.set({
+		left,
+		top,
+		scaleX,
+		scaleY,
+		angle: canvasData.angle,
+		fill: canvasData.fill,
+		shapeType: ShapeType.CUSTOM_SHAPE,
+		id: canvasData.id,
+	});
+
+	canvas.current.add(img);
+	if (isNewShape) {
+		canvas.current.setActiveObject(img);
+	}
+	canvas.current.requestRenderAll();
+};
+
+const handleTextChangedStepsCreator = (group: Group, canvas: CanvasRef) => {
+	const textObject = (group.getObjects()[1] as Group).getObjects()[1] as IText;
+	const circleObject = (group.getObjects()[1] as Group).getObjects()[0] as Circle;
+	const textWidth = textObject.width;
+	const textHeight = textObject.height;
+	const radius = circleObject.radius;
+	const newRadius = Math.max(textWidth / 2 + 10, textHeight / 2 + 10);
+
+	circleObject.set({
+		radius: newRadius,
+		left: circleObject.left - (newRadius - radius),
+		top: circleObject.top - (newRadius - radius),
+	});
+
+	textObject.set({
+		left: 0,
+		top: 0,
+	});
+
+	canvas.current.requestRenderAll();
+};
+
+const handleDoubleClickStepsCreator = (e: any, canvas: CanvasRef) => {
+	const target = e.target;
+	if (!target) {
+		return;
+	}
+
+	if (target?.shapeType === ShapeType.STEPS_CREATOR) {
+		const group = target as Group;
+		const textObject = (group.getObjects()[1] as Group).getObjects()[1] as IText;
+
+		textObject.enterEditing();
+		textObject.selectAll();
+
+		canvas.current.requestRenderAll();
+	}
+};
+
+const handleDeselectStepsCreator = (group: Group, canvas: CanvasRef) => {
+	((group.getObjects()[1] as Group).getObjects()[1] as IText).exitEditing();
+	canvas.current.requestRenderAll();
+};
+
+const addStepsCreator = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData: any;
+}) => {
+	const text = new IText(canvasData.objects[1].objects[1].text, {
+		left: 0,
+		top: 0,
+		fontSize: canvasData.objects[1].objects[1].fontSize,
+		fill: canvasData.objects[1].objects[1].fill,
+		angle: canvasData.objects[1].objects[1].angle,
+		fontWeight: 'bold',
+		editable: true,
+		objectCaching: false,
+		shapeType: ShapeType.TEXT_STEPS_CREATOR,
+		originX: 'center',
+		originY: 'center',
+	});
+
+	const textWidth = text.width;
+	const textHeight = text.height;
+	const newRadius = Math.max(textWidth / 2 + 10, textHeight / 2 + 10);
+
+	const circle = new Circle({
+		radius: newRadius,
+		left: -newRadius / 2,
+		top: -newRadius / 2,
+		fill: canvasData.objects[1].objects[0].fill,
+		selectable: false,
+		objectCaching: false,
+	});
+
+	const rect = new Rect({
+		width: canvasData.objects[0].width,
+		height: canvasData.objects[0].height,
+		fill: canvasData.objects[0].fill,
+		stroke: canvasData.objects[0].stroke,
+		strokeWidth: canvasData.objects[0].strokeWidth,
+		strokeUniform: true,
+		objectCaching: false,
+		selectable: false,
+		shapeType: ShapeType.RECT_STEPS_CREATOR,
+		id: canvasData.id,
+		...(isNewShape
+			? {}
+			: {
+					left: canvasData.objects[0].left,
+					top: canvasData.objects[0].top,
+				}),
+	});
+
+	const internalGroup = new Group([circle, text], {
+		left: isNewShape ? canvasData.objects[1].objects[0].left : canvasData.objects[1].left,
+		top: isNewShape ? canvasData.objects[1].objects[0].top : canvasData.objects[1].top,
+		selectable: false,
+		hasControls: false,
+		objectCaching: false,
+		originX: 'center',
+		originY: 'center',
+	});
+
+	text.set({
+		left: 0,
+		top: 0,
+	});
+
+	let groupLeft: number = 0;
+	let groupTop: number = 0;
+	if (isNewShape) {
+		if (canvasData.left === canvasData.objects[0].left) {
+			groupLeft = canvasData.objects[0].left - newRadius;
+		} else if (canvasData.left === canvasData.objects[0].left + canvasData.objects[0].width) {
+			groupLeft = canvasData.objects[0].left;
+		}
+		if (canvasData.top === canvasData.objects[0].top) {
+			groupTop = canvasData.objects[0].top - newRadius;
+		} else if (canvasData.top === canvasData.objects[0].top + canvasData.objects[0].height) {
+			groupTop = canvasData.objects[0].top;
+		}
+	}
+
+	const group = new Group([rect, internalGroup], {
+		selectable: true,
+		hasControls: true,
+		objectCaching: false,
+		angle: canvasData.angle,
+		fill: canvasData.fill,
+		cornerStyle: 'circle',
+		cornerColor: '#1d7bb9',
+		cornerSize: 8,
+		transparentCorners: false,
+		left: isNewShape ? groupLeft : canvasData.left,
+		top: isNewShape ? groupTop : canvasData.top,
+		scaleX: canvasData.scaleX,
+		scaleY: canvasData.scaleY,
+	});
+
+	group.set({
+		shapeType: ShapeType.STEPS_CREATOR,
+		id: canvasData.id,
+	});
+
+	group.on('deselected', () => handleDeselectStepsCreator(group, canvas));
+	group.on('mousedblclick', (e) => handleDoubleClickStepsCreator(e, canvas));
+	((group.getObjects()[1] as Group).getObjects()[1] as IText).on('changed', () =>
+		handleTextChangedStepsCreator(group, canvas),
+	);
+
+	group.setCoords();
+	canvas.current.add(group);
+
+	if (isNewShape) {
+		canvas.current.setActiveObject(group);
+		canvas.current.discardActiveObject();
+		canvas.current.setActiveObject(group);
+	} else {
+		canvas.current.discardActiveObject();
+		canvas.current.setActiveObject(group);
+		canvas.current.discardActiveObject();
+	}
+	canvas.current.renderAll();
+};
+
+const addCommentBox = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData: any;
+}): void => {
+	const bottomArrowPoints = [
+		{ x: 0, y: 0 },
+		{ x: 100, y: 0 },
+		{ x: 100, y: 50 },
+		{ x: 50, y: 50 },
+		{ x: 60, y: 70 },
+		{ x: 70, y: 50 },
+		{ x: 0, y: 50 },
+	];
+	const points = {
+		points: bottomArrowPoints,
+		pointIndex: 4,
+		widthPointer: { x1: 0, x2: 1 },
+		heightPointer: { y1: 1, y2: 2 },
+		type: 'bottom',
+	};
+	const defaultPoints = {
+		points: bottomArrowPoints,
+		pointIndex: 4,
+		widthPointer: { x1: 0, x2: 1 },
+		heightPointer: { y1: 1, y2: 2 },
+		type: 'bottom',
+	};
+	if (points.points.length === 0) {
+		return;
+	}
+	const clonedPoints = JSON.parse(JSON.stringify(points));
+	const clonedDefaultPoints = JSON.parse(JSON.stringify(defaultPoints));
+	const polygon = new CustomFabricPolygon(
+		clonedDefaultPoints.points,
+		{
+			id: canvasData.id,
+			fill: canvasData?.fill,
+			scaleX: canvasData.scaleX,
+			scaleY: canvasData.scaleY,
+			lockRotation: true,
+			objectCaching: false,
+			transparentCorners: false,
+			hasControls: true,
+			evented: true,
+			stroke: canvasData?.stroke,
+			strokeWidth: canvasData?.strokeWidth,
+			cornerColor: '#fff',
+			cornerStyle: 'circle',
+			cornerSize: 12,
+			fontStyle: canvasData?.['test']?.fontStyle || 'normal',
+		},
+		new Textbox(canvasData?.['test']?.text ?? '', {
+			id: canvasData.id + '-text',
+			fill: canvasData?.['test']?.fill,
+			fontSize: canvasData?.['test']?.fontSize,
+			fontFamily: 'Inter Roboto',
+			fontWeight: canvasData?.['test']?.fontWeight,
+			textAlign: canvasData?.['test']?.textAlign,
+			objectCaching: false,
+			hasBorders: false,
+			hasControls: true,
+			evented: true,
+			excludeFromExport: true,
+			fontStyle: canvasData?.['test']?.fontStyle || 'normal',
+			shapeType: ShapeType.COMMENT_BOX_TEXTBOX,
+		}),
+		canvas.current,
+		clonedDefaultPoints.pointIndex,
+		clonedDefaultPoints.widthPointer,
+		clonedDefaultPoints.heightPointer,
+		clonedDefaultPoints.type,
+		'bottom',
+	);
+	polygon.set({
+		left: canvasData.left,
+		top: canvasData.top,
+	});
+	canvas.current.add(polygon);
+	polygon.set({
+		points: canvasData.points ?? JSON.parse(JSON.stringify(clonedPoints.points)),
+		pointIndex: clonedPoints.pointIndex,
+		widthPointer: clonedPoints.widthPointer,
+		heightPointer: clonedPoints.heightPointer,
+		type: clonedPoints.type,
+		dirty: true,
+		hasControls: true,
+		evented: true,
+		shapeType: ShapeType.COMMENT_BOX,
+	});
+
+	if (isNewShape) {
+		canvas.current.setActiveObject(polygon);
+	}
+	canvas.current.requestRenderAll();
+};
+
+const drawLCorner = (ctx: any, left: number, top: number, position: string) => {
+	ctx.save();
+	ctx.strokeStyle = '#1677FF';
+	ctx.lineWidth = 3;
+
+	ctx.beginPath();
+
+	switch (position) {
+		case 'tl':
+			ctx.moveTo(left, top + 15);
+			ctx.lineTo(left, top);
+			ctx.lineTo(left + 15, top);
+			break;
+
+		case 'tr':
+			ctx.moveTo(left - 15, top);
+			ctx.lineTo(left, top);
+			ctx.lineTo(left, top + 15);
+			break;
+
+		case 'bl':
+			ctx.moveTo(left, top - 15);
+			ctx.lineTo(left, top);
+			ctx.lineTo(left + 15, top);
+			break;
+
+		case 'br':
+			ctx.moveTo(left - 15, top);
+			ctx.lineTo(left, top);
+			ctx.lineTo(left, top - 15);
+			break;
+
+		case 'mt':
+		case 'mb':
+			ctx.moveTo(left - 10, top);
+			ctx.lineTo(left + 10, top);
+			break;
+
+		case 'ml':
+		case 'mr':
+			ctx.moveTo(left, top - 10);
+			ctx.lineTo(left, top + 10);
+			break;
+	}
+
+	ctx.stroke();
+	ctx.restore();
+};
+
+const lCornerControl = (x: number, y: number, cursor: string, position: string) => {
+	let actionHandler: TransformActionHandler<any>;
+
+	switch (cursor) {
+		case 'ns-resize':
+			actionHandler = controlsUtils.scalingY;
+			break;
+		case 'ew-resize':
+			actionHandler = controlsUtils.scalingX;
+			break;
+		default:
+			actionHandler = controlsUtils.scalingEqually;
+			break;
+	}
+
+	return new Control({
+		x,
+		y,
+		render: (ctx, left, top) => drawLCorner(ctx, left, top, position),
+		actionHandler,
+		cursorStyle: cursor,
+		sizeX: 20,
+		sizeY: 20,
+	});
+};
+
+const addCropRectangle = ({
+	canvas,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	isNewShape: boolean;
+	canvasData?: any;
+}) => {
+	// overlays cover the whole scene, which differs from the canvas element size when the view is zoomed
+	const canvasWidth = canvasData.sceneWidth ?? canvas.current.getWidth();
+	const canvasHeight = canvasData.sceneHeight ?? canvas.current.getHeight();
+
+	const cropRect = new Rect({
+		left: canvasData.left,
+		top: canvasData.top,
+		width: canvasData.width,
+		height: canvasData.height,
+		fill: 'transparent',
+		stroke: '#fff',
+		strokeWidth: 1,
+		strokeDashArray: [5, 5],
+		selectable: true,
+		strokeUniform: true,
+		lockRotation: true,
+		cornerSize: 8,
+		transparentCorners: false,
+		excludeFromExport: true,
+	});
+	cropRect.set({
+		id: canvasData.id,
+		shapeType: ShapeType.CROP_RECTANGLE,
+	});
+
+	cropRect.controls = {
+		tl: lCornerControl(-0.5, -0.5, 'nwse-resize', 'tl'),
+		tr: lCornerControl(0.5, -0.5, 'nesw-resize', 'tr'),
+		bl: lCornerControl(-0.5, 0.5, 'nesw-resize', 'bl'),
+		br: lCornerControl(0.5, 0.5, 'nwse-resize', 'br'),
+		mt: lCornerControl(0, -0.5, 'ns-resize', 'mt'),
+		mb: lCornerControl(0, 0.5, 'ns-resize', 'mb'),
+		ml: lCornerControl(-0.5, 0, 'ew-resize', 'ml'),
+		mr: lCornerControl(0.5, 0, 'ew-resize', 'mr'),
+	};
+
+	const overlayTop = new Rect({
+		left: 0,
+		top: 0,
+		width: canvasWidth,
+		height: cropRect.top,
+		fill: 'rgba(0,0,0,0.5)',
+		selectable: false,
+		evented: false,
+		hoverCursor: 'default',
+		excludeFromExport: true,
+	});
+	overlayTop.set({ shapeType: ShapeType.CROP_GREYED_TOP });
+
+	const overlayLeft = new Rect({
+		left: 0,
+		top: cropRect.top,
+		width: cropRect.left,
+		height: cropRect.getScaledHeight(),
+		fill: 'rgba(0,0,0,0.5)',
+		selectable: false,
+		evented: false,
+		hoverCursor: 'default',
+		excludeFromExport: true,
+	});
+	overlayLeft.set({ shapeType: ShapeType.CROP_GREYED_LEFT });
+
+	const overlayRight = new Rect({
+		left: cropRect.left + cropRect.getScaledWidth(),
+		top: cropRect.top,
+		width: canvasWidth - (cropRect.left + cropRect.getScaledWidth()),
+		height: cropRect.getScaledHeight(),
+		fill: 'rgba(0,0,0,0.5)',
+		selectable: false,
+		evented: false,
+		hoverCursor: 'default',
+		excludeFromExport: true,
+	});
+	overlayRight.set({ shapeType: ShapeType.CROP_GREYED_RIGHT });
+
+	const overlayBottom = new Rect({
+		left: 0,
+		top: cropRect.top + cropRect.getScaledHeight(),
+		width: canvasWidth,
+		height: canvasHeight - (cropRect.top + cropRect.getScaledHeight()),
+		fill: 'rgba(0,0,0,0.5)',
+		selectable: false,
+		evented: false,
+		hoverCursor: 'default',
+		excludeFromExport: true,
+	});
+	overlayBottom.set({ shapeType: ShapeType.CROP_GREYED_BOTTOM });
+
+	canvas.current.add(overlayTop, overlayLeft, overlayRight, overlayBottom);
+	canvas.current.add(cropRect);
+
+	if (!isNewShape) {
+		canvas.current.setActiveObject(cropRect);
+	}
+
+	const updateOverlays = () => {
+		const newLeft = cropRect.left;
+		const newTop = cropRect.top;
+		const newWidth = cropRect.getScaledWidth();
+		const newHeight = cropRect.getScaledHeight();
+		overlayTop.set({
+			top: 0,
+			left: 0,
+			width: canvasWidth,
+			height: newTop,
+		});
+		overlayLeft.set({
+			left: 0,
+			top: newTop,
+			width: newLeft,
+			height: newHeight,
+		});
+		overlayRight.set({
+			left: newLeft + newWidth,
+			top: newTop,
+			width: canvasWidth - (newLeft + newWidth),
+			height: newHeight,
+		});
+		overlayBottom.set({
+			left: 0,
+			top: newTop + newHeight,
+			width: canvasWidth,
+			height: canvasHeight - (newTop + newHeight),
+		});
+		[overlayTop, overlayLeft, overlayRight, overlayBottom].forEach((overlay) => overlay.setCoords());
+		canvas.current?.requestRenderAll();
+	};
+
+	if (!isNewShape) {
+		const handleAfterRender = () => {
+			canvas.current?.off('after:render', handleAfterRender);
+			updateOverlays();
+		};
+		canvas.current.on('after:render', handleAfterRender);
+	}
+
+	cropRect.on('modified', updateOverlays);
+	cropRect.on('moving', updateOverlays);
+	cropRect.on('scaling', updateOverlays);
+};
+
+const createShape = ({
+	canvas,
+	shapeType,
+	isNewShape,
+	canvasData,
+}: {
+	canvas: CanvasRef;
+	shapeType: string;
+	isNewShape: boolean;
+	canvasData?: any;
+}): Promise<void> | void => {
+	switch (shapeType) {
+		case ShapeType.BLUR:
+			addBlurEffect({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.ADVANCED_ARROW:
+		case ShapeType.TEMP_ADVANCED_ARROW:
+			addAdvancedArrow({ canvas, isNewShape, canvasData, shapeType });
+			break;
+		case ShapeType.LINE_PATH:
+		case ShapeType.TEMP_LINE_PATH:
+			addLinePath({ canvas, isNewShape, canvasData, shapeType });
+			break;
+		case ShapeType.DRAW:
+			addPencil({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.TEXT:
+			addText({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.EMOJI:
+			addEmoji({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.RECTANGLE:
+			addRectangle({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.CIRCLE:
+			addCircle({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.STAR:
+			addStar({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.ARROW:
+			addArrow({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.CUSTOM_SHAPE:
+			// returned so callers restoring a saved state can wait for the image to load
+			return addCustomShape({ canvas, isNewShape, canvasData }).catch((err) => console.error(err));
+		case ShapeType.STEPS_CREATOR:
+			addStepsCreator({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.COMMENT_BOX:
+			addCommentBox({ canvas, isNewShape, canvasData });
+			break;
+		case ShapeType.CROP_RECTANGLE:
+			addCropRectangle({ canvas, isNewShape, canvasData });
+			break;
+		default:
+			break;
+	}
+};
+
+export default createShape;

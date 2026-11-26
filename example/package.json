@@ -1,0 +1,25 @@
+{
+	"name": "fabri-pix-example",
+	"private": true,
+	"scripts": {
+		"dev": "vite",
+		"dev:local": "FABRIPIX_SOURCE=local vite",
+		"build": "vite build && vite build --ssr entry-server.tsx --outDir dist-ssr && node scripts/prerender.mjs",
+		"build:local": "FABRIPIX_SOURCE=local yarn build",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"fabri-pix": "^3.0.0",
+		"fabric": "^6.6.4",
+		"prism-react-renderer": "2.4.1",
+		"react": "^19.0.0",
+		"react-dom": "^19.0.0"
+	},
+	"devDependencies": {
+		"@types/react": "^19.1.2",
+		"@types/react-dom": "^19.1.2",
+		"@vitejs/plugin-react": "^4.4.1",
+		"typescript": "~5.7.2",
+		"vite": "^6.2.0"
+	}
+}

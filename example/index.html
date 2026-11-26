@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<!-- scripts/prerender.mjs replaces the title and description with the page's own and adds its other tags at the marker -->
+		<title>FabriPix · React image editor component (crop, annotate, filters, redact)</title>
+		<meta
+			name="description"
+			content="A fully customizable React image editor built on Fabric.js: crop, rotate, filters, redact, annotate with shapes, arrows, text and steps."
+		/>
+		<!--seo-->
+		<script>
+			// the theme before the first paint (the html of the page is rendered at build time)
+			try {
+				var theme = localStorage.getItem('fabri-pix-theme');
+				document.documentElement.dataset.theme =
+					theme === 'dark' || theme === 'light'
+						? theme
+						: matchMedia('(prefers-color-scheme: dark)').matches
+							? 'dark'
+							: 'light';
+			} catch (error) {}
+		</script>
+		<meta name="theme-color" content="#6d5dfc" />
+		<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+		<link rel="apple-touch-icon" href="/icon-192.png" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<link
+			href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+			rel="stylesheet"
+		/>
+	</head>
+	<body>
+		<div id="root"></div>
+		<script type="module" src="./main.tsx"></script>
+	</body>
+</html>

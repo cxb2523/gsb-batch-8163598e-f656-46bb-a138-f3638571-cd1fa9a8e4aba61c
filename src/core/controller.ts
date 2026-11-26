@@ -1,0 +1,2101 @@
+/**
+ * @author Vikhyat Singh
+ * @description Framework independent editor core. It owns the fabric canvas, the tools, the history and the view.
+ * The react components are a thin layer on top of it and everything they do is available through its methods.
+ */
+
+import { ActiveSelection, Canvas, FabricImage, FabricObject, Point, Rect, Shadow, TMat2D, util } from 'fabric';
+
+import { builtInFilters } from './filters';
+import { attachGestures } from './gestures';
+import { builtInShapes } from './shapes';
+import { applyBlurEffect } from './shapeFactory';
+import { blobToDataUrl, downloadBlob, isTypingTarget } from './dom';
+import {
+	CUSTOM_OBJECT_PROPERTIES,
+	generateId,
+	MAX_ZOOM,
+	MIN_ZOOM,
+	SCENE_REFERENCE_SIZE,
+	ShapeType,
+	ZOOM_STEP,
+} from './constants';
+import {
+	EditorEvents,
+	EditorShortcut,
+	EditorState,
+	ExportOptions,
+	FilterDefinition,
+	FlipDirection,
+	HistoryState,
+	ImageEditorOptions,
+	LayerDirection,
+	MenuDefinition,
+	MenuItem,
+	ObjectStyle,
+	SaveResult,
+	ShapeDefinition,
+	ToolContext,
+	ToolDeactivateReason,
+	ToolDefinition,
+	ToolOptions,
+} from './types';
+
+const DEFAULT_HISTORY_LIMIT = 50;
+const DEFAULT_MAX_EXPORT_PIXELS = 16_000_000;
+
+/** built-in tools and menus, injected by the react layer (they contain react icons / panels) */
+export interface EditorRegistry {
+	tools: ToolDefinition<any>[];
+	menus: MenuDefinition[];
+}
+
+type Listener<T> = (payload: T) => void;
+
+interface ToolSession {
+	id: string;
+	cleanup: (reason: ToolDeactivateReason) => void;
+}
+
+// the keyboard shortcuts only apply to the editor the user interacted with last (several editors on one page)
+let lastInteractedEditor: ImageEditorController | null = null;
+
+// copied objects, shared by all editors on the page
+let clipboard: { objects: Record<string, any>[]; pasteCount: number } | null = null;
+// written to the system clipboard on copy, so that a later paste knows the editor's own objects are the latest content
+const CLIPBOARD_MARKER = 'fabri-pix/objects';
+const PASTE_OFFSET = 20;
+
+/** `mod` is ⌘ on macOS and Ctrl elsewhere, combinations are written like `mod+shift+z` */
+export const defaultShortcuts: Record<EditorShortcut, string[]> = {
+	undo: ['mod+z'],
+	redo: ['mod+shift+z', 'mod+y'],
+	delete: ['delete', 'backspace'],
+	copy: ['mod+c'],
+	cut: ['mod+x'],
+	paste: ['mod+v'],
+	duplicate: ['mod+d'],
+	selectAll: ['mod+a'],
+	deselect: ['escape'],
+	// hold shift to move by 10
+	nudgeLeft: ['arrowleft'],
+	nudgeRight: ['arrowright'],
+	nudgeUp: ['arrowup'],
+	nudgeDown: ['arrowdown'],
+	bringForward: ['mod+]'],
+	sendBackward: ['mod+['],
+	bringToFront: ['mod+shift+]'],
+	sendToBack: ['mod+shift+['],
+};
+
+const isMac = () =>
+	typeof navigator !== 'undefined' && /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent);
+
+// physical keys, so that shortcuts work with shift held and on other keyboard layouts
+const keyOf = (event: KeyboardEvent) => {
+	if (/^Key[A-Z]$/.test(event.code)) {
+		return event.code.slice(3).toLowerCase();
+	}
+	if (/^Digit[0-9]$/.test(event.code)) {
+		return event.code.slice(5);
+	}
+	if (event.code === 'BracketLeft') {
+		return '[';
+	}
+	if (event.code === 'BracketRight') {
+		return ']';
+	}
+	return event.key.toLowerCase();
+};
+
+const matchesShortcut = (event: KeyboardEvent, combination: string, ignoreShift = false) => {
+	const parts = combination.toLowerCase().split('+');
+	const key = parts[parts.length - 1];
+	const modifiers = new Set(parts.slice(0, -1));
+	const mac = isMac();
+	const wantsCtrl = modifiers.has('ctrl') || (!mac && modifiers.has('mod'));
+	const wantsMeta = modifiers.has('meta') || (mac && modifiers.has('mod'));
+	return (
+		keyOf(event) === key &&
+		event.ctrlKey === wantsCtrl &&
+		event.metaKey === wantsMeta &&
+		event.altKey === modifiers.has('alt') &&
+		(ignoreShift || event.shiftKey === modifiers.has('shift'))
+	);
+};
+
+// three decimals: small pinch / trackpad steps must still change the zoom
+const roundZoom = (value: number) => Math.round(value * 1000) / 1000;
+
+/**
+ * Compares configuration values by content: arrays and plain objects recursively, everything else (functions,
+ * components, class instances) by identity. React elements (icons) are compared by type and props.
+ */
+const isEquivalent = (a: unknown, b: unknown, depth = 0): boolean => {
+	if (Object.is(a, b)) {
+		return true;
+	}
+	if (depth > 8 || typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
+		return false;
+	}
+	if (Array.isArray(a) || Array.isArray(b)) {
+		return (
+			Array.isArray(a) &&
+			Array.isArray(b) &&
+			a.length === b.length &&
+			a.every((item, index) => isEquivalent(item, b[index], depth + 1))
+		);
+	}
+	const prototypeA = Object.getPrototypeOf(a);
+	if (prototypeA !== Object.getPrototypeOf(b) || (prototypeA !== Object.prototype && prototypeA !== null)) {
+		return false;
+	}
+	// react elements carry internal bookkeeping (_owner, _store) which differs between renders
+	const keys = (value: object) => Object.keys(value).filter((key) => !key.startsWith('_'));
+	const keysA = keys(a);
+	const keysB = keys(b);
+	return (
+		keysA.length === keysB.length && keysA.every((key) => isEquivalent((a as any)[key], (b as any)[key], depth + 1))
+	);
+};
+
+export class ImageEditorController {
+	/** the fabric canvas, `null` until the editor canvas is mounted */
+	canvas: Canvas | null = null;
+
+	private options: ImageEditorOptions;
+	private registry: EditorRegistry;
+	private state: EditorState;
+	private subscribers = new Set<() => void>();
+	private eventListeners = new Map<keyof EditorEvents, Set<Listener<any>>>();
+	private optionListeners = new Map<string, Set<(options: ToolOptions) => void>>();
+
+	private tools = new Map<string, ToolDefinition<any>>();
+	private customToolIds: string[] = [];
+	private visibleToolIds: Set<string> | null = null;
+	private menus: MenuDefinition[] = [];
+	private shapes = new Map<string, ShapeDefinition>();
+	private registeredShapes: ShapeDefinition[] = [];
+	private filterDefinitions: FilterDefinition<any>[] = [];
+
+	private toolSession: ToolSession | null = null;
+	private pausedTool: string | null = null;
+	private historySuspended = 0;
+	private nudgeCommitTimer: ReturnType<typeof setTimeout> | undefined;
+	private loadToken = 0;
+	private sceneSize = { ...SCENE_REFERENCE_SIZE };
+	private viewSize = { width: 0, height: 0 };
+	private fitZoom = 1;
+	private panState = { dragging: false, x: 0, y: 0 };
+	private gestureZoom = MIN_ZOOM;
+	private detachGestures: (() => void) | null = null;
+
+	constructor(options: ImageEditorOptions = {}, registry: EditorRegistry = { tools: [], menus: [] }) {
+		this.options = options;
+		this.registry = registry;
+		this.configure();
+		this.state = {
+			ready: false,
+			loading: false,
+			activeMenu: this.menus[0]?.id ?? null,
+			activeTool: null,
+			zoom: MIN_ZOOM,
+			panning: false,
+			history: { entries: [], index: -1 },
+			restoring: false,
+			selection: [],
+			revision: 0,
+			toolOptions: this.createInitialToolOptions({}),
+		};
+	}
+
+	// ---------------------------------------------------------------- configuration
+
+	/** updates the options (callbacks, tools, menus...), called by the react provider on every render */
+	setOptions(options: ImageEditorOptions) {
+		const previous = this.options;
+		this.options = options;
+		// arrays / objects written inline are new on every render, only a different content reconfigures the editor
+		const changed = (key: 'tools' | 'menus' | 'shapes' | 'filters' | 'defaults') =>
+			previous[key] !== options[key] && !isEquivalent(previous[key], options[key]);
+		const defaultsChanged = changed('defaults');
+		if (changed('tools') || changed('menus') || changed('shapes') || changed('filters') || defaultsChanged) {
+			this.configure();
+			const activeTool = this.state.activeTool;
+			if (activeTool && !this.isToolVisible(activeTool)) {
+				this.setActiveTool(null);
+			}
+			const toolOptions = defaultsChanged
+				? this.applyChangedDefaults(previous.defaults, options.defaults)
+				: this.state.toolOptions;
+			this.setState({
+				toolOptions: this.createInitialToolOptions(toolOptions),
+				activeMenu: this.menus.some((menu) => menu.id === this.state.activeMenu)
+					? this.state.activeMenu
+					: (this.menus[0]?.id ?? null),
+			});
+		}
+	}
+
+	getOptions(): ImageEditorOptions {
+		return this.options;
+	}
+
+	private configure() {
+		this.tools = new Map(this.registry.tools.map((tool) => [tool.id, tool]));
+		this.customToolIds = [];
+		for (const tool of this.options.tools ?? []) {
+			if (typeof tool !== 'string') {
+				if (!this.registry.tools.some((builtIn) => builtIn.id === tool.id)) {
+					this.customToolIds.push(tool.id);
+				}
+				this.tools.set(tool.id, tool);
+			}
+		}
+		this.visibleToolIds = this.options.tools
+			? new Set(this.options.tools.map((tool) => (typeof tool === 'string' ? tool : tool.id)))
+			: null;
+
+		this.shapes = new Map(
+			[...builtInShapes, ...(this.options.shapes ?? []), ...this.registeredShapes].map((shape) => [
+				shape.type,
+				shape,
+			]),
+		);
+		const customFilters = this.options.filters ?? [];
+		this.filterDefinitions = [
+			...builtInFilters.map((filter) => customFilters.find((custom) => custom.id === filter.id) ?? filter),
+			...customFilters.filter((custom) => !builtInFilters.some((filter) => filter.id === custom.id)),
+		];
+		this.menus = this.resolveMenus();
+	}
+
+	private isToolVisible(id: string) {
+		return this.tools.has(id) && (!this.visibleToolIds || this.visibleToolIds.has(id));
+	}
+
+	private resolveMenus(): MenuDefinition[] {
+		const used = new Set<string>();
+		const resolved = (this.options.menus ?? this.registry.menus).map((menu) => {
+			const tools = menu.tools
+				.map((item): MenuItem | null => {
+					if (typeof item === 'string') {
+						return this.isToolVisible(item) ? item : null;
+					}
+					const groupTools = item.tools.filter((id) => this.isToolVisible(id));
+					return groupTools.length > 0 ? { ...item, tools: groupTools } : null;
+				})
+				.filter((item): item is MenuItem => item !== null);
+			tools.forEach((item) => (typeof item === 'string' ? [item] : item.tools).forEach((id) => used.add(id)));
+			return {
+				...menu,
+				tools,
+				defaultTool: menu.defaultTool && this.isToolVisible(menu.defaultTool) ? menu.defaultTool : undefined,
+			};
+		});
+
+		// custom tools which are not part of any menu are shown in the first one
+		const unplaced = this.customToolIds.filter((id) => this.isToolVisible(id) && !used.has(id));
+		if (unplaced.length > 0) {
+			if (resolved.length > 0) {
+				resolved[0] = { ...resolved[0], tools: [...resolved[0].tools, ...unplaced] };
+			} else {
+				resolved.push({ id: 'tools', label: 'Tools', tools: unplaced, defaultTool: undefined });
+			}
+		}
+
+		return resolved.filter((menu) => menu.tools.length > 0);
+	}
+
+	/** tool options with the values from `defaults` which changed, other options the user changed are kept */
+	private applyChangedDefaults(previous: ImageEditorOptions['defaults'], next: ImageEditorOptions['defaults']) {
+		const toolOptions: Record<string, ToolOptions> = { ...this.state.toolOptions };
+		Object.entries(next ?? {}).forEach(([id, values]) => {
+			const changedValues = Object.fromEntries(
+				Object.entries(values ?? {}).filter(([key, value]) => !isEquivalent(previous?.[id]?.[key], value)),
+			);
+			if (toolOptions[id] && Object.keys(changedValues).length > 0) {
+				toolOptions[id] = { ...toolOptions[id], ...changedValues };
+				this.optionListeners.get(id)?.forEach((listener) => listener(toolOptions[id]));
+			}
+		});
+		return toolOptions;
+	}
+
+	private createInitialToolOptions(current: Readonly<Record<string, ToolOptions>>) {
+		const toolOptions: Record<string, ToolOptions> = { ...current };
+		this.tools.forEach((tool, id) => {
+			if (!toolOptions[id]) {
+				toolOptions[id] = { ...(tool.defaultOptions ?? {}), ...(this.options.defaults?.[id] ?? {}) };
+			}
+		});
+		return toolOptions;
+	}
+
+	// ---------------------------------------------------------------- state & events
+
+	getState = (): EditorState => this.state;
+
+	/** subscribe to state changes (compatible with react's useSyncExternalStore) */
+	subscribe = (listener: () => void): (() => void) => {
+		this.subscribers.add(listener);
+		return () => {
+			this.subscribers.delete(listener);
+		};
+	};
+
+	private setState(partial: Partial<EditorState>) {
+		this.state = { ...this.state, ...partial };
+		this.subscribers.forEach((listener) => listener());
+	}
+
+	/** listen to editor events, returns a function which removes the listener */
+	on<K extends keyof EditorEvents>(event: K, listener: Listener<EditorEvents[K]>): () => void {
+		if (!this.eventListeners.has(event)) {
+			this.eventListeners.set(event, new Set());
+		}
+		this.eventListeners.get(event)!.add(listener);
+		return () => {
+			this.eventListeners.get(event)?.delete(listener);
+		};
+	}
+
+	private hasListeners(event: keyof EditorEvents) {
+		return (this.eventListeners.get(event)?.size ?? 0) > 0;
+	}
+
+	private emit<K extends keyof EditorEvents>(event: K, payload: EditorEvents[K]) {
+		try {
+			switch (event) {
+				case 'ready':
+					this.options.onReady?.(this);
+					break;
+				case 'change':
+					this.options.onChange?.((payload as EditorEvents['change']).json);
+					break;
+				case 'toolChange':
+					this.options.onToolChange?.((payload as EditorEvents['toolChange']).tool);
+					break;
+				case 'selectionChange':
+					this.options.onSelectionChange?.((payload as EditorEvents['selectionChange']).objects);
+					break;
+				case 'error':
+					this.options.onError?.((payload as EditorEvents['error']).error);
+					break;
+			}
+		} catch (error) {
+			console.error(error);
+		}
+		this.eventListeners.get(event)?.forEach((listener) => {
+			try {
+				listener(payload);
+			} catch (error) {
+				console.error(error);
+			}
+		});
+	}
+
+	private reportError(error: unknown) {
+		if (!this.options.onError && !this.hasListeners('error')) {
+			console.error(error);
+		}
+		this.emit('error', { error });
+	}
+
+	// ---------------------------------------------------------------- lifecycle
+
+	/** creates the fabric canvas on the given element and loads the image, returns a function that disposes it */
+	attach(element: HTMLCanvasElement): () => void {
+		FabricObject.customProperties = CUSTOM_OBJECT_PROPERTIES;
+		// pointer events (instead of touch events) let the gesture layer replay a held back touch to fabric
+		const canvas = new Canvas(element, { enablePointerEvents: true });
+		this.canvas = canvas;
+		this.detachGestures = attachGestures(canvas, {
+			enabled: () => this.options.gestures !== false && this.state.ready,
+			pinchStart: () => {
+				this.gestureZoom = this.state.zoom;
+			},
+			pinch: (scale, center, pan) => {
+				this.setZoom(this.gestureZoom * scale, center);
+				this.panBy(pan.x, pan.y);
+			},
+			// zoomed out below "fit" while pinching: center the image again
+			pinchEnd: () => this.state.zoom <= MIN_ZOOM && this.applyViewport(),
+			wheelZoom: (scale, center) => this.setZoom(this.state.zoom * scale, center),
+			wheelPan: (dx, dy) => {
+				if (this.state.zoom <= MIN_ZOOM) {
+					return false;
+				}
+				this.panBy(dx, dy);
+				return true;
+			},
+		});
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		lastInteractedEditor ??= this;
+
+		canvas.on('object:added', this.handleObjectAdded);
+		canvas.on('object:modified', this.handleObjectModified);
+		canvas.on('object:removed', this.handleObjectRemoved);
+		canvas.on('selection:created', this.handleSelectionChange);
+		canvas.on('selection:updated', this.handleSelectionChange);
+		canvas.on('selection:cleared', this.handleSelectionChange);
+		canvas.on('mouse:down', this.handleCanvasMouseDown);
+		window.addEventListener('keydown', this.handleKeyDown);
+		window.addEventListener('copy', this.handleCopyEvent);
+		window.addEventListener('cut', this.handleCutEvent);
+		window.addEventListener('paste', this.handlePasteEvent);
+
+		this.applyViewport();
+		void this.load();
+
+		return () => this.detach(canvas);
+	}
+
+	private detach(canvas: Canvas) {
+		if (this.canvas !== canvas) {
+			return;
+		}
+		this.loadToken++;
+		this.deactivateTool('dispose');
+		this.stopPanHandlers();
+		this.detachGestures?.();
+		this.detachGestures = null;
+		window.removeEventListener('keydown', this.handleKeyDown);
+		window.removeEventListener('copy', this.handleCopyEvent);
+		window.removeEventListener('cut', this.handleCutEvent);
+		window.removeEventListener('paste', this.handlePasteEvent);
+		clearTimeout(this.nudgeCommitTimer);
+		if (lastInteractedEditor === this) {
+			lastInteractedEditor = null;
+		}
+		canvas.off();
+		this.canvas = null;
+		void canvas.dispose();
+		this.setState({ ready: false, loading: false, activeTool: null, panning: false, selection: [] });
+	}
+
+	/** loads another image (and optionally a state), the history starts again */
+	async setSource(src: ImageEditorOptions['src'], initialState?: ImageEditorOptions['initialState']) {
+		this.options = { ...this.options, src, initialState: initialState ?? null };
+		await this.load();
+	}
+
+	private async load() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+
+		const token = ++this.loadToken;
+		this.deactivateTool('dispose');
+		this.stopPanHandlers();
+		this.pausedTool = null;
+		this.setState({ ready: false, loading: true, zoom: MIN_ZOOM, panning: false });
+
+		this.historySuspended++;
+		try {
+			canvas.discardActiveObject();
+			canvas.clear();
+			canvas.clipPath = undefined;
+			this.sceneSize = { ...SCENE_REFERENCE_SIZE };
+
+			const { src, initialState } = this.options;
+			if (src) {
+				try {
+					const url = typeof src === 'string' ? src : await blobToDataUrl(src);
+					const crossOrigin = this.options.crossOrigin === undefined ? 'anonymous' : this.options.crossOrigin;
+					const image = await FabricImage.fromURL(url, { crossOrigin });
+					if (token !== this.loadToken) {
+						return;
+					}
+					const scale = Math.min(
+						SCENE_REFERENCE_SIZE.width / image.width,
+						SCENE_REFERENCE_SIZE.height / image.height,
+					);
+					image.scaleX = scale;
+					image.scaleY = scale;
+					canvas.backgroundImage = image;
+					this.normalizeBackground(image);
+				} catch (error) {
+					if (token !== this.loadToken) {
+						return;
+					}
+					this.reportError(error);
+					// nothing to edit: the editor stays not ready (and `ready` is not emitted) until another image loads
+					this.setState({ loading: false });
+					return;
+				}
+			}
+
+			if (initialState) {
+				const json = typeof initialState === 'string' ? JSON.parse(initialState) : initialState;
+				// deep copy so that the consumer's object is never mutated
+				if (
+					Object.keys(json).length > 0 &&
+					!(await this.restoreState(JSON.parse(JSON.stringify(json)), token))
+				) {
+					return;
+				}
+			}
+		} catch (error) {
+			this.reportError(error);
+		} finally {
+			this.historySuspended--;
+		}
+
+		if (token !== this.loadToken || this.canvas !== canvas) {
+			return;
+		}
+
+		this.applyViewport();
+		const history: HistoryState = { entries: [this.serialize()], index: 0 };
+		const activeMenu = this.menus.some((menu) => menu.id === this.state.activeMenu)
+			? this.state.activeMenu
+			: (this.menus[0]?.id ?? null);
+		this.setState({ ready: true, loading: false, history, activeMenu, selection: [] });
+		this.emit('historyChange', { history });
+
+		const defaultTool = this.getMenu(activeMenu)?.defaultTool;
+		if (defaultTool) {
+			this.setActiveTool(defaultTool);
+		}
+		this.emit('ready', { editor: this });
+	}
+
+	// ---------------------------------------------------------------- serialization & history
+
+	/** the canvas as JSON (can be passed to `initialState` / `loadState` later) */
+	toJSON(): Record<string, any> {
+		const json: any = this.canvas?.toJSON() ?? {};
+		if (json.objects) {
+			json.objects = json.objects.filter((obj: any) => !this.isTransientType(obj.shapeType));
+		}
+		return json;
+	}
+
+	// the background image source (often a large data url) is the same for every state,
+	// so it is not stored again in each history entry
+	private serialize(): string {
+		const json = this.toJSON();
+		if (json.backgroundImage) {
+			json.backgroundImage = { ...json.backgroundImage, src: undefined };
+		}
+		return JSON.stringify(json);
+	}
+
+	/** records the current canvas as a new history entry (identical states are ignored) */
+	commit = (): void => {
+		if (!this.canvas || this.historySuspended > 0 || !this.state.ready) {
+			return;
+		}
+
+		const entry = this.serialize();
+		const { entries, index } = this.state.history;
+		if (entries[index] === entry) {
+			return;
+		}
+
+		let nextEntries = [...entries.slice(0, index + 1), entry];
+		const limit = Math.max(1, this.options.historyLimit ?? DEFAULT_HISTORY_LIMIT);
+		if (nextEntries.length > limit + 1) {
+			nextEntries = nextEntries.slice(nextEntries.length - (limit + 1));
+		}
+
+		const history: HistoryState = { entries: nextEntries, index: nextEntries.length - 1 };
+		this.setState({ history });
+		this.emit('historyChange', { history });
+		this.emitChange();
+	};
+
+	private emitChange() {
+		if (this.options.onChange || this.hasListeners('change')) {
+			this.emit('change', { json: this.toJSON() });
+		}
+	}
+
+	/** runs `callback` without recording history entries for the changes it makes */
+	withoutHistory<T>(callback: () => T): T {
+		this.historySuspended++;
+		try {
+			return callback();
+		} finally {
+			this.historySuspended--;
+		}
+	}
+
+	canUndo() {
+		return !this.state.restoring && this.state.history.index > 0;
+	}
+
+	canRedo() {
+		return !this.state.restoring && this.state.history.index < this.state.history.entries.length - 1;
+	}
+
+	undo() {
+		return this.goToHistory(this.state.history.index - 1);
+	}
+
+	redo() {
+		return this.goToHistory(this.state.history.index + 1);
+	}
+
+	/** restores the history entry with the given index */
+	async goToHistory(index: number) {
+		const { entries } = this.state.history;
+		if (!this.canvas || this.state.restoring || index < 0 || index >= entries.length) {
+			return;
+		}
+		if (index === this.state.history.index) {
+			return;
+		}
+
+		this.setState({ restoring: true });
+		const tool = this.suspendTool('restore');
+		try {
+			if (await this.restoreState(JSON.parse(entries[index]))) {
+				const history: HistoryState = { entries, index };
+				this.setState({ history });
+				this.emit('historyChange', { history });
+				this.emitChange();
+			}
+		} catch (error) {
+			this.reportError(error);
+		} finally {
+			this.setState({ restoring: false });
+			this.resumeTool(tool);
+		}
+	}
+
+	/** replaces the canvas content with the given JSON and starts a new history */
+	async loadState(json: Record<string, any> | string) {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const data = typeof json === 'string' ? JSON.parse(json) : JSON.parse(JSON.stringify(json));
+		await this.withToolSuspended('restore', async () => {
+			if (await this.restoreState(data)) {
+				const history: HistoryState = { entries: [this.serialize()], index: 0 };
+				this.setState({ history });
+				this.emit('historyChange', { history });
+				this.emitChange();
+			}
+		});
+	}
+
+	private async restoreState(json: any, token = this.loadToken): Promise<boolean> {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return false;
+		}
+		const isStale = () => this.canvas !== canvas || token !== this.loadToken;
+
+		this.historySuspended++;
+		try {
+			const existingBackgroundImage = canvas.backgroundImage;
+			canvas.clear();
+
+			const backgroundData = json.backgroundImage;
+			if (existingBackgroundImage) {
+				canvas.backgroundImage = existingBackgroundImage;
+				if (backgroundData) {
+					this.applyBackgroundState(existingBackgroundImage as FabricImage, backgroundData);
+				}
+			} else if (backgroundData?.src) {
+				const image = await FabricImage.fromURL(backgroundData.src, {
+					crossOrigin: this.options.crossOrigin === undefined ? 'anonymous' : this.options.crossOrigin,
+				});
+				if (isStale()) {
+					return false;
+				}
+				image.set({
+					width: backgroundData.width,
+					height: backgroundData.height,
+					scaleX: backgroundData.scaleX,
+					scaleY: backgroundData.scaleY,
+				});
+				canvas.backgroundImage = image;
+				this.applyBackgroundState(image, backgroundData);
+			}
+
+			canvas.clipPath = json.clipPath
+				? new Rect({
+						left: json.clipPath.left,
+						top: json.clipPath.top,
+						width: json.clipPath.width * json.clipPath.scaleX,
+						height: json.clipPath.height * json.clipPath.scaleY,
+						absolutePositioned: true,
+					})
+				: undefined;
+
+			// one by one so that asynchronously loaded objects (images) keep their stacking order
+			for (const data of json.objects ?? []) {
+				await this.restoreObject(data, canvas);
+				if (isStale()) {
+					return false;
+				}
+			}
+
+			this.applyViewport();
+			return true;
+		} finally {
+			this.historySuspended--;
+		}
+	}
+
+	private async restoreObject(data: any, canvas: Canvas) {
+		const shape = this.shapes.get(data.shapeType);
+		if (shape?.restore) {
+			await shape.restore(data, { editor: this, canvas });
+			return;
+		}
+		// objects of custom tools without a restore function: fabric's own deserialization
+		const [object] = await util.enlivenObjects<FabricObject>([data]);
+		if (object) {
+			canvas.add(object);
+		}
+	}
+
+	// ---------------------------------------------------------------- canvas events
+
+	private handleObjectAdded = (event: { target: FabricObject }) => {
+		if (this.historySuspended > 0) {
+			return;
+		}
+		const shape = this.getShape((event.target as any)?.shapeType);
+		if (shape && (shape.helper || shape.transient || shape.recordOnAdd === false)) {
+			return;
+		}
+		this.commit();
+	};
+
+	private handleObjectModified = (event: { target: FabricObject }) => {
+		if (this.historySuspended > 0) {
+			return;
+		}
+		const shape = this.getShape((event.target as any)?.shapeType);
+		if (shape && (shape.transient || (shape.helper && !shape.recordModifications))) {
+			return;
+		}
+		this.commit();
+	};
+
+	private handleObjectRemoved = (event: { target: FabricObject }) => {
+		if (this.historySuspended > 0) {
+			return;
+		}
+		const shape = this.getShape((event.target as any)?.shapeType);
+		if (shape && (shape.helper || shape.transient)) {
+			return;
+		}
+		// removing an object which was never recorded (e.g. an empty drawing) results in an identical state
+		this.commit();
+	};
+
+	private handleSelectionChange = () => {
+		const objects = this.canvas?.getActiveObjects() ?? [];
+		this.setState({ selection: objects });
+		this.emit('selectionChange', { objects });
+	};
+
+	private handleCanvasMouseDown = () => {
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		lastInteractedEditor = this;
+	};
+
+	/** the key combinations of a shortcut, `null` when it is disabled */
+	getShortcut(action: EditorShortcut): string[] | null {
+		const config = this.options.keyboardShortcuts;
+		if (config === false) {
+			return null;
+		}
+		if (config && typeof config === 'object' && action in config) {
+			return config[action] ?? null;
+		}
+		return defaultShortcuts[action];
+	}
+
+	// keyboard and clipboard events are only handled for the editor the user worked with last, and never while typing
+	private acceptsShortcuts(event: Event) {
+		if (lastInteractedEditor !== this || !this.canvas || !this.state.ready || isTypingTarget(event.target)) {
+			return false;
+		}
+		const activeObject = this.canvas.getActiveObject() as any;
+		// fabric's text editing handles its own keys
+		return !(
+			activeObject?.isEditing ||
+			activeObject?._objects?.[1]?._objects?.[1]?.isEditing ||
+			activeObject?.shapeType === ShapeType.COMMENT_BOX_TEXTBOX
+		);
+	}
+
+	private handleKeyDown = (event: KeyboardEvent) => {
+		if (!this.acceptsShortcuts(event)) {
+			return;
+		}
+
+		const matches = (action: EditorShortcut, ignoreShift = false) =>
+			(this.getShortcut(action) ?? []).some((combination) => matchesShortcut(event, combination, ignoreShift));
+		const hasSelection = !!this.canvas?.getActiveObject();
+		const nudgeStep = event.shiftKey ? 10 : 1;
+
+		const handlers: [boolean, () => void][] = [
+			[matches('undo'), () => void this.undo()],
+			[matches('redo'), () => void this.redo()],
+			[hasSelection && matches('delete'), () => this.deleteSelection()],
+			[hasSelection && matches('duplicate'), () => void this.duplicateSelection()],
+			[matches('selectAll'), () => this.selectAll()],
+			[hasSelection && matches('deselect'), () => this.deselect()],
+			[hasSelection && matches('nudgeLeft', true), () => this.nudgeSelection(-nudgeStep, 0)],
+			[hasSelection && matches('nudgeRight', true), () => this.nudgeSelection(nudgeStep, 0)],
+			[hasSelection && matches('nudgeUp', true), () => this.nudgeSelection(0, -nudgeStep)],
+			[hasSelection && matches('nudgeDown', true), () => this.nudgeSelection(0, nudgeStep)],
+			[hasSelection && matches('bringForward'), () => this.arrangeSelection('forward')],
+			[hasSelection && matches('sendBackward'), () => this.arrangeSelection('backward')],
+			[hasSelection && matches('bringToFront'), () => this.arrangeSelection('front')],
+			[hasSelection && matches('sendToBack'), () => this.arrangeSelection('back')],
+		];
+		const handler = handlers.find(([matched]) => matched);
+		if (handler) {
+			// e.g. the browser's own select all / bookmark (mod+d) / scrolling with the arrow keys
+			event.preventDefault();
+			handler[1]();
+		}
+	};
+
+	private handleCopyEvent = (event: ClipboardEvent) => {
+		if (!this.getShortcut('copy') || !this.acceptsShortcuts(event) || !this.copySelection()) {
+			return;
+		}
+		event.clipboardData?.setData('text/plain', CLIPBOARD_MARKER);
+		event.preventDefault();
+	};
+
+	private handleCutEvent = (event: ClipboardEvent) => {
+		if (!this.getShortcut('cut') || !this.acceptsShortcuts(event) || !this.cutSelection()) {
+			return;
+		}
+		event.clipboardData?.setData('text/plain', CLIPBOARD_MARKER);
+		event.preventDefault();
+	};
+
+	private handlePasteEvent = (event: ClipboardEvent) => {
+		if (!this.getShortcut('paste') || !this.acceptsShortcuts(event)) {
+			return;
+		}
+		const data = event.clipboardData;
+		// an image copied in another application (e.g. a screenshot) is added on top of the photo
+		const imageFile = [...(data?.items ?? [])]
+			.find((item) => item.kind === 'file' && item.type.startsWith('image/'))
+			?.getAsFile();
+		if (imageFile && data?.getData('text/plain') !== CLIPBOARD_MARKER) {
+			event.preventDefault();
+			void this.addImage(imageFile);
+			return;
+		}
+		if (clipboard && (!data || data.getData('text/plain') === CLIPBOARD_MARKER || !data.types.length)) {
+			event.preventDefault();
+			void this.paste();
+		}
+	};
+
+	// ---------------------------------------------------------------- tools & menus
+
+	getTool(id: string): ToolDefinition<any> | undefined {
+		return this.tools.get(id);
+	}
+
+	/** all registered tools (including hidden ones) */
+	getTools(): ToolDefinition<any>[] {
+		return [...this.tools.values()];
+	}
+
+	/** the tool whose objects have the given shapeType */
+	getToolForShape(shapeType: string | undefined): ToolDefinition<any> | undefined {
+		if (!shapeType) {
+			return undefined;
+		}
+		return this.getTools().find((tool) => tool.shapeTypes?.includes(shapeType));
+	}
+
+	/** visible menus with their visible tools */
+	getMenus(): MenuDefinition[] {
+		return this.menus;
+	}
+
+	getMenu(id: string | null | undefined): MenuDefinition | undefined {
+		return this.menus.find((menu) => menu.id === id);
+	}
+
+	getShape(type: string | undefined): ShapeDefinition | undefined {
+		return type ? this.shapes.get(type) : undefined;
+	}
+
+	/** registers (or replaces) a shape definition */
+	registerShape(shape: ShapeDefinition) {
+		this.registeredShapes = [...this.registeredShapes.filter((item) => item.type !== shape.type), shape];
+		this.shapes.set(shape.type, shape);
+	}
+
+	setMenu(id: string) {
+		if (!this.canvas || !this.state.ready || id === this.state.activeMenu) {
+			return;
+		}
+		const menu = this.getMenu(id);
+		if (!menu) {
+			return;
+		}
+		this.setPanning(false, false);
+		this.deactivateTool('switch');
+		this.setState({ activeMenu: id });
+		this.emit('menuChange', { menu: id });
+		if (menu.defaultTool) {
+			this.setActiveTool(menu.defaultTool);
+		}
+	}
+
+	/** activates a toggle tool (or runs an action tool), `null` deactivates the current tool */
+	setActiveTool(id: string | null) {
+		if (!this.canvas || !this.state.ready) {
+			return;
+		}
+		if (this.state.panning) {
+			this.setPanning(false, false);
+		}
+		if (id === this.state.activeTool) {
+			return;
+		}
+
+		const tool = id ? this.tools.get(id) : undefined;
+		if (id && !tool) {
+			console.warn(`fabri-pix: unknown tool "${id}"`);
+			return;
+		}
+
+		const previous = this.deactivateTool('switch', true);
+		if (tool?.type === 'action') {
+			this.runTool(tool);
+		} else if (tool) {
+			this.activateTool(tool);
+		}
+		if (previous !== this.state.activeTool) {
+			this.emit('toolChange', { tool: this.state.activeTool });
+		}
+	}
+
+	/** activates the tool, or deactivates it when it is already active */
+	toggleTool(id: string) {
+		this.setActiveTool(this.state.activeTool === id ? null : id);
+	}
+
+	private activateTool(tool: ToolDefinition<any>) {
+		const { context, dispose } = this.createToolContext(tool);
+		let cleanup: void | ((reason: ToolDeactivateReason) => void);
+		try {
+			cleanup = tool.activate?.(context);
+		} catch (error) {
+			dispose(true);
+			this.reportError(error);
+			return;
+		}
+
+		this.toolSession = {
+			id: tool.id,
+			cleanup: (reason) => {
+				try {
+					if (typeof cleanup === 'function') {
+						cleanup(reason);
+					}
+				} catch (error) {
+					this.reportError(error);
+				} finally {
+					dispose(true);
+				}
+			},
+		};
+		this.setState({ activeTool: tool.id });
+	}
+
+	private runTool(tool: ToolDefinition<any>) {
+		const { context, dispose } = this.createToolContext(tool);
+		try {
+			const result = tool.run?.(context);
+			if (result instanceof Promise) {
+				result.catch((error) => this.reportError(error)).finally(() => dispose(false));
+			} else {
+				dispose(false);
+			}
+		} catch (error) {
+			dispose(false);
+			this.reportError(error);
+		}
+	}
+
+	/** returns the id of the tool that was active */
+	private deactivateTool(reason: ToolDeactivateReason, silent = false): string | null {
+		const session = this.toolSession;
+		if (!session) {
+			return null;
+		}
+		this.toolSession = null;
+		session.cleanup(reason);
+		this.setState({ activeTool: null });
+		if (!silent) {
+			this.emit('toolChange', { tool: null });
+		}
+		return session.id;
+	}
+
+	// temporary deactivation (undo, reset, export...): no toolChange events, the same tool is resumed afterwards
+	private suspendTool(reason: ToolDeactivateReason): string | null {
+		return this.deactivateTool(reason, true);
+	}
+
+	private resumeTool(id: string | null) {
+		const tool = id ? this.tools.get(id) : undefined;
+		if (tool && this.canvas && !this.toolSession && !this.state.panning) {
+			this.activateTool(tool);
+		}
+	}
+
+	private async withToolSuspended<T>(reason: ToolDeactivateReason, callback: () => Promise<T> | T): Promise<T> {
+		const tool = this.suspendTool(reason);
+		try {
+			return await callback();
+		} finally {
+			this.resumeTool(tool);
+		}
+	}
+
+	private createToolContext<O extends ToolOptions>(tool: ToolDefinition<O>) {
+		const canvas = this.canvas!;
+		const canvasListeners: [string, (event: any) => void][] = [];
+		const domListeners: [EventTarget, string, (event: any) => void][] = [];
+		const unsubscribers: (() => void)[] = [];
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const editor = this;
+
+		const context: ToolContext<O> = {
+			editor,
+			canvas,
+			tool,
+			get options() {
+				return editor.getToolOptions<O>(tool.id);
+			},
+			setOptions: (options) => this.setToolOptions(tool.id, options),
+			on: (eventName, handler) => {
+				(canvas as any).on(eventName, handler);
+				canvasListeners.push([eventName, handler]);
+			},
+			listen: (target, type, handler) => {
+				target.addEventListener(type, handler);
+				domListeners.push([target, type, handler]);
+			},
+			onOptionsChange: (handler) => {
+				unsubscribers.push(this.onToolOptionsChange(tool.id, handler as (options: ToolOptions) => void));
+			},
+			setCursor: (cursor) => {
+				canvas.defaultCursor = cursor;
+				canvas.setCursor(cursor);
+			},
+			setSelectionEnabled: (enabled) => {
+				canvas.selection = enabled;
+			},
+			setInteractive: (interactive) => {
+				canvas.skipTargetFind = !interactive;
+				if (!interactive) {
+					canvas.discardActiveObject();
+					canvas.requestRenderAll();
+				}
+			},
+		};
+
+		const dispose = (resetCanvas: boolean) => {
+			canvasListeners.forEach(([eventName, handler]) => (canvas as any).off(eventName, handler));
+			domListeners.forEach(([target, type, handler]) => target.removeEventListener(type, handler));
+			unsubscribers.forEach((unsubscribe) => unsubscribe());
+			if (resetCanvas) {
+				canvas.isDrawingMode = false;
+				canvas.selection = true;
+				canvas.skipTargetFind = false;
+				canvas.defaultCursor = 'default';
+				canvas.setCursor('default');
+			}
+		};
+
+		return { context, dispose };
+	}
+
+	getToolOptions<O extends ToolOptions = ToolOptions>(id: string): O {
+		return (this.state.toolOptions[id] ?? {}) as O;
+	}
+
+	setToolOptions<O extends ToolOptions = ToolOptions>(id: string, options: Partial<O>) {
+		const next = { ...this.getToolOptions(id), ...options };
+		this.setState({ toolOptions: { ...this.state.toolOptions, [id]: next } });
+		this.optionListeners.get(id)?.forEach((listener) => listener(next));
+	}
+
+	private onToolOptionsChange(id: string, listener: (options: ToolOptions) => void) {
+		if (!this.optionListeners.has(id)) {
+			this.optionListeners.set(id, new Set());
+		}
+		this.optionListeners.get(id)!.add(listener);
+		return () => {
+			this.optionListeners.get(id)?.delete(listener);
+		};
+	}
+
+	// ---------------------------------------------------------------- objects
+
+	/** the size of the image in canvas (object) coordinates */
+	getSceneSize() {
+		return { ...this.sceneSize };
+	}
+
+	getSceneCenter() {
+		return { x: this.sceneSize.width / 2, y: this.sceneSize.height / 2 };
+	}
+
+	/** adds an object using its shape definition, e.g. `addShape('rectangle', { left, top, width, height, ... })` */
+	async addShape(type: string, data: Record<string, any>) {
+		const canvas = this.canvas;
+		const shape = this.getShape(type);
+		if (!canvas || !shape?.create) {
+			console.warn(`fabri-pix: shape "${type}" can't be created`);
+			return;
+		}
+		// one history entry per shape: creating some shapes adds, selects and adjusts several objects
+		this.historySuspended++;
+		try {
+			await shape.create({ id: generateId(), ...data }, { editor: this, canvas });
+		} finally {
+			this.historySuspended--;
+		}
+		this.commit();
+	}
+
+	/** adds an image (URL, data URL or Blob) on top of the photo, scaled to fit into half of it */
+	async addImage(src: string | Blob) {
+		const url = typeof src === 'string' ? src : await blobToDataUrl(src);
+		await this.addShape(ShapeType.CUSTOM_SHAPE, {
+			src: url,
+			angle: 0,
+			fill: 'transparent',
+			scaleX: 1,
+			scaleY: 1,
+		});
+	}
+
+	/** sets properties of an object, re-renders and optionally records a history entry */
+	updateObject(object: FabricObject, properties: Record<string, any>, { commit = false } = {}) {
+		object.set(properties);
+		object.setCoords();
+		this.notifyObjectChanged({ commit });
+	}
+
+	/** call after changing objects directly: re-renders the canvas and the option panels */
+	notifyObjectChanged({ commit = false } = {}) {
+		this.canvas?.requestRenderAll();
+		this.setState({ revision: this.state.revision + 1 });
+		if (commit) {
+			this.commit();
+		}
+	}
+
+	/** removes the object together with its helper objects (arrow head, blur...) */
+	deleteObject(object: FabricObject) {
+		const canvas = this.canvas;
+		if (!canvas || !object) {
+			return;
+		}
+		const related = this.getShape((object as any).shapeType)?.getRelatedObjects?.(object, canvas) ?? [];
+		canvas.remove(...related.filter((obj) => obj !== object), object);
+		canvas.requestRenderAll();
+	}
+
+	/** removes the selected objects as a single history entry, returns the removed objects */
+	deleteSelection(): FabricObject[] {
+		const canvas = this.canvas;
+		const activeObject = canvas?.getActiveObject();
+		if (!canvas || !activeObject) {
+			return [];
+		}
+
+		const targets = activeObject instanceof ActiveSelection ? activeObject.getObjects() : [activeObject];
+		canvas.discardActiveObject();
+		this.withoutHistory(() => targets.forEach((object) => this.deleteObject(object)));
+		this.commit();
+		return targets;
+	}
+
+	/** removes every annotation, the crop, rotation, flip and filters (one history entry) */
+	reset() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const tool = this.suspendTool('restore');
+		this.withoutHistory(() => {
+			canvas.discardActiveObject();
+			canvas.remove(...canvas.getObjects());
+			canvas.clipPath = undefined;
+			const image = canvas.backgroundImage as FabricImage | undefined;
+			if (image) {
+				image.set({ angle: 0, flipX: false, flipY: false });
+				(image as any).fpResize = undefined;
+				this.applyFilterState(image, {});
+				this.normalizeBackground(image);
+			}
+		});
+		this.applyViewport();
+		this.notifyObjectChanged({ commit: true });
+		this.resumeTool(tool);
+	}
+
+	/** removes every annotation, keeps the crop and the image adjustments (one history entry) */
+	clearAnnotations() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const tool = this.suspendTool('restore');
+		this.withoutHistory(() => {
+			canvas.discardActiveObject();
+			canvas.remove(...canvas.getObjects());
+		});
+		canvas.requestRenderAll();
+		this.commit();
+		this.resumeTool(tool);
+	}
+
+	private isTransientType(type: string | undefined) {
+		return !!this.getShape(type)?.transient;
+	}
+
+	// ---------------------------------------------------------------- selection, clipboard & layers
+
+	/** selected objects without the editing UI (crop rectangle) */
+	private getSelectedObjects(): FabricObject[] {
+		return (this.canvas?.getActiveObjects() ?? []).filter(
+			(object) => !this.getShape((object as any).shapeType)?.transient,
+		);
+	}
+
+	private select(objects: FabricObject[]) {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		canvas.discardActiveObject();
+		if (objects.length === 1) {
+			canvas.setActiveObject(objects[0]);
+		} else if (objects.length > 1) {
+			canvas.setActiveObject(new ActiveSelection(objects, { canvas }));
+		}
+		canvas.requestRenderAll();
+	}
+
+	/** selects every annotation */
+	selectAll() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		this.select(
+			canvas.getObjects().filter((object) => {
+				const shape = this.getShape((object as any).shapeType);
+				return object.selectable && object.evented !== false && !shape?.helper && !shape?.transient;
+			}),
+		);
+	}
+
+	deselect() {
+		this.canvas?.discardActiveObject();
+		this.canvas?.requestRenderAll();
+	}
+
+	/** moves the selection by the given distance (image coordinates), one history entry per burst of moves */
+	nudgeSelection(dx: number, dy: number) {
+		const canvas = this.canvas;
+		const activeObject = canvas?.getActiveObject();
+		if (!canvas || !activeObject) {
+			return;
+		}
+		activeObject.set({ left: activeObject.left + dx, top: activeObject.top + dy });
+		activeObject.setCoords();
+		const objects = activeObject instanceof ActiveSelection ? activeObject.getObjects() : [activeObject];
+		// keeps helper objects (arrow heads) in place
+		objects.forEach((object) => object.fire('moving', {} as any));
+		canvas.requestRenderAll();
+
+		clearTimeout(this.nudgeCommitTimer);
+		this.nudgeCommitTimer = setTimeout(() => {
+			// e.g. blur areas re-render their blurred copy when they were modified
+			objects.forEach((object) => object.fire('modified', {} as any));
+			this.commit();
+		}, 400);
+	}
+
+	// serialized with absolute coordinates (objects in a multi selection are relative to it)
+	private serializeObjects(objects: FabricObject[]): Record<string, any>[] {
+		const canvas = this.canvas;
+		const activeObject = canvas?.getActiveObject();
+		const inSelection = activeObject instanceof ActiveSelection;
+		if (inSelection) {
+			canvas?.discardActiveObject();
+		}
+		const data = objects.map((object) => object.toObject());
+		if (inSelection) {
+			this.select(objects);
+		}
+		return data;
+	}
+
+	/** copies the selected objects into the editor clipboard, returns false when nothing is selected */
+	copySelection(): boolean {
+		const objects = this.getSelectedObjects();
+		if (objects.length === 0) {
+			return false;
+		}
+		clipboard = { objects: this.serializeObjects(objects), pasteCount: 0 };
+		return true;
+	}
+
+	cutSelection(): boolean {
+		if (!this.copySelection()) {
+			return false;
+		}
+		// pasting a cut selection puts it back at the same place
+		clipboard!.pasteCount = -1;
+		this.deleteSelection();
+		return true;
+	}
+
+	hasClipboard() {
+		return !!clipboard;
+	}
+
+	/** pastes the copied objects (slightly moved for every paste) and selects them */
+	async paste() {
+		if (!clipboard) {
+			return;
+		}
+		clipboard.pasteCount++;
+		await this.addCopies(clipboard.objects, PASTE_OFFSET * clipboard.pasteCount);
+	}
+
+	/** copies the selected objects in place (slightly moved) without touching the clipboard */
+	async duplicateSelection() {
+		const objects = this.getSelectedObjects();
+		if (objects.length > 0) {
+			await this.addCopies(this.serializeObjects(objects), PASTE_OFFSET);
+		}
+	}
+
+	private async addCopies(objects: Record<string, any>[], offset: number) {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const ids: string[] = [];
+		this.historySuspended++;
+		try {
+			for (const data of objects) {
+				const id = generateId();
+				ids.push(id);
+				await this.restoreObject(
+					{ ...JSON.parse(JSON.stringify(data)), id, left: data.left + offset, top: data.top + offset },
+					canvas,
+				);
+			}
+		} finally {
+			this.historySuspended--;
+		}
+		if (this.canvas !== canvas) {
+			return;
+		}
+		this.select(canvas.getObjects().filter((object) => ids.includes((object as any).id)));
+		this.commit();
+	}
+
+	/** objects grouped with their helpers (arrow heads, callout text, blur copies), in stacking order */
+	private getLayerUnits(): FabricObject[][] {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return [];
+		}
+		const objects = canvas.getObjects();
+		const owner = new Map<FabricObject, FabricObject>();
+		objects.forEach((object) => {
+			this.getShape((object as any).shapeType)
+				?.getRelatedObjects?.(object, canvas)
+				.forEach((related) => {
+					if (this.getShape((related as any).shapeType)?.helper) {
+						owner.set(related, object);
+					}
+				});
+		});
+		return objects
+			.filter((object) => !owner.has(object))
+			.map((object) => [object, ...objects.filter((candidate) => owner.get(candidate) === object)]);
+	}
+
+	/** changes the stacking order of the selected objects */
+	arrangeSelection(direction: LayerDirection) {
+		const canvas = this.canvas;
+		const selected = new Set(this.getSelectedObjects());
+		if (!canvas || selected.size === 0) {
+			return;
+		}
+
+		const units = this.getLayerUnits();
+		const isSelected = (unit: FabricObject[]) => selected.has(unit[0]);
+		let ordered = [...units];
+		if (direction === 'front') {
+			ordered = [...units.filter((unit) => !isSelected(unit)), ...units.filter(isSelected)];
+		} else if (direction === 'back') {
+			ordered = [...units.filter(isSelected), ...units.filter((unit) => !isSelected(unit))];
+		} else if (direction === 'forward') {
+			for (let index = ordered.length - 2; index >= 0; index--) {
+				if (isSelected(ordered[index]) && !isSelected(ordered[index + 1])) {
+					[ordered[index], ordered[index + 1]] = [ordered[index + 1], ordered[index]];
+				}
+			}
+		} else {
+			for (let index = 1; index < ordered.length; index++) {
+				if (isSelected(ordered[index]) && !isSelected(ordered[index - 1])) {
+					[ordered[index], ordered[index - 1]] = [ordered[index - 1], ordered[index]];
+				}
+			}
+		}
+
+		ordered.flat().forEach((object, index) => canvas.moveObjectTo(object, index));
+		canvas.requestRenderAll();
+		this.notifyObjectChanged({ commit: true });
+	}
+
+	/** whether the selected objects can be moved in the given direction */
+	canArrangeSelection(direction: LayerDirection): boolean {
+		const selected = new Set(this.getSelectedObjects());
+		const units = this.getLayerUnits();
+		const indexes = units.map((unit, index) => (selected.has(unit[0]) ? index : -1)).filter((index) => index >= 0);
+		if (indexes.length === 0) {
+			return false;
+		}
+		const towardsFront = direction === 'forward' || direction === 'front';
+		// already at the top / bottom as one block
+		return towardsFront
+			? indexes.some((index, position) => index !== units.length - indexes.length + position)
+			: indexes.some((index, position) => index !== position);
+	}
+
+	// ---------------------------------------------------------------- object styles
+
+	/** current style of an object */
+	getObjectStyle(object: FabricObject): Required<ObjectStyle> {
+		const shadow = object.shadow as Shadow | null | undefined;
+		return {
+			opacity: object.opacity ?? 1,
+			shadow: shadow
+				? { color: String(shadow.color), blur: shadow.blur, offsetX: shadow.offsetX, offsetY: shadow.offsetY }
+				: null,
+			dashed: !!object.strokeDashArray?.length,
+			cornerRadius: (object as any).rx ?? 0,
+		};
+	}
+
+	/** whether the object supports a style (dashes need a stroke, the corner radius a rectangle) */
+	supportsObjectStyle(object: FabricObject, style: keyof ObjectStyle): boolean {
+		const type = (object as any).shapeType;
+		// a see-through or shadowed blur area would no longer hide what it covers
+		if (type === ShapeType.BLUR || this.getShape(type)?.transient) {
+			return false;
+		}
+		if (style === 'dashed') {
+			return (
+				!!object.stroke &&
+				object.stroke !== 'transparent' &&
+				object.strokeWidth > 0 &&
+				!(object as any)._objects
+			);
+		}
+		if (style === 'cornerRadius') {
+			return type === ShapeType.RECTANGLE;
+		}
+		return true;
+	}
+
+	/** sets opacity, shadow, dashes or corner radius of objects (and their helpers, e.g. the arrow head) */
+	setObjectStyle(objects: FabricObject | FabricObject[], style: ObjectStyle, { commit = true } = {}) {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		for (const object of Array.isArray(objects) ? objects : [objects]) {
+			const props: Record<string, any> = {};
+			if (style.opacity !== undefined && this.supportsObjectStyle(object, 'opacity')) {
+				props.opacity = style.opacity;
+			}
+			if (style.shadow !== undefined && this.supportsObjectStyle(object, 'shadow')) {
+				props.shadow = style.shadow ? new Shadow(style.shadow) : null;
+			}
+			if (style.dashed !== undefined && this.supportsObjectStyle(object, 'dashed')) {
+				props.strokeDashArray = style.dashed ? [object.strokeWidth * 3, object.strokeWidth * 2] : null;
+			}
+			if (style.cornerRadius !== undefined && this.supportsObjectStyle(object, 'cornerRadius')) {
+				props.rx = style.cornerRadius;
+				props.ry = style.cornerRadius;
+			}
+			object.set(props);
+			// helpers are drawn separately and follow the look of their object
+			const related = this.getShape((object as any).shapeType)?.getRelatedObjects?.(object, canvas) ?? [];
+			related.forEach((helper) => {
+				if ('opacity' in props) {
+					helper.set({ opacity: props.opacity });
+				}
+				if ('shadow' in props && (helper as any).shapeType === ShapeType.ADVANCED_ARROW_HEAD) {
+					helper.set({ shadow: style.shadow ? new Shadow(style.shadow) : null });
+				}
+			});
+		}
+		this.notifyObjectChanged({ commit });
+	}
+
+	// ---------------------------------------------------------------- image adjustments
+
+	private getBackground(): FabricImage | undefined {
+		return this.canvas?.backgroundImage as FabricImage | undefined;
+	}
+
+	/** the photo is positioned by its center, the scene is the bounding box of the (rotated) photo */
+	private normalizeBackground(image: FabricImage) {
+		const width = image.width * image.scaleX;
+		const height = image.height * image.scaleY;
+		const radians = util.degreesToRadians(image.angle ?? 0);
+		const sceneWidth = Math.abs(width * Math.cos(radians)) + Math.abs(height * Math.sin(radians));
+		const sceneHeight = Math.abs(width * Math.sin(radians)) + Math.abs(height * Math.cos(radians));
+		image.set({ originX: 'center', originY: 'center', left: sceneWidth / 2, top: sceneHeight / 2 });
+		image.setCoords();
+		this.sceneSize = { width: sceneWidth, height: sceneHeight };
+	}
+
+	private applyBackgroundState(image: FabricImage, data: any) {
+		image.set({ angle: data.angle ?? 0, flipX: !!data.flipX, flipY: !!data.flipY });
+		(image as any).fpResize = data.fpResize;
+		this.applyFilterState(image, data.fpFilters ?? {});
+		this.normalizeBackground(image);
+	}
+
+	private applyFilterState(image: FabricImage, state: Record<string, ToolOptions>) {
+		(image as any).fpFilters = state;
+		image.filters = this.filterDefinitions
+			.filter((definition) => state[definition.id])
+			.map((definition) => definition.create({ ...definition.defaultOptions, ...state[definition.id] }));
+		image.applyFilters();
+	}
+
+	/** blur areas show a blurred copy of the photo, which has to be re-rendered when the photo changes */
+	private refreshBlurPatches() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		canvas
+			.getObjects()
+			.filter((obj: any) => obj.shapeType === ShapeType.BLUR)
+			.forEach((rect) => applyBlurEffect({ current: canvas }, rect));
+	}
+
+	/** filters of the Filter menu (built-in and from the `filters` option), in the order they are applied */
+	getFilterDefinitions(): FilterDefinition<any>[] {
+		return this.filterDefinitions;
+	}
+
+	/** active filters of the photo: `{ [filterId]: options }` */
+	getImageFilters(): Record<string, ToolOptions> {
+		return { ...((this.getBackground() as any)?.fpFilters ?? {}) };
+	}
+
+	/**
+	 * Enables (or changes the options of) a filter, `null` removes it. Pass `{ commit: false }` while the user drags a
+	 * slider and commit once at the end.
+	 */
+	setImageFilter(id: string, options: ToolOptions | null, { commit = true } = {}) {
+		const image = this.getBackground();
+		const definition = this.filterDefinitions.find((filter) => filter.id === id);
+		if (!image || !definition) {
+			return;
+		}
+		const state = this.getImageFilters();
+		if (options === null) {
+			delete state[id];
+		} else {
+			state[id] = { ...definition.defaultOptions, ...state[id], ...options };
+		}
+		this.applyFilterState(image, state);
+		this.refreshBlurPatches();
+		this.notifyObjectChanged({ commit });
+	}
+
+	/**
+	 * Removes the filters. `group: 'filter'` removes only those of the Filter menu, `group: 'adjust'` only the
+	 * adjustments (brightness...), without a group all of them.
+	 */
+	clearImageFilters({ commit = true, group }: { commit?: boolean; group?: 'filter' | 'adjust' } = {}) {
+		const image = this.getBackground();
+		if (!image) {
+			return;
+		}
+		const state = group
+			? Object.fromEntries(
+					Object.entries(this.getImageFilters()).filter(([id]) => {
+						const definition = this.filterDefinitions.find((filter) => filter.id === id);
+						return (definition?.group ?? 'filter') !== group;
+					}),
+				)
+			: {};
+		this.applyFilterState(image, state);
+		this.refreshBlurPatches();
+		this.notifyObjectChanged({ commit });
+	}
+
+	/** output scale relative to the original resolution, `{ x: 1, y: 1 }` = original size */
+	getOutputScale(): { x: number; y: number } {
+		const resize = (this.getBackground() as any)?.fpResize;
+		return { x: resize?.x ?? 1, y: resize?.y ?? 1 };
+	}
+
+	/** scales the exported image, e.g. `setOutputScale(0.5)`; a different `y` stretches the image */
+	setOutputScale(x: number, y: number = x, { commit = true } = {}) {
+		const image = this.getBackground();
+		if (!image || !(x > 0) || !(y > 0)) {
+			return;
+		}
+		(image as any).fpResize = x === 1 && y === 1 ? undefined : { x, y };
+		this.notifyObjectChanged({ commit });
+	}
+
+	/** pixel size of the exported image at the original resolution (crop and rotation included) */
+	getNaturalSize(): { width: number; height: number } {
+		const canvas = this.canvas;
+		const clipPath = canvas?.clipPath;
+		const area = clipPath
+			? { width: clipPath.width * clipPath.scaleX, height: clipPath.height * clipPath.scaleY }
+			: this.sceneSize;
+		const scale = canvas?.backgroundImage?.scaleX || 1;
+		return { width: Math.round(area.width / scale), height: Math.round(area.height / scale) };
+	}
+
+	/** pixel size of the exported image */
+	getOutputSize(): { width: number; height: number } {
+		const natural = this.getNaturalSize();
+		const scale = this.getOutputScale();
+		return { width: Math.round(natural.width * scale.x), height: Math.round(natural.height * scale.y) };
+	}
+
+	/** resizes the exported image to the given pixels; with `keepAspect` the missing / other side follows */
+	setOutputSize(size: { width?: number; height?: number }, { keepAspect = true, commit = true } = {}) {
+		const natural = this.getNaturalSize();
+		const current = this.getOutputScale();
+		let x = size.width ? size.width / natural.width : current.x;
+		let y = size.height ? size.height / natural.height : current.y;
+		if (keepAspect) {
+			if (size.width) {
+				y = x;
+			} else {
+				x = y;
+			}
+		}
+		this.setOutputScale(x, y, { commit });
+	}
+
+	/** rotation of the photo in degrees (0 - 360) */
+	getImageRotation(): number {
+		return this.getBackground()?.angle ?? 0;
+	}
+
+	getImageFlip(): { horizontal: boolean; vertical: boolean } {
+		const image = this.getBackground();
+		return { horizontal: !!image?.flipX, vertical: !!image?.flipY };
+	}
+
+	/** rotates the photo and the annotations by `degrees` (clockwise) */
+	rotateImage(degrees: number, { commit = true } = {}) {
+		this.transformScene({ type: 'rotate', degrees }, commit);
+	}
+
+	/** rotates the photo (and the annotations) to the given angle */
+	setImageRotation(degrees: number, { commit = true } = {}) {
+		const normalize = (value: number) => ((value % 360) + 360) % 360;
+		const delta = normalize(degrees) - normalize(this.getImageRotation());
+		if (delta !== 0) {
+			this.rotateImage(delta, { commit });
+		} else if (commit) {
+			this.commit();
+		}
+	}
+
+	/** mirrors the photo and the annotations */
+	flipImage(direction: FlipDirection, { commit = true } = {}) {
+		this.transformScene({ type: 'flip', direction }, commit);
+	}
+
+	/**
+	 * Rotates / flips the photo together with all annotations. Shapes, arrows and drawings turn with the photo. Text,
+	 * steps and callouts only move, so they stay readable. Blur areas and the crop stay axis aligned.
+	 */
+	private transformScene(
+		operation: { type: 'rotate'; degrees: number } | { type: 'flip'; direction: FlipDirection },
+		commit: boolean,
+	) {
+		const canvas = this.canvas;
+		const image = this.getBackground();
+		if (!canvas || !image || (operation.type === 'rotate' && operation.degrees % 360 === 0)) {
+			return;
+		}
+
+		const tool = this.suspendTool('switch');
+		const oldCenter = this.getSceneCenter();
+		const radians = operation.type === 'rotate' ? util.degreesToRadians(operation.degrees) : 0;
+		const quarterTurn = operation.type === 'rotate' && Math.abs(operation.degrees % 180) === 90;
+
+		this.withoutHistory(() => {
+			if (operation.type === 'rotate') {
+				image.set({ angle: ((((image.angle ?? 0) + operation.degrees) % 360) + 360) % 360 });
+			} else if (operation.direction === 'horizontal') {
+				image.set({ flipX: !image.flipX, angle: (360 - (image.angle ?? 0)) % 360 });
+			} else {
+				image.set({ flipY: !image.flipY, angle: (360 - (image.angle ?? 0)) % 360 });
+			}
+			this.normalizeBackground(image);
+			const newCenter = this.getSceneCenter();
+
+			const mapPoint = (point: { x: number; y: number }) => {
+				if (operation.type === 'rotate') {
+					const dx = point.x - oldCenter.x;
+					const dy = point.y - oldCenter.y;
+					return new Point(
+						newCenter.x + dx * Math.cos(radians) - dy * Math.sin(radians),
+						newCenter.y + dx * Math.sin(radians) + dy * Math.cos(radians),
+					);
+				}
+				return operation.direction === 'horizontal'
+					? new Point(2 * oldCenter.x - point.x, point.y)
+					: new Point(point.x, 2 * oldCenter.y - point.y);
+			};
+
+			// axis aligned areas: only the center moves, a quarter turn swaps width and height
+			const moveArea = (object: FabricObject) => {
+				const center = mapPoint(object.getCenterPoint());
+				if (quarterTurn) {
+					object.set({
+						width: object.height * object.scaleY,
+						height: object.width * object.scaleX,
+						scaleX: 1,
+						scaleY: 1,
+					});
+				}
+				object.setPositionByOrigin(center, 'center', 'center');
+				object.setCoords();
+			};
+
+			const keepUpright = new Set<string>([
+				ShapeType.TEXT,
+				ShapeType.EMOJI,
+				ShapeType.STEPS_CREATOR,
+				ShapeType.COMMENT_BOX,
+			]);
+
+			for (const object of canvas.getObjects()) {
+				const type = (object as any).shapeType;
+				// re-created from their parent object
+				if (type === ShapeType.COMMENT_BOX_TEXTBOX || type === ShapeType.BLUR_INNER_PART) {
+					continue;
+				}
+				if (type === ShapeType.BLUR) {
+					moveArea(object);
+					continue;
+				}
+
+				const center = mapPoint(object.getCenterPoint());
+				if (!keepUpright.has(type)) {
+					if (operation.type === 'rotate') {
+						object.set({ angle: (object.angle ?? 0) + operation.degrees });
+					} else if (operation.direction === 'horizontal') {
+						object.set({ flipX: !object.flipX, angle: -(object.angle ?? 0) });
+					} else {
+						object.set({ flipY: !object.flipY, angle: -(object.angle ?? 0) });
+					}
+				}
+				object.setPositionByOrigin(center, 'center', 'center');
+				object.setCoords();
+			}
+
+			if (canvas.clipPath) {
+				moveArea(canvas.clipPath);
+			}
+		});
+
+		this.applyViewport();
+		this.refreshBlurPatches();
+		this.notifyObjectChanged({ commit });
+		this.resumeTool(tool);
+	}
+
+	// ---------------------------------------------------------------- view
+
+	/** size of the area the canvas is shown in, the image is fitted into it */
+	setViewportSize(width: number, height: number) {
+		if (width === this.viewSize.width && height === this.viewSize.height) {
+			return;
+		}
+		this.viewSize = { width, height };
+		this.applyViewport();
+	}
+
+	private applyViewport() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const { width: sceneWidth, height: sceneHeight } = this.sceneSize;
+		const { width: viewWidth, height: viewHeight } = this.viewSize;
+		const fit = viewWidth > 0 && viewHeight > 0 ? Math.min(viewWidth / sceneWidth, viewHeight / sceneHeight) : 1;
+		this.fitZoom = fit;
+
+		canvas.setDimensions({
+			width: Math.max(1, Math.floor(sceneWidth * fit)),
+			height: Math.max(1, Math.floor(sceneHeight * fit)),
+		});
+		canvas.setViewportTransform([fit, 0, 0, fit, 0, 0]);
+		if (this.state.zoom > MIN_ZOOM) {
+			canvas.zoomToPoint(new Point(canvas.getWidth() / 2, canvas.getHeight() / 2), fit * this.state.zoom);
+		}
+		canvas.requestRenderAll();
+	}
+
+	/**
+	 * User zoom, 1 = fit (1 - 4). Zooms around the center of the view, or around `point` (in pixels from the top left
+	 * corner of the canvas element) keeping that spot under the pointer, like a pinch.
+	 */
+	setZoom(zoom: number, point?: { x: number; y: number }) {
+		const canvas = this.canvas;
+		const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, roundZoom(zoom)));
+		if (next === this.state.zoom) {
+			return;
+		}
+		this.setState({ zoom: next });
+		if (next <= MIN_ZOOM) {
+			this.setPanning(false);
+		}
+		if (canvas && point && next > MIN_ZOOM) {
+			canvas.zoomToPoint(new Point(point.x, point.y), this.fitZoom * next);
+			this.clampViewport();
+			canvas.requestRenderAll();
+		} else {
+			this.applyViewport();
+		}
+		this.emit('zoomChange', { zoom: next });
+	}
+
+	/** moves the zoomed in view by the given pixels (no effect at zoom 1, the image is never moved out of view) */
+	panBy(dx: number, dy: number) {
+		const canvas = this.canvas;
+		if (!canvas || this.state.zoom <= MIN_ZOOM) {
+			return;
+		}
+		canvas.relativePan(new Point(dx, dy));
+		this.clampViewport();
+		canvas.requestRenderAll();
+	}
+
+	/** keeps the zoomed in image covering the view */
+	private clampViewport() {
+		const canvas = this.canvas;
+		if (!canvas) {
+			return;
+		}
+		const transform = [...canvas.viewportTransform] as TMat2D;
+		const clamp = (offset: number, content: number, view: number) =>
+			content <= view ? (view - content) / 2 : Math.min(0, Math.max(view - content, offset));
+		transform[4] = clamp(transform[4], this.sceneSize.width * transform[0], canvas.getWidth());
+		transform[5] = clamp(transform[5], this.sceneSize.height * transform[3], canvas.getHeight());
+		canvas.setViewportTransform(transform);
+	}
+
+	zoomIn() {
+		this.setZoom(this.state.zoom + ZOOM_STEP);
+	}
+
+	zoomOut() {
+		this.setZoom(this.state.zoom - ZOOM_STEP);
+	}
+
+	fitToView() {
+		this.setZoom(MIN_ZOOM);
+	}
+
+	/** pan mode: dragging the canvas moves the view, the active tool is paused meanwhile */
+	setPanning(enabled: boolean, resumeTool = true) {
+		const canvas = this.canvas;
+		if (!canvas || enabled === this.state.panning) {
+			return;
+		}
+
+		if (enabled) {
+			if (this.state.zoom <= MIN_ZOOM) {
+				return;
+			}
+			this.pausedTool = this.deactivateTool('pause');
+			canvas.on('mouse:down', this.handlePanMouseDown);
+			canvas.on('mouse:move', this.handlePanMouseMove);
+			canvas.on('mouse:up', this.handlePanMouseUp);
+			canvas.selection = false;
+			canvas.defaultCursor = 'grab';
+			this.setState({ panning: true });
+			return;
+		}
+
+		this.stopPanHandlers();
+		canvas.selection = true;
+		canvas.defaultCursor = 'default';
+		this.setState({ panning: false });
+		const pausedTool = this.pausedTool;
+		this.pausedTool = null;
+		if (resumeTool && pausedTool) {
+			this.setActiveTool(pausedTool);
+		}
+	}
+
+	togglePanning() {
+		this.setPanning(!this.state.panning);
+	}
+
+	private stopPanHandlers() {
+		this.panState.dragging = false;
+		this.canvas?.off('mouse:down', this.handlePanMouseDown);
+		this.canvas?.off('mouse:move', this.handlePanMouseMove);
+		this.canvas?.off('mouse:up', this.handlePanMouseUp);
+	}
+
+	private handlePanMouseDown = (event: any) => {
+		if (this.canvas?.findTarget(event.e)) {
+			return;
+		}
+		this.panState = { dragging: true, x: event.e.clientX, y: event.e.clientY };
+	};
+
+	private handlePanMouseMove = (event: any) => {
+		if (!this.panState.dragging || !this.canvas) {
+			return;
+		}
+		this.panBy(event.e.clientX - this.panState.x, event.e.clientY - this.panState.y);
+		this.panState.x = event.e.clientX;
+		this.panState.y = event.e.clientY;
+	};
+
+	private handlePanMouseUp = () => {
+		this.panState.dragging = false;
+	};
+
+	// ---------------------------------------------------------------- export
+
+	/** exports the edited image (at the original image resolution by default) */
+	exportImage(options: ExportOptions = {}): Promise<Blob> {
+		// lets tools finish pending work first (e.g. the crop tool applies the crop rectangle)
+		return this.withToolSuspended('switch', () => this.renderImage(options));
+	}
+
+	private async renderImage(options: ExportOptions = {}): Promise<Blob> {
+		const canvas = this.canvas;
+		if (!canvas) {
+			throw new Error('fabri-pix: the editor is not mounted');
+		}
+
+		const {
+			format = 'png',
+			quality = 1,
+			multiplier: customMultiplier,
+			maxPixels = DEFAULT_MAX_EXPORT_PIXELS,
+		} = { ...this.options.exportOptions, ...options };
+		const clipPath = canvas.clipPath;
+		const area = clipPath
+			? {
+					left: clipPath.left,
+					top: clipPath.top,
+					width: clipPath.width * clipPath.scaleX,
+					height: clipPath.height * clipPath.scaleY,
+				}
+			: { left: 0, top: 0, ...this.sceneSize };
+
+		const backgroundScale = canvas.backgroundImage?.scaleX;
+		const baseMultiplier = backgroundScale ? 1 / backgroundScale : Math.max(1, window.devicePixelRatio || 1);
+		// the output size (Resize menu) applies unless an explicit multiplier is passed
+		const outputScale = customMultiplier !== undefined ? { x: 1, y: 1 } : this.getOutputScale();
+		let multiplierX = (customMultiplier ?? baseMultiplier) * outputScale.x;
+		let multiplierY = (customMultiplier ?? baseMultiplier) * outputScale.y;
+		const exportPixels = area.width * area.height * multiplierX * multiplierY;
+		if (exportPixels > maxPixels) {
+			const reduction = Math.sqrt(maxPixels / exportPixels);
+			multiplierX *= reduction;
+			multiplierY *= reduction;
+		}
+
+		canvas.discardActiveObject();
+		const filter = (object: any) => !this.isTransientType(object.shapeType);
+		const viewportTransform = [...canvas.viewportTransform] as TMat2D;
+		canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+		let blobPromise: Promise<Blob | null>;
+		try {
+			// rendering is synchronous, only the encoding is async, so the view is restored right away
+			if (multiplierX === multiplierY) {
+				blobPromise = canvas.toBlob({ format, quality, multiplier: multiplierX, ...area, filter });
+			} else {
+				// a resize without keeping the aspect ratio: render at the larger scale and stretch it
+				const rendered = canvas.toCanvasElement(Math.max(multiplierX, multiplierY), { ...area, filter });
+				const stretched = document.createElement('canvas');
+				stretched.width = Math.max(1, Math.round(area.width * multiplierX));
+				stretched.height = Math.max(1, Math.round(area.height * multiplierY));
+				stretched.getContext('2d')?.drawImage(rendered, 0, 0, stretched.width, stretched.height);
+				blobPromise = new Promise((resolve) => stretched.toBlob(resolve, `image/${format}`, quality));
+			}
+		} finally {
+			canvas.setViewportTransform(viewportTransform);
+		}
+
+		const blob = await blobPromise;
+		if (!blob) {
+			throw new Error('fabri-pix: unable to export the image');
+		}
+		return blob;
+	}
+
+	/** exports the image and the JSON, calls `onSave` or downloads the image */
+	async save(): Promise<SaveResult | null> {
+		try {
+			// the JSON is taken while the tool is suspended, so that it contains the applied crop
+			const result: SaveResult = await this.withToolSuspended('switch', async () => ({
+				blob: await this.renderImage(),
+				json: this.toJSON(),
+			}));
+			if (this.options.onSave) {
+				this.options.onSave(result);
+			} else {
+				const extension = result.blob.type.split('/')[1] ?? 'png';
+				downloadBlob(result.blob, `edited-image-${Date.now()}.${extension}`);
+			}
+			this.emit('save', result);
+			return result;
+		} catch (error) {
+			// e.g. an image from a server without CORS headers taints the canvas
+			this.reportError(error);
+			return null;
+		}
+	}
+
+	/** current fit zoom (canvas pixels per scene unit at zoom 1) */
+	getFitZoom() {
+		return this.fitZoom;
+	}
+}
