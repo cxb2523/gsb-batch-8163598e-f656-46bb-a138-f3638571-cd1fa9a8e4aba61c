@@ -30,6 +30,12 @@ export const mountJoystickArea = ({
 
   let resetMovementTimeout: ReturnType<typeof setTimeout> | null = null
   let endResetTimeout: ReturnType<typeof setTimeout> | null = null
+  // Incremented for every newly claimed touch session and when the area is
+  // unmounted. Reset timers capture the session they were scheduled in so a
+  // stale timer can never clear a newer session, even if the browser reuses
+  // the same touch identifier (for example `0`).
+  let session = 0
+  let disposed = false
 
   const resetJoystick = () => {
     if (!joystick) {
@@ -53,14 +59,55 @@ export const mountJoystickArea = ({
     joystick.movement.y = 0
   }
 
+  // Supports both a real TouchList (`item(index)`) and plain array / array-like
+  // touch collections used in hand-rolled DOM event samples.
+  const getTouchAt = (list: TouchList | null | undefined, index: number): Touch | null => {
+    if (!list) {
+      return null
+    }
+    if (typeof list.item === 'function') {
+      return list.item(index)
+    }
+    return list[index] ?? null
+  }
+
   const handleTouchStart = (e: TouchEvent) => {
     e.preventDefault()
 
-    const touch = e.changedTouches.item(0)
-
-    if (!touch || !joystick || joystick.identifier != undefined) {
+    if (disposed) {
       return
     }
+
+    const touch = getTouchAt(e.changedTouches, 0)
+
+    if (!touch || !joystick) {
+      return
+    }
+
+    // `identifier` is `null` exactly while no touch is bound. A touch
+    // identifier of `0` is a valid active touch, so checks must be against
+    // `null` rather than loose `!= undefined` / truthiness.
+    // `endResetTimeout` being set means the bound touch has already ended and
+    // its values are only retained until the delayed reset. During that
+    // window a new touch is allowed to claim the joystick immediately.
+    const hasActiveTouch = joystick.identifier !== null && endResetTimeout === null
+
+    if (hasActiveTouch) {
+      return
+    }
+
+    // Cancel the pending reset of the previous (already ended) session so it
+    // cannot wipe the new session, and drop its stale movement reset.
+    if (endResetTimeout !== null) {
+      clearTimeout(endResetTimeout)
+      endResetTimeout = null
+    }
+    if (resetMovementTimeout !== null) {
+      clearTimeout(resetMovementTimeout)
+      resetMovementTimeout = null
+    }
+
+    session += 1
 
     const target = e.target as HTMLElement
     const rect = target.getBoundingClientRect()
@@ -94,12 +141,12 @@ export const mountJoystickArea = ({
   const handleTouchMove = (e: TouchEvent) => {
     e.preventDefault()
 
-    if (!joystick) {
+    if (disposed || !joystick) {
       return
     }
 
     for (let i = 0; i < e.changedTouches.length; i++) {
-      const touch = e.changedTouches.item(i)
+      const touch = getTouchAt(e.changedTouches, i)
 
       if (!touch || joystick.identifier !== touch.identifier) {
         continue
@@ -198,14 +245,25 @@ export const mountJoystickArea = ({
 
       onMove?.(joystick)
 
-      resetMovementTimeout && clearTimeout(resetMovementTimeout)
-      resetMovementTimeout = setTimeout(() => {
-        if (joystick && joystick.identifier !== undefined) {
-          joystick.movement.x = 0
-          joystick.movement.y = 0
+      if (resetMovementTimeout !== null) {
+        clearTimeout(resetMovementTimeout)
+      }
 
-          onMove?.(joystick)
+      const movementSession = session
+      resetMovementTimeout = setTimeout(() => {
+        resetMovementTimeout = null
+
+        // Only flush the movement reset for the session that scheduled it.
+        // A newer session or unmount invalidates this callback, and a `null`
+        // identifier means the joystick was already fully reset.
+        if (disposed || movementSession !== session || joystick.identifier === null) {
+          return
         }
+
+        joystick.movement.x = 0
+        joystick.movement.y = 0
+
+        onMove?.(joystick)
       }, 70)
     }
   }
@@ -213,12 +271,12 @@ export const mountJoystickArea = ({
   const handleTouchEnd = (e: TouchEvent) => {
     e.preventDefault()
 
-    if (!joystick) {
+    if (disposed || !joystick) {
       return
     }
 
     for (let i = 0; i < e.changedTouches.length; i++) {
-      const touch = e.changedTouches.item(i)
+      const touch = getTouchAt(e.changedTouches, i)
 
       if (!touch || joystick.identifier !== touch.identifier) {
         continue
@@ -227,9 +285,29 @@ export const mountJoystickArea = ({
       joystick.movement.x = 0
       joystick.movement.y = 0
 
+      // Movement is already zeroed above, so cancel its debounced reset to
+      // avoid a stale extra onMove after release.
+      if (resetMovementTimeout !== null) {
+        clearTimeout(resetMovementTimeout)
+        resetMovementTimeout = null
+      }
+
       onEnd?.(joystick)
 
+      if (endResetTimeout !== null) {
+        clearTimeout(endResetTimeout)
+      }
+
+      const endSession = session
       endResetTimeout = setTimeout(() => {
+        endResetTimeout = null
+
+        // A new touch session started during the reset delay, or the area was
+        // unmounted: never reset the current joystick state here.
+        if (disposed || endSession !== session) {
+          return
+        }
+
         resetJoystick()
         onEnd?.(joystick)
       }, 50)
@@ -244,10 +322,31 @@ export const mountJoystickArea = ({
   element.addEventListener('touchend', handleTouchEnd /*, { passive: false } */)
 
   return () => {
-    resetMovementTimeout && clearTimeout(resetMovementTimeout)
-    endResetTimeout && clearTimeout(endResetTimeout)
+    // Idempotent: React (or a double invoke) must not remove listeners twice.
+    if (disposed) {
+      return
+    }
+
+    disposed = true
+    // Invalidate every timer captured by the previous session.
+    session += 1
+
+    if (resetMovementTimeout !== null) {
+      clearTimeout(resetMovementTimeout)
+      resetMovementTimeout = null
+    }
+    if (endResetTimeout !== null) {
+      clearTimeout(endResetTimeout)
+      endResetTimeout = null
+    }
+
     element.removeEventListener('touchstart', handleTouchStart)
     element.removeEventListener('touchmove', handleTouchMove)
     element.removeEventListener('touchend', handleTouchEnd)
+
+    // Return the joystick to the same initial state as `createJoystick` so an
+    // identifier or coordinates from the removed element never linger. This
+    // reset is silent: neither onMove nor onEnd is emitted.
+    resetJoystick()
   }
 }

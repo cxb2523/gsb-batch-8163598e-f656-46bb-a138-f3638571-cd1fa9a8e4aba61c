@@ -42,21 +42,35 @@ export const JoystickArea = ({
   const localRef = useRef<HTMLDivElement>(null)
   const mergedRefs = mergeRefs([localRef, ref])
 
-  useEffect(
-    () =>
-      mountJoystickArea({
-        mode,
-        joystick,
-        maxFollowDistance,
-        maxOriginDistance,
-        onEnd,
-        onMove,
-        onStart,
-        element: localRef.current!,
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [mode, joystick, maxFollowDistance, maxOriginDistance],
-  )
+  // Always invoke the latest callbacks without re-running the binding effect.
+  // Callbacks are commonly passed as fresh inline functions on every render,
+  // so depending on them directly would remove/re-add the touch listeners and
+  // reset an in-progress joystick session on unrelated parent re-renders.
+  const callbacksRef = useRef({ onStart, onMove, onEnd })
+  callbacksRef.current = { onStart, onMove, onEnd }
+
+  useEffect(() => {
+    const element = localRef.current
+
+    if (!element) {
+      return
+    }
+
+    const cleanup = mountJoystickArea({
+      mode,
+      joystick,
+      maxFollowDistance,
+      maxOriginDistance,
+      element,
+      onStart: joystick => callbacksRef.current.onStart?.(joystick),
+      onMove: joystick => callbacksRef.current.onMove?.(joystick),
+      onEnd: joystick => callbacksRef.current.onEnd?.(joystick),
+    })
+
+    // Returning the cleanup guarantees listeners and pending reset timers are
+    // disposed on unmount and before every re-run of these structural deps.
+    return cleanup
+  }, [mode, joystick, maxFollowDistance, maxOriginDistance])
 
   return (
     <div ref={mergedRefs} {...containerProps}>
