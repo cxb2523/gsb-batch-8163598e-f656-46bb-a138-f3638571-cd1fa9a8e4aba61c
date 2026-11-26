@@ -34,6 +34,7 @@ class NebulaView extends ItemView {
   build() {
     this.built = this.shape();
     const prev = this.c ? this.c.getView() : null;
+    // Drop the old scene before the new one starts drawing, so two scenes never share the DOM or the loop.
     if (this.c) this.c.destroy();
     this.c = null;
     const app = this.app, notes = [], links = [];
@@ -44,10 +45,13 @@ class NebulaView extends ItemView {
     }
     const rl = app.metadataCache.resolvedLinks;
     for (const a in rl) for (const b in rl[a]) links.push([a, b]);
+    let c;
     try {
-      this.c = new Constellation(this.contentEl, { notes, links }, {
+      c = new Constellation(this.contentEl, { notes, links }, {
         settings: this.plugin.data.settings,
         mobile: Platform.isMobile,
+        // Restores camera, hover, beads, flights and drag before the first frame of the new scene.
+        state: prev,
         onSettings: (s) => { this.plugin.data.settings = s; this.plugin.saveData(this.plugin.data); },
         onFocus: () => this.plugin.toggleFocus(),
         // Phones and tablets have no split panes, so the note opens in its own tab there.
@@ -64,10 +68,11 @@ class NebulaView extends ItemView {
         : "It needs WebGL. Turn on Settings → Appearance → Hardware acceleration, restart Obsidian, then run Nebula: Refresh view." });
       return;
     }
-    if (prev) this.c.setView(prev);
+    this.c = c;
     // Phones drop the GPU context when Obsidian goes to the background; rebuild when it comes back instead of staying black.
-    const cv = this.c.renderer && this.c.renderer.domElement;
-    if (cv) cv.addEventListener("webglcontextrestored", () => this.build(), { once: true });
+    // Only the scene that is still current may trigger a rebuild: a replaced scene's listener must be inert.
+    const cv = c.renderer && c.renderer.domElement;
+    if (cv) cv.addEventListener("webglcontextrestored", () => { if (this.c === c) this.build(); }, { once: true });
   }
   async onClose() { if (this.c) this.c.destroy(); this.c = null; }
 }

@@ -18,6 +18,7 @@ const SWATCHES = [["Green", "#2cf27f"], ["White", "#ffffff"], ["Ice", "#9fdcff"]
 const QUALITY = { fast: 1, high: 1.75, max: 2.5 };
 const MAX_BEADS = 800;
 const ease = (t) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+const clamp01 = (t) => (t < 0 ? 0 : t > 1 ? 1 : t);
 
 function rng(seed) {
   let a = seed >>> 0;
@@ -132,9 +133,21 @@ export class Constellation {
     this.doc = el.ownerDocument || document; this.win = this.doc.defaultView || window;
     this.mq = typeof this.win.matchMedia === "function" ? this.win.matchMedia("(prefers-reduced-motion: reduce)") : null;
     this.t0 = performance.now(); this.running = true; this.hover = -1; this._last = 0; this.frames = 0; this.spinPause = 0;
+    this.mouse = null; this._dirty = false; this._hoverLock = false;
+    this._destroyed = false; this._raf = 0; this._bound = []; this._dragGuard = null; this._dragRestored = false;
+    this._fly = null;
     this.root = this.doc.createElement("div"); this.root.className = "nebula-root"; el.appendChild(this.root);
-    this._build(); this._ui(); this._events(); this.apply();
-    this._loop = this._loop.bind(this); this.win.requestAnimationFrame(this._loop);
+    try {
+      this._build(); this._ui(); this._events(); this.apply();
+      // Restore before the first animation frame, so the new scene never renders the old scene's
+      // hover highlight, hover lines, tooltip or fly-in state against the new note/link data.
+      if (opts.state) { this.setView(opts.state); this.controls.update(); this.composer.render(); }
+    } catch (e) {
+      // Do not leave a half-built scene (renderer, DOM, listeners) behind when WebGL is unavailable.
+      this.destroy();
+      throw e;
+    }
+    this._loop = this._loop.bind(this); this._raf = this.win.requestAnimationFrame(this._loop);
   }
 
   // Motion "auto" follows the system's reduced-motion setting (Windows "Animation effects" off, macOS "Reduce motion").
@@ -144,12 +157,130 @@ export class Constellation {
   get sysReduced() { return !!(this.mq && this.mq.matches); }
   get reduced() { const m = this.s.motion; return m === "off" || (m !== "on" && this.sysReduced); }
 
-  /** Camera and panel state, so a rebuild (notes or links changed) does not throw the user back to the fly-in. */
-  getView() { return { pos: this.camera.position.toArray(), target: this.controls.target.toArray(), up: this.camera.up.toArray(), panel: this.panel.classList.contains("is-open") }; }
+  /**
+   * Interaction state, so a rebuild (notes or links changed) is a continuation rather than a reset:
+   * camera, orbit target, panel, hovered star, bead progress/speed, in-flight camera animation and
+   * an active drag. Everything is data-keyed (note ids), never slot indices, because slots shift
+   * when notes are added or removed.
+   */
+  getView() {
+    const now = performance.now(), notes = this.data.notes;
+    const slotId = (slot) => (slot > 0 && slot <= notes.length ? notes[slot - 1].id : null);
+    const hover = { id: null, group: null };
+    if (this.hover > 0) {
+      if (this.hover <= notes.length) hover.id = notes[this.hover - 1].id;
+      else { const g = this.groupInfo.find((x) => x.slot === this.hover); if (g) hover.group = g.name; }
+    }
+    const beads = (this.beads || []).map((b) => ({ a: slotId(b.e[0]), b: slotId(b.e[1]), t: b.t, s: b.s }));
+    let fly = null;
+    if (this._fly) {
+      const dir = new THREE.Vector3().subVectors(this._fly.ct, this._fly.to);
+      if (dir.lengthSq() < 1e-9) dir.set(0, 0, 1);
+      fly = {
+        u: clamp01((now - this._fly.t0) / 900), kind: this._fly.kind || (this._fly.noteId ? "note" : "free"),
+        noteId: this._fly.noteId || null, group: this._fly.group || null,
+        from: this._fly.from.toArray(), cf: this._fly.cf.toArray(), to: this._fly.to.toArray(), ct: this._fly.ct.toArray(), dir: dir.normalize().toArray(),
+      };
+    }
+    return {
+      v: 2,
+      pos: this.camera.position.toArray(), target: this.controls.target.toArray(), up: this.camera.up.toArray(),
+      panel: this.panel.classList.contains("is-open"),
+      hover, beads, fly,
+      intro: this.flying ? { u: clamp01((now - this.flyStart) / 2600) } : null,
+      dragging: !!this._down, down: this._down ? [this._down[0], this._down[1]] : null,
+      // Remaining pause, not an absolute timestamp: the new scene starts its own clock.
+      spinPause: Math.max(0, (this.spinPause || 0) - now),
+      mouse: this.mouse ? { x: this.mouse.x, y: this.mouse.y } : null,
+    };
+  }
+
   setView(v) {
-    if (!v) return;
-    this.camera.position.fromArray(v.pos); this.controls.target.fromArray(v.target); this.camera.up.fromArray(v.up);
-    this.flying = false; this.panel.classList.toggle("is-open", !!v.panel);
+    if (!v || this._destroyed) return;
+    const now = performance.now();
+    if (v.pos) this.camera.position.fromArray(v.pos);
+    if (v.target) this.controls.target.fromArray(v.target);
+    if (v.up) this.camera.up.fromArray(v.up);
+    this.panel.classList.toggle("is-open", !!v.panel);
+
+    // In-progress intro (fly-in) and explicit camera flights keep their elapsed progress.
+    if (this.reduced) this.flying = false;
+    else if (v.intro) { const u = clamp01(v.intro.u || 0); this.flying = u < 1; this.flyStart = now - u * 2600; }
+    else this.flying = false;
+    this._fly = null;
+    if (v.fly && !this.reduced) {
+      const f = v.fly, u = clamp01(f.u || 0);
+      let to = null, ct = null, ok = true;
+      if (f.kind === "reset") { to = new THREE.Vector3(); ct = this.home.clone(); }
+      else if (f.noteId != null) {
+        const slot = this.index.get(f.noteId);
+        if (slot) {
+          to = new THREE.Vector3().fromArray(this.pos, slot * 3);
+          const dir = new THREE.Vector3().fromArray(f.dir && f.dir.length === 3 ? f.dir : [0, 0, 1]).normalize();
+          ct = to.clone().add(dir.multiplyScalar(24));
+        } else ok = false; // the star it was flying to is gone
+      } else if (f.kind === "group" && f.group != null) {
+        const g = this.groupInfo.find((x) => x.name === f.group);
+        if (g) {
+          to = new THREE.Vector3().fromArray(this.pos, g.slot * 3);
+          const dir = new THREE.Vector3().fromArray(f.dir && f.dir.length === 3 ? f.dir : [0, 0, 1]).normalize();
+          ct = to.clone().add(dir.multiplyScalar(24));
+        } else ok = false; // the folder no longer exists
+      } else if (f.to && f.ct) { to = new THREE.Vector3().fromArray(f.to); ct = new THREE.Vector3().fromArray(f.ct); }
+      else ok = false;
+      if (ok && to && ct) this._fly = {
+        t0: now - u * 900, from: new THREE.Vector3().fromArray(f.from || v.pos || [0, 0, 0]),
+        to, cf: new THREE.Vector3().fromArray(f.cf || v.pos || [0, 0, 0]), ct,
+      };
+    }
+
+    // Hover is matched by note id (or folder name for a hub); a deleted note clears it entirely.
+    let h = -1;
+    if (v.hover) {
+      if (v.hover.id != null) { const slot = this.index.get(v.hover.id); if (slot) h = slot; }
+      else if (v.hover.group != null) { const g = this.groupInfo.find((x) => x.name === v.hover.group); if (g) h = g.slot; }
+    }
+    this._setHover(h);
+    if (this.tip) { this.tip.classList.add("is-hidden"); this.tip._n = -1; if (this.tip.replaceChildren) this.tip.replaceChildren(); }
+
+    // Keep the pointer where it was so the tooltip can be positioned; do not re-pick until it moves,
+    // so a rebuilt layout cannot silently swap the restored hover for a different star. With no pointer
+    // over the canvas there is nothing to anchor the highlight, so let the first frame re-pick (and clear it).
+    this.mouse = v.mouse && typeof v.mouse.x === "number" ? { x: v.mouse.x, y: v.mouse.y } : null;
+    this._hoverLock = !!this.mouse;
+    this._dirty = false;
+
+    // If the user was holding a drag, the new scene stays paused until they let go. Listen on the
+    // window because the pointerup will not reach the old (now removed) canvas.
+    if (v.dragging) { this._down = Array.isArray(v.down) ? v.down.slice(0, 2) : [0, 0]; this._dragRestored = true; }
+    else { this._down = null; this._dragRestored = false; }
+    this.spinPause = now + Math.max(0, typeof v.spinPause === "number" ? v.spinPause : 0);
+
+    this._restoreBeads(v.beads);
+    if (this._dragRestored) this._armDragRelease();
+  }
+
+  // Follow each bead onto the same link when both ends still exist, keyed by note id; otherwise it
+  // lands on another link but keeps its progress and speed.
+  _restoreBeads(st) {
+    if (!Array.isArray(st) || !this.beads || !this.beads.length || !this.edges || !this.edges.length) return;
+    const emap = new Map();
+    for (const e of this.edges || []) { emap.set(e[0] + ":" + e[1], e); emap.set(e[1] + ":" + e[0], [e[1], e[0]]); }
+    const n = Math.min(st.length, this.beads.length);
+    for (let i = 0; i < n; i++) {
+      const sb = st[i]; if (!sb) continue;
+      let e = null;
+      if (sb.a != null && sb.b != null) {
+        const x = this.index.get(sb.a), y = this.index.get(sb.b);
+        if (x && y) e = emap.get(x + ":" + y) || null;
+      }
+      if (!e) e = this.edges && this.edges.length ? this.edges[(Math.random() * this.edges.length) | 0] : [0, 0];
+      const b = this.beads[i]; b.e = e;
+      if (Number.isFinite(sb.t)) b.t = ((sb.t % 1) + 1) % 1;
+      if (Number.isFinite(sb.s)) b.s = sb.s;
+    }
+    const nb = Math.min(MAX_BEADS, Math.round(this.s.beads));
+    if (nb > 0) this._writeBeads(nb);
   }
 
   _build() {
@@ -396,37 +527,65 @@ export class Constellation {
   }
 
   resetView() {
-    this._fly = { t0: performance.now(), from: this.controls.target.clone(), to: new THREE.Vector3(), cf: this.camera.position.clone(), ct: this.home.clone() };
+    this._fly = { t0: performance.now(), kind: "reset", from: this.controls.target.clone(), to: new THREE.Vector3(), cf: this.camera.position.clone(), ct: this.home.clone() };
     this.camera.up.set(0, 1, 0);
   }
 
   _events() {
     const cv = this.renderer.domElement;
-    this._mv = (e) => { const r = cv.getBoundingClientRect(); this.mouse = { x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }; this._dirty = true; };
-    this._lv = () => { this.mouse = null; this._dirty = true; };
+    this._mv = (e) => { const r = cv.getBoundingClientRect(); this.mouse = { x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }; this._dirty = true; this._hoverLock = false; };
+    this._lv = () => { this.mouse = null; this._dirty = true; this._hoverLock = false; };
     this._ptrs = new Set();
-    this._dn = (e) => { this._ptrs.add(e.pointerId); if (this._ptrs.size > 1) this._multi = true; else this._multi = false; this._mv(e); this._down = [e.clientX, e.clientY]; this.spinPause = performance.now() + 6000; this._fly = null; this.flying = false; };
+    this._dn = (e) => {
+      // A fresh press supersedes any drag carried over from the previous scene; the old release is moot.
+      this._dragRestored = false; if (this._dragGuard) { this._dragGuard(); this._dragGuard = null; }
+      this._ptrs.add(e.pointerId); if (this._ptrs.size > 1) this._multi = true; else this._multi = false; this._mv(e); this._down = [e.clientX, e.clientY]; this.spinPause = performance.now() + 6000; this._fly = null; this.flying = false;
+    };
     this._up = (e) => {
-      this._ptrs.delete(e.pointerId); const multi = this._multi; if (this._ptrs.size) return; const d = this._down; this._down = null; if (multi) { this._multi = false; return; }
+      this._ptrs.delete(e.pointerId); const multi = this._multi; if (this._ptrs.size) return; const d = this._down; this._down = null;
+      // A pointerup that ends a drag carried over from the previous scene is not a click on this one.
+      const restored = this._dragRestored; this._dragRestored = false;
+      if (multi) { this._multi = false; return; }
+      if (restored) { if (this._dragGuard) { this._dragGuard(); this._dragGuard = null; } return; }
       // A tap has no hover before it, so pick the star under the finger now.
       if (e.pointerType === "touch") { const pp = this.raycaster.params.Points, t = pp.threshold; pp.threshold = t * 1.8; const i = this._pick(); pp.threshold = t; if (i !== this.hover) this._setHover(i); }
       if (!d || e.button !== 0 || Math.hypot(e.clientX - d[0], e.clientY - d[1]) > (e.pointerType === "touch" ? 12 : 5)) return;
       if (this.hover > 0 && this.hover <= this.data.notes.length && this.opts.onOpen) this.opts.onOpen(this.data.notes[this.hover - 1].id, e);
     };
     this._wh = () => { this.spinPause = performance.now() + 3000; this._fly = null; this.flying = false; };
-    cv.addEventListener("pointermove", this._mv); cv.addEventListener("pointerleave", this._lv); cv.addEventListener("pointerdown", this._dn); cv.addEventListener("pointerup", this._up); cv.addEventListener("wheel", this._wh, { passive: true });
+    this._on(cv, "pointermove", this._mv); this._on(cv, "pointerleave", this._lv); this._on(cv, "pointerdown", this._dn); this._on(cv, "pointerup", this._up); this._on(cv, "wheel", this._wh, { passive: true });
     // A drag that never gets its pointerup (alt-tab mid drag, a dialog stealing the pointer) left _down set, and spin
     // waits for !_down, so the view stopped spinning until Obsidian was restarted. Clear it on cancel too.
     // TrackballControls only drops the pointer on cancel and stays in its drag state, so the camera kept following the
     // mouse with no button held. End its drag the same way a pointerup does.
     this._cn = (e) => {
-      this._down = null; if (this._ptrs) this._ptrs.clear(); this._multi = false;
-      if (e && e.type === "pointercancel" && this.controls._onPointerUp) { try { this.controls._onPointerUp(e); } catch (err) { /* pointer already released */ } }
+      this._down = null; this._dragRestored = false; if (this._ptrs) this._ptrs.clear(); this._multi = false;
+      if (this._dragGuard) { this._dragGuard(); this._dragGuard = null; }
+      if (e && e.type === "pointercancel" && this.controls && this.controls._onPointerUp) { try { this.controls._onPointerUp(e); } catch (err) { /* pointer already released */ } }
     };
-    cv.addEventListener("pointercancel", this._cn); this.win.addEventListener("blur", this._cn);
-    cv.addEventListener("contextmenu", (e) => e.preventDefault());
+    this._on(cv, "pointercancel", this._cn); this._on(this.win, "blur", this._cn);
+    this._on(cv, "contextmenu", (e) => e.preventDefault());
     this._mqh = () => this.apply({}); if (this.mq && this.mq.addEventListener) this.mq.addEventListener("change", this._mqh);
     this.ro = new ResizeObserver(() => this.resize()); this.ro.observe(this.el);
+  }
+
+  /** Register a listener that destroy() is guaranteed to remove, wherever it lives (canvas, window, doc). */
+  _on(target, type, fn, opts) { target.addEventListener(type, fn, opts); this._bound.push([target, type, fn, opts]); }
+
+  /**
+   * A drag that started in the previous scene must still hold the new scene's spin until it ends.
+   * The pointerup goes to the window (the old canvas is gone and its capture released), so listen there.
+   */
+  _armDragRelease() {
+    if (this._dragGuard) return;
+    const end = (e) => {
+      if (e && e.type === "pointercancel" && this.controls && this.controls._onPointerUp) { try { this.controls._onPointerUp(e); } catch (err) { /* already released */ } }
+      this._down = null; this._dragRestored = false; if (this._ptrs) this._ptrs.clear(); this._multi = false;
+      if (this._dragGuard) { this._dragGuard(); this._dragGuard = null; }
+    };
+    const targets = [[this.win, "pointerup", end], [this.win, "pointercancel", end], [this.win, "blur", end]];
+    for (const [t, ty, fn] of targets) t.addEventListener(ty, fn);
+    this._dragGuard = () => { for (const [t, ty, fn] of targets) t.removeEventListener(ty, fn); };
   }
 
   resize() {
@@ -438,7 +597,13 @@ export class Constellation {
   focusSlot(slot) {
     const p = new THREE.Vector3().fromArray(this.pos, slot * 3);
     const dir = this.camera.position.clone().sub(this.controls.target).normalize().multiplyScalar(24);
-    this._fly = { t0: performance.now(), from: this.controls.target.clone(), to: p, cf: this.camera.position.clone(), ct: p.clone().add(dir) };
+    const note = slot > 0 && slot <= this.data.notes.length ? this.data.notes[slot - 1] : null;
+    const hub = note ? null : this.groupInfo.find((g) => g.slot === slot);
+    this._fly = {
+      t0: performance.now(), kind: note ? "note" : hub ? "group" : "free",
+      noteId: note ? note.id : null, group: hub ? hub.name : null,
+      from: this.controls.target.clone(), to: p, cf: this.camera.position.clone(), ct: p.clone().add(dir),
+    };
   }
 
   _pick() {
@@ -450,6 +615,7 @@ export class Constellation {
   }
 
   _setHover(i) {
+    if (this._destroyed) return;
     const b = this.boostAttr.array, old = this.hover;
     if (old >= 0) { b[old] = 0; (this.adj.get(old) || []).forEach((n) => (b[n] = 0)); }
     this.hover = i;
@@ -460,18 +626,30 @@ export class Constellation {
       this.hoverGeo.attributes.position.needsUpdate = true; this.hoverGeo.setDrawRange(0, k * 2);
     } else this.hoverGeo.setDrawRange(0, 0);
     this.boostAttr.needsUpdate = true;
+    // A hub (folder) has no tooltip; clear it so the previous note's name does not linger on a folder hover.
+    if (this.tip && (i <= 0 || i > this.data.notes.length)) { this.tip.classList.add("is-hidden"); this.tip._n = -1; }
+  }
+
+  /** Write bead positions for the first n beads from their edge + progress. Shared by the loop and setView(). */
+  _writeBeads(n) {
+    const bp = this.beadPts.geometry.attributes.position.array, P = this.pos;
+    for (let i = 0; i < n; i++) {
+      const b = this.beads[i], a = b.e[0] * 3, e2 = b.e[1] * 3, k = b.t;
+      bp[i * 3] = P[a] + (P[e2] - P[a]) * k; bp[i * 3 + 1] = P[a + 1] + (P[e2 + 1] - P[a + 1]) * k; bp[i * 3 + 2] = P[a + 2] + (P[e2 + 2] - P[a + 2]) * k;
+    }
+    this.beadPts.geometry.attributes.position.needsUpdate = true;
   }
 
   _project(slot, out) { out.fromArray(this.pos, slot * 3).project(this.camera); return out; }
 
   _loop(now) {
-    if (!this.running) return;
-    this.win.requestAnimationFrame(this._loop);
+    if (!this.running || this._destroyed) return;
+    this._raf = this.win.requestAnimationFrame(this._loop);
     if (this.doc.hidden || !this.el.isConnected || this.el.clientWidth < 10 || (this.el.offsetParent === null && !this.opts.force)) return;
     // no frame cap: runs at the monitor's refresh. Only throttles when Obsidian is in the background (optional).
     if (this.s.saveGpu && !this.doc.hasFocus() && now - this._last < 66) return;
     const dt = Math.min(100, now - (this._last || now)); this._last = now; this.frames++;
-    if ((this._fpsT = (this._fpsT || now)) && now - this._fpsT > 500) { this.fpsEl.textContent = Math.round((this.frames - (this._fpsF || 0)) * 1000 / (now - this._fpsT)) + " fps"; this._fpsT = now; this._fpsF = this.frames; }
+    if ((this._fpsT = (this._fpsT || now)) && now - this._fpsT > 500) { if (this.root.isConnected && this.fpsEl) this.fpsEl.textContent = Math.round((this.frames - (this._fpsF || 0)) * 1000 / (now - this._fpsT)) + " fps"; this._fpsT = now; this._fpsF = this.frames; }
     const t = (now - this.t0) / 1000; this.uniforms.uTime.value = this.reduced ? 0 : t;
     const cam = this.camera, c = this.controls;
     if (this.flying) { const k = (now - this.flyStart) / 2600; cam.position.lerpVectors(this.home.clone().multiplyScalar(2.6), this.home, ease(k)); if (k >= 1) this.flying = false; }
@@ -486,13 +664,15 @@ export class Constellation {
     this.core.scale.setScalar(this.coreSize * 16 * (1 + (this.s.pulse && !this.reduced ? Math.sin(t * 1.3) * 0.012 : 0)));
     this.starU.uTime.value = tm; this.dustU.uTime.value = tm;
     if (!this.reduced) for (const cl of this.clouds) cl.material.rotation += cl.userData.spin * dt / 1000;
-    if (this._dirty || this.hover >= 0) { const p = this._pick(); if (p !== this.hover) this._setHover(p); this._dirty = false; }
+    // After a rebuild the hover restored by setView() stays put until the pointer actually moves, so a
+    // different star under the stale pointer position cannot steal it on the very first frame.
+    if (!this._hoverLock && (this._dirty || this.hover >= 0)) { const p = this._pick(); if (p !== this.hover) this._setHover(p); this._dirty = false; }
     const w = this.el.clientWidth, h = this.el.clientHeight, tmp = (this._tmp = this._tmp || new THREE.Vector3()), hv = (this._hv = this._hv || new THREE.Vector3());
-    if (this.hover > 0 && this.hover <= this.data.notes.length && this.mouse) {
+    if (this.root.isConnected && this.hover > 0 && this.hover <= this.data.notes.length && this.mouse) {
       const n = this.data.notes[this.hover - 1]; this._project(this.hover, tmp); this.tip.classList.remove("is-hidden");
       this.tip.style.transform = `translate(${(tmp.x * 0.5 + 0.5) * w + 14}px,${(-tmp.y * 0.5 + 0.5) * h - 10}px)`;
       if (this.tip._n !== this.hover) { this.tip.replaceChildren(); const b = document.createElement("b"), sp = document.createElement("span"); b.textContent = n.name; sp.textContent = n.group; this.tip.append(b, sp); this.tip._n = this.hover; }
-    } else this.tip.classList.add("is-hidden");
+    } else if (this.tip) this.tip.classList.add("is-hidden");
     if (this.s.labels) {
       const zf = Math.min(1, Math.max(0, (this.far * 3.2 - cam.position.distanceTo(c.target)) / (this.far * 1.6)));
       this.groupInfo.forEach((g, i) => {
@@ -505,14 +685,12 @@ export class Constellation {
     }
     const nb = Math.min(MAX_BEADS, Math.round(this.s.beads));
     if (!this.reduced && nb > 0 && this.edges.length) {
-      const bp = this.beadPts.geometry.attributes.position.array, P = this.pos, sp = this.s.beadSpeed * dt / 1000;
+      const sp = this.s.beadSpeed * dt / 1000;
       for (let i = 0; i < nb; i++) {
         const b = this.beads[i]; b.t += b.s * sp; if (b.t > 1) { b.t = 0; b.e = this.edges[(Math.random() * this.edges.length) | 0]; }
-        const a = b.e[0] * 3, e2 = b.e[1] * 3, k = b.t;
-        bp[i * 3] = P[a] + (P[e2] - P[a]) * k; bp[i * 3 + 1] = P[a + 1] + (P[e2 + 1] - P[a + 1]) * k; bp[i * 3 + 2] = P[a + 2] + (P[e2 + 2] - P[a + 2]) * k;
       }
-      this.beadPts.geometry.attributes.position.needsUpdate = true;
     }
+    if (nb > 0 && this.edges.length) this._writeBeads(nb);
     if (!this.reduced) {
       if (this.s.comets && this.s.rings > 0) for (const cm of this.comets) {
         cm.ph = (cm.ph + cm.sp * dt / 1000 + 1) % 1; const seg = cm.lp.length / 3, head = Math.floor(cm.ph * seg), dir = cm.sp > 0 ? 1 : -1;
@@ -528,10 +706,40 @@ export class Constellation {
     this.composer.render();
   }
 
+  /**
+   * Tear down completely: stop the loop, unbind every listener and observer, release GPU resources,
+   * drop DOM. Safe to call more than once, and safe to call from the constructor's failure path.
+   */
   destroy() {
-    this.running = false; window.clearTimeout(this._saveT); this.ro && this.ro.disconnect(); this.controls.dispose();
-    this.win.removeEventListener("blur", this._cn); if (this.mq && this.mq.removeEventListener) this.mq.removeEventListener("change", this._mqh);
-    this.scene.traverse((o) => { o.geometry && o.geometry.dispose(); if (o.material) { o.material.map && o.material.map.dispose(); o.material.dispose(); } });
-    this.composer.dispose && this.composer.dispose(); this.renderer.dispose(); this.root.remove();
+    if (this._destroyed) return;
+    this._destroyed = true; this.running = false;
+    window.clearTimeout(this._saveT);
+    if (this._raf) { try { this.win.cancelAnimationFrame(this._raf); } catch (e) { /* window gone */ } this._raf = 0; }
+    if (this._dragGuard) { this._dragGuard(); this._dragGuard = null; }
+    if (this.ro) { try { this.ro.disconnect(); } catch (e) { /* already gone */ } this.ro = null; }
+    for (const [target, type, fn, opts] of this._bound || []) { try { target.removeEventListener(type, fn, opts); } catch (e) { /* target gone */ } }
+    this._bound = [];
+    if (this.mq && this.mq.removeEventListener && this._mqh) { try { this.mq.removeEventListener("change", this._mqh); } catch (e) { /* gone */ } }
+    if (this.controls) { try { this.controls.dispose(); } catch (e) { /* already disposed */ } }
+    if (this.scene) {
+      this.scene.traverse((o) => {
+        if (o.geometry) o.geometry.dispose();
+        const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
+        for (const m of mats) { for (const k of Object.keys(m)) { const v = m[k]; if (v && v.isTexture) v.dispose(); } if (m.map && m.map.isTexture) m.map.dispose(); m.dispose(); }
+      });
+      this.scene.clear();
+    }
+    // The composer owns its render targets and passes (including the bloom pass); the renderer owns the canvas/GL context.
+    if (this.composer) {
+      try { if (this.composer.passes) for (const p of this.composer.passes) { if (p.dispose) p.dispose(); } } catch (e) { /* already disposed */ }
+      try { this.composer.dispose && this.composer.dispose(); } catch (e) { /* already disposed */ }
+    }
+    if (this.renderer) {
+      try { const cv = this.renderer.domElement; if (cv) { cv.width = cv.height = 0; if (cv.parentNode) cv.parentNode.removeChild(cv); } } catch (e) { /* gone */ }
+      try { this.renderer.dispose(); } catch (e) { /* already disposed */ }
+      try { if (this.renderer.forceContextLoss) this.renderer.forceContextLoss(); } catch (e) { /* no context */ }
+    }
+    if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root);
+    this.root = null; this.beads = []; this._tmp = this._hv = this.pos = this.hoverGeo = this.boostAttr = null;
   }
 }
