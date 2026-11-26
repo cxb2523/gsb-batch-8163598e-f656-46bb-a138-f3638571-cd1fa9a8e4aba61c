@@ -10,9 +10,14 @@
   "homepage": "https://jazz-soft.net",
   "bugs": "https://jazz-soft.org",
   "license": "MIT",
+  "scripts": {
+    "test": "node tests/run-node.js",
+    "build": "grunt"
+  },
   "devDependencies": {
     "grunt": "^1.6.1",
     "grunt-contrib-uglify": "^5.2.2",
+    "jsdom": "^31.0.1",
     "jzz": "^1.9.3",
     "jzz-synth-tiny": "^1.4.3"
   },

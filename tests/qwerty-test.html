@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Qwerty Hancock / JZZ.input.Qwerty tests</title>
+<style>
+  body { font-family: monospace; margin: 20px; }
+  h1 { font-size: 16px; }
+  #summary { font-weight: bold; margin: 10px 0; }
+  .pass { color: #060; }
+  .fail { color: #c00; font-weight: bold; }
+  .skip { color: #888; }
+  .row { margin: 1px 0; }
+  .detail { color: #c00; margin-left: 8px; }
+  #fixtures { position: absolute; left: -9999px; top: 0; width: 600px; }
+  button { margin: 5px 0; }
+</style>
+<script>
+/* Install the listener tracker BEFORE any library script loads so that
+ * every add/removeEventListener on window/document is counted. */
+(function () {
+    var details = [];
+    function track(target, label) {
+        var add = target.addEventListener,
+            remove = target.removeEventListener;
+        target.addEventListener = function (type, listener, options) {
+            details.push({ target: label, type: type, listener: listener });
+            return add.call(this, type, listener, options);
+        };
+        target.removeEventListener = function (type, listener, options) {
+            for (var i = details.length - 1; i >= 0; i--) {
+                if (details[i].target === label &&
+                    details[i].type === type &&
+                    details[i].listener === listener) {
+                    details.splice(i, 1);
+                    break;
+                }
+            }
+            return remove.call(this, type, listener, options);
+        };
+    }
+    track(window, 'window');
+    track(document, 'document');
+    window.__listenerCount = function (target) {
+        var label = target === window ? 'window'
+                  : target === document ? 'document' : null;
+        if (!label) { return 0; }
+        // Exclude JZZ's own engine-probe listener, which is JZZ's to manage.
+        return details.filter(function (d) {
+            return d.target === label && d.type !== 'jazz-midi-msg';
+        }).length;
+    };
+})();
+</script>
+<script src="../node_modules/jzz/javascript/JZZ.js"></script>
+<script src="../javascript/qwerty-hancock.js"></script>
+<script src="../javascript/JZZ.input.Qwerty.js"></script>
+<script src="scenarios.js"></script>
+</head>
+<body>
+<h1>Qwerty Hancock / JZZ.input.Qwerty behavioural tests</h1>
+<p>
+  The same scenarios as <code>tests/run-node.js</code>, driven by simulated
+  DOM events in a real browser. They open and close real JZZ virtual MIDI
+  ports and inspect the emitted message sequence.
+</p>
+<button id="run">Run tests</button>
+<div id="summary">not run</div>
+<div id="results"></div>
+<!-- Keyboards created by the tests live here, off-screen but rendered. -->
+<div id="fixtures"></div>
+
+<script>
+(function () {
+    var resultsEl = document.getElementById('results'),
+        summaryEl = document.getElementById('summary'),
+        runBtn = document.getElementById('run');
+
+    function render(results) {
+        var failed = results.filter(function (r) { return !r.ok; }),
+            skipped = results.filter(function (r) { return r.skipped; }),
+            html = '';
+
+        results.forEach(function (r) {
+            var cls = r.skipped ? 'skip' : (r.ok ? 'pass' : 'fail'),
+                mark = r.skipped ? 'SKIP' : (r.ok ? 'PASS' : 'FAIL');
+            html += '<div class="row"><span class="' + cls + '">' + mark +
+                '</span> ' + r.name +
+                (r.skipped ? '<span class="detail">' + r.detail + '</span>'
+                           : (r.ok ? '' : '<span class="detail">' + r.detail + '</span>')) +
+                '</div>';
+        });
+        resultsEl.innerHTML = html;
+        summaryEl.className = failed.length ? 'fail' : 'pass';
+        summaryEl.textContent = (results.length - failed.length - skipped.length) +
+            ' passed, ' + skipped.length + ' skipped, ' + failed.length +
+            ' failed (of ' + results.length + ' checks)';
+    }
+
+    function run() {
+        runBtn.disabled = true;
+        summaryEl.textContent = 'running...';
+        resultsEl.innerHTML = '';
+
+        JZZ().and(function () {
+            var harness = {
+                document: document,
+                window: window,
+                QwertyHancock: window.QwertyHancock,
+                JZZ: window.JZZ,
+                wait: function () {
+                    return new Promise(function (resolve) {
+                        setTimeout(resolve, 30);
+                    });
+                },
+                listenerCount: window.__listenerCount
+            };
+
+            window.QwertyHancockTestScenarios(harness).run().then(function (results) {
+                render(results);
+                runBtn.disabled = false;
+                window.__testResults = results; // for console inspection
+            });
+        });
+    }
+
+    runBtn.addEventListener('click', run);
+    window.addEventListener('load', run);
+})();
+</script>
+</body>
+</html>

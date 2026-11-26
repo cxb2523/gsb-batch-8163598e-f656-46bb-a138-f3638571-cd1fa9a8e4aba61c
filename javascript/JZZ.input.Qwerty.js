@@ -1,5 +1,5 @@
 (function() {
-  if (!JZZ) return;
+  if (typeof JZZ === 'undefined' || !JZZ) return;
   if (!JZZ.input) JZZ.input = {};
 
   function _name(name) { return name ? name : 'Qwerty-Hancock'; }
@@ -27,19 +27,41 @@
   }
 
   Engine.prototype._openIn = function(port, name) {
+    var qwerty;
+
     try {
-      var qwerty = new QwertyHancock(this._arg);
-      qwerty.keyDown = function (note, frequency) {
-        port._emit(JZZ.MIDI(0x90, note, 127));
-      };
-      qwerty.keyUp = function (note, frequency) {
-        port._emit(JZZ.MIDI(0x80, note, 127));
-      };
+      qwerty = new QwertyHancock(this._arg);
     }
     catch (e) {
+      // The constructor cleans up after itself on failure, so no
+      // event listeners remain when the port cannot be opened.
       port._crash(e.toString());
+      return;
     }
+
+    // MIDI-layer safety net: even if a stray duplicate callback ever
+    // reaches us, the port emits one Note On per note and one Note Off.
+    var activeNotes = {};
+
+    qwerty.keyDown = function (note /*, frequency */) {
+      if (activeNotes[note]) return;
+      activeNotes[note] = true;
+      port._emit(JZZ.MIDI(0x90, note, 127));
+    };
+    qwerty.keyUp = function (note /*, frequency */) {
+      if (!activeNotes[note]) return;
+      delete activeNotes[note];
+      port._emit(JZZ.MIDI(0x80, note, 127));
+    };
+
     port._info = this._info(name);
+
+    // Closing the port must remove every listener the keyboard added
+    // to window/document and release any notes still being held.
+    port._close = function() {
+      qwerty.destroy();
+    };
+
     port._resume();
   }
 
