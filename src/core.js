@@ -93,6 +93,21 @@ export class AdlMidiCore {
         this._audioBufferPtr = null;
         /** @private @type {number|undefined} */
         this._defaultEmulator = undefined;
+        /**
+         * Number of chips the reservation bookkeeping is currently sized to.
+         * Zero means "not tracked yet" (e.g. instance wired up manually),
+         * in which case the backend count is queried lazily.
+         * @private @type {number}
+         */
+        this._numChips = 0;
+        /**
+         * Per-chip channel reservation masks, indexed by zero-based chipId.
+         * This is the JS-side source of truth for
+         * {@link AdlMidiCore#getReservedChipChannels}; it is kept in sync with
+         * the WASM backend and trimmed whenever the chip count shrinks.
+         * @private @type {number[]}
+         */
+        this._reservedChipChannels = [];
     }
 
     /**
@@ -113,6 +128,11 @@ export class AdlMidiCore {
             throw new Error('Failed to initialize ADL MIDI player');
         }
 
+        // A fresh player has no channel reservations, so reset the bookkeeping
+        // (also covers init() after a previous close()).
+        this._reservedChipChannels = [];
+        this._numChips = this._readBackendChipCount();
+
         if (this._defaultEmulator !== undefined) {
             this._module._adl_switchEmulator(this._player, this._defaultEmulator);
         }
@@ -122,6 +142,10 @@ export class AdlMidiCore {
 
     /**
      * Close the synthesizer and free resources.
+     *
+     * Also drops all chip-channel reservation records. Reservation calls
+     * after close() throw the same "not initialized" error as every other
+     * player-backed method until {@link init} is called again.
      */
     close() {
         if (this._audioBufferPtr) {
@@ -134,6 +158,10 @@ export class AdlMidiCore {
             this._module._adl_close(this._player);
             this._player = null;
         }
+
+        // Never leave masks indexed against a freed/replaced player.
+        this._reservedChipChannels = [];
+        this._numChips = 0;
     }
 
     /**
@@ -225,12 +253,47 @@ export class AdlMidiCore {
     /**
      * Set the number of emulated OPL3 chips.
      *
+     * On success, reservation masks for chips at or above the new count are
+     * discarded and the surviving masks are re-applied to the backend, so
+     * channels that remain reserved keep blocking the MIDI voice allocator
+     * after the chips are rebuilt. On failure (e.g. an out-of-range count)
+     * the existing reservation state is left untouched.
+     *
      * @param {number} count - Number of chips (1-100)
      * @returns {boolean} True if successful
      */
     setNumChips(count) {
         this._ensurePlayer();
-        return this._module._adl_setNumChips(this._player, count) === 0;
+        const succeeded = this._module._adl_setNumChips(this._player, count) === 0;
+        if (!succeeded) {
+            // Do not touch _numChips / _reservedChipChannels: a failed call
+            // must leave the reservation invariant exactly as it was.
+            return false;
+        }
+
+        const newCount = Math.max(0, Math.trunc(Number(count)));
+        this._numChips = newCount;
+
+        // Drop masks that now point at non-existent chips.
+        if (this._reservedChipChannels.length > newCount) {
+            this._reservedChipChannels.length = newCount;
+        }
+
+        // Re-apply surviving masks: the backend rebuilds its chips when the
+        // count changes, and custom/older backends may not preserve them.
+        // Only replay entries the caller actually set (skip sparse holes).
+        for (let chipId = 0; chipId < this._reservedChipChannels.length; chipId++) {
+            if (!Object.prototype.hasOwnProperty.call(this._reservedChipChannels, chipId)) {
+                continue;
+            }
+            this._module._adl_reserveChipChannels(
+                this._player,
+                chipId,
+                this._reservedChipChannels[chipId]
+            );
+        }
+
+        return true;
     }
 
     /**
@@ -635,32 +698,54 @@ export class AdlMidiCore {
      * Reserve chip channels so the MIDI voice allocator will not use them.
      *
      * After reservation, use {@link rawOPL3} to drive those channels
-     * directly. Pass channelMask = 0 to release all reservations.
+     * directly. Pass channelMask = 0 to release all reservations for a chip.
+     *
+     * The mask is tracked by AdlMidiCore itself so it stays consistent with
+     * the current chip count across {@link setNumChips} and close/init
+     * cycles.
      *
      * @param {number} chipId - Zero-based chip index (0 to getNumChipsObtained()-1)
      * @param {number} channelMask - Bitmask of per-chip channels to reserve
      *   (bits 0-22, where bit N reserves per-chip channel N)
-     * @returns {boolean} True on success
-     * @throws {Error} If the device is invalid
+     * @returns {boolean} True on success; false if chipId is out of range or
+     *   the backend rejected the request. Never throws for an invalid chipId.
      */
     reserveChipChannels(chipId, channelMask) {
         this._ensurePlayer();
-        const result = this._module._adl_reserveChipChannels(this._player, chipId, channelMask);
-        if (result === -1) {
-            throw new Error('Invalid device');
+
+        if (!this._isValidChipId(chipId)) {
+            return false;
         }
-        return result === 0;
+
+        const result = this._module._adl_reserveChipChannels(this._player, chipId, channelMask);
+        if (result !== 0) {
+            return false;
+        }
+
+        this._reservedChipChannels[chipId] = channelMask >>> 0;
+        return true;
     }
 
     /**
      * Read back the chip-channel reservation mask.
      *
+     * Reads the state tracked by AdlMidiCore, which is kept in sync with the
+     * backend and trimmed after {@link setNumChips}.
+     *
      * @param {number} chipId - Zero-based chip index
-     * @returns {number} Reservation bitmask (0 if invalid chipId)
+     * @returns {number} Reservation bitmask (0 if chipId is out of range or
+     *   the chip has no reservations)
      */
     getReservedChipChannels(chipId) {
         this._ensurePlayer();
-        return this._module._adl_getReservedChipChannels(this._player, chipId);
+
+        if (!this._isValidChipId(chipId)) {
+            return 0;
+        }
+
+        // AdlMidiCore's own record is the source of truth; it is kept in
+        // sync with the backend by reserveChipChannels()/setNumChips().
+        return /** @type {number} */ (this._reservedChipChannels[chipId]) >>> 0;
     }
 
     /**
@@ -1280,6 +1365,83 @@ export class AdlMidiCore {
         if (!this._player) {
             throw new Error('Synthesizer not initialized - call init() first');
         }
+    }
+
+    /**
+     * Determine whether a chip index is valid for the current chip count.
+     *
+     * Never calls into the backend before {@link _ensurePlayer} has run;
+     * callers are expected to invoke that first.
+     *
+     * @param {number} chipId
+     * @returns {boolean}
+     * @private
+     */
+    _isValidChipId(chipId) {
+        if (typeof chipId !== 'number' || !Number.isInteger(chipId) || chipId < 0) {
+            return false;
+        }
+        return chipId < this._getChipCount();
+    }
+
+    /**
+     * Chip count to use for reservation bounds.
+     *
+     * Prefers the count committed by init()/a successful setNumChips(). For
+     * instances wired up manually (no init() bookkeeping), queries the
+     * backend and finally falls back to the libADLMIDI hard maximum
+     * (`ADL_MAX_CHIPS`, 100 on non-hardware builds) so legitimate low chip
+     * ids are not rejected merely because the count is untracked.
+     *
+     * @returns {number}
+     * @private
+     */
+    _getChipCount() {
+        if (this._numChips > 0) {
+            return this._numChips;
+        }
+
+        const backendCount = this._readBackendChipCount();
+        if (backendCount > 0) {
+            this._numChips = backendCount;
+            return backendCount;
+        }
+
+        return 100;
+    }
+
+    /**
+     * Read the active chip count from the backend without throwing when the
+     * count bindings are missing or a custom/mock backend rejects them.
+     *
+     * @returns {number} Positive chip count, or 0 if it cannot be determined.
+     * @private
+     */
+    _readBackendChipCount() {
+        if (!this._module || !this._player) {
+            return 0;
+        }
+
+        try {
+            if (typeof this._module._adl_getNumChipsObtained === 'function') {
+                const obtained = this._module._adl_getNumChipsObtained(this._player);
+                if (Number.isInteger(obtained) && obtained > 0) {
+                    return /** @type {number} */ (obtained);
+                }
+            }
+
+            if (typeof this._module._adl_getNumChips === 'function') {
+                const requested = this._module._adl_getNumChips(this._player);
+                if (Number.isInteger(requested) && requested > 0) {
+                    return /** @type {number} */ (requested);
+                }
+            }
+        } catch {
+            // Custom backends/mocks may not implement the count getters;
+            // callers fall back to a safe default.
+        }
+
+        return 0;
     }
 }
 
