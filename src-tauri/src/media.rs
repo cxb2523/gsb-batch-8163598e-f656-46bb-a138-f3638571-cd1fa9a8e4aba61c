@@ -296,7 +296,10 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
     map_uri_attributes(line, |uri| absolutize(base, uri))
 }
 
-/// 清空封面 / 播放列表 / 分片内存缓存
+/// 清空封面 / 播放列表 / 分片内存缓存，同时失效播放预取条目。
+///
+/// 已经返回给播放器的签名地址是前端持有的独立字符串，不受这里影响；
+/// 只保证清理后不会再从预取缓存拿到旧地址。
 pub fn clear_caches() {
     if let Ok(mut g) = IMG_CACHE.lock() {
         g.clear();
@@ -307,6 +310,7 @@ pub fn clear_caches() {
     if let Ok(mut g) = SEG_CACHE.lock() {
         g.clear();
     }
+    crate::playback::invalidate();
 }
 
 fn is_playlist_payload(ctype: Option<&str>, bytes: &[u8]) -> bool {
@@ -655,6 +659,8 @@ mod tests {
 
     #[test]
     fn segment_cache_stores_small_segments_and_clears_cleanly() {
+        // clear_caches 会抬升播放预取代次，与播放模块用例互斥执行。
+        let _lock = crate::playback::test_lock();
         clear_caches();
         let entry = Arc::new(CachedSegment {
             ctype: "video/mp2t".to_string(),

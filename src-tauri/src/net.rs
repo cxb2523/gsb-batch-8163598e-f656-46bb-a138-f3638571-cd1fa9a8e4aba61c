@@ -106,6 +106,8 @@ pub fn set_base(url: &str) -> Result<String, String> {
     if let Some(path) = BASE_FILE.read().ok().and_then(|p| p.clone()) {
         let _ = std::fs::write(path, json!({ "base": next }).to_string());
     }
+    // 线路变化后旧线路的预取签名地址与在途响应一律失效。
+    crate::playback::invalidate();
     Ok(next)
 }
 

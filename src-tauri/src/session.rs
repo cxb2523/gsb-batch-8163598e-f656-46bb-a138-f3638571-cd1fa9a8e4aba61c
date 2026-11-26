@@ -22,6 +22,8 @@ mod tests {
 
     #[test]
     fn credentials_are_bound_to_origin() {
+        // set/clear 会抬升播放预取代次，与播放模块用例互斥执行。
+        let _lock = crate::playback::test_lock();
         let store = SessionStore::new();
         store.set(
             "https://huangguoai.com",
@@ -94,6 +96,8 @@ impl SessionStore {
             cur.token = token;
             cur.user = user;
         }
+        // 账号变化后，旧令牌预取的签名地址一律失效，防止跨账号命中。
+        crate::playback::invalidate();
         self.persist();
     }
 
@@ -104,6 +108,8 @@ impl SessionStore {
             cur.origin.clear();
             cur.user = serde_json::Value::Null;
         }
+        // 退出登录 / 切换线路清空会话后，登录态预取条目不得继续可用。
+        crate::playback::invalidate();
         self.persist();
     }
 
