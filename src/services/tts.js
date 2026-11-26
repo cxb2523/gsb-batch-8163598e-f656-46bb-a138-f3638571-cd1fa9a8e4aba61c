@@ -11,7 +11,70 @@ let tokenInfo = {
     expiredAt: null
 };
 
-// 获取 Microsoft TTS Endpoint
+// 正在进行的 endpoint 刷新 Promise（单飞模式，保证并发下只刷新一次）
+let endpointRefreshPromise = null;
+
+// 根据输出格式推断音频的 MIME 类型
+export function getAudioContentType(outputFormat) {
+    const format = String(outputFormat || '').toLowerCase();
+
+    if (format.includes('mp3') || format.includes('mpeg')) {
+        return 'audio/mpeg';
+    }
+    if (format.includes('wav') || format.includes('riff') || format.includes('pcm')) {
+        return 'audio/wav';
+    }
+    // webm 格式名中包含 opus（如 webm-24khz-16bit-mono-opus），需先于 ogg 判断
+    if (format.includes('webm')) {
+        return 'audio/webm';
+    }
+    if (format.includes('ogg') || format.includes('opus')) {
+        return 'audio/ogg';
+    }
+
+    // 默认按 mp3 处理
+    return 'audio/mpeg';
+}
+
+// 实际执行 endpoint 刷新
+async function refreshEndpoint() {
+    const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
+    const clientId = crypto.randomUUID().replace(/-/g, "");
+
+    const response = await fetch(endpointUrl, {
+        method: "POST",
+        headers: {
+            "Accept-Language": "zh-Hans",
+            "X-ClientVersion": "4.0.530a 5fe1dc6c",
+            "X-UserId": "0f04d16a175c411e",
+            "X-HomeGeographicRegion": "zh-Hans-CN",
+            "X-ClientTraceId": clientId,
+            "X-MT-Signature": await sign(endpointUrl),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": "0",
+            "Accept-Encoding": "gzip"
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`获取endpoint失败: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const jwt = data.t.split(".")[1];
+    const decodedJwt = JSON.parse(atob(jwt));
+
+    tokenInfo = {
+        endpoint: data,
+        token: data.t,
+        expiredAt: decodedJwt.exp
+    };
+
+    return data;
+}
+
+// 获取 Microsoft TTS Endpoint（并发安全：多个调用共享同一次刷新）
 export async function getEndpoint() {
     const now = Date.now() / 1000;
 
@@ -19,51 +82,27 @@ export async function getEndpoint() {
         return tokenInfo.endpoint;
     }
 
-    // 获取新token
-    const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
-    const clientId = crypto.randomUUID().replace(/-/g, "");
+    // 单飞：已有刷新在进行时复用同一个 Promise，避免并发重复刷新
+    if (!endpointRefreshPromise) {
+        endpointRefreshPromise = refreshEndpoint().finally(() => {
+            endpointRefreshPromise = null;
+        });
+    }
 
     try {
-        const response = await fetch(endpointUrl, {
-            method: "POST",
-            headers: {
-                "Accept-Language": "zh-Hans",
-                "X-ClientVersion": "4.0.530a 5fe1dc6c",
-                "X-UserId": "0f04d16a175c411e",
-                "X-HomeGeographicRegion": "zh-Hans-CN",
-                "X-ClientTraceId": clientId,
-                "X-MT-Signature": await sign(endpointUrl),
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
-                "Content-Type": "application/json; charset=utf-8",
-                "Content-Length": "0",
-                "Accept-Encoding": "gzip"
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`获取endpoint失败: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const jwt = data.t.split(".")[1];
-        const decodedJwt = JSON.parse(atob(jwt));
-
-        tokenInfo = {
-            endpoint: data,
-            token: data.t,
-            expiredAt: decodedJwt.exp
-        };
-
-        return data;
-
+        return await endpointRefreshPromise;
     } catch (error) {
         console.error("获取endpoint失败:", error);
-        // 如果有缓存的token，即使过期也尝试使用
+        // 如果有缓存的token，即使过期也降级使用；
+        // 注意：不更新缓存的过期时间，后续请求仍会再次尝试刷新
         if (tokenInfo.token) {
             console.log("使用过期的缓存token");
             return tokenInfo.endpoint;
         }
-        throw error;
+        // 无缓存可用，标记为可重试错误并向上抛出
+        const retryableError = new Error(`获取endpoint失败: ${error.message}`);
+        retryableError.retryable = true;
+        throw retryableError;
     }
 }
 
@@ -138,8 +177,8 @@ export async function getAudioChunk(text, voiceName, rate, pitch, volume, style,
                 throw new Error(`音频生成失败（已重试${maxRetries}次）: ${error.message}`);
             }
 
-            // 如果是网络错误或其他可重试错误
-            if (error.message.includes('fetch') || error.message.includes('network')) {
+            // 如果是网络错误、endpoint 刷新失败或其他可重试错误
+            if (error.retryable || error.message.includes('fetch') || error.message.includes('network')) {
                 console.log(`网络错误，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
                 await delay(retryDelay * (attempt + 1));
                 continue;
@@ -201,7 +240,7 @@ export async function getVoice(text, voiceName, rate, pitch, volume, style, outp
             const audioBlob = await getAudioChunk(cleanText, voiceName, rate, pitch, volume, style, outputFormat);
             return new Response(audioBlob, {
                 headers: {
-                    "Content-Type": "audio/mpeg",
+                    "Content-Type": getAudioContentType(outputFormat),
                     ...makeCORSHeaders()
                 }
             });
@@ -230,11 +269,12 @@ export async function getVoice(text, voiceName, rate, pitch, volume, style, outp
             BATCH_DELAY_MS
         );
 
-        // 将音频片段拼接起来
-        const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
+        // 将音频片段拼接起来，Blob 类型与响应头保持一致
+        const contentType = getAudioContentType(outputFormat);
+        const concatenatedAudio = new Blob(audioChunks, { type: contentType });
         return new Response(concatenatedAudio, {
             headers: {
-                "Content-Type": "audio/mpeg",
+                "Content-Type": contentType,
                 ...makeCORSHeaders()
             }
         });
