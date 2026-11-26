@@ -4,9 +4,11 @@ content.system.stages = (() => {
     mix = 0
 
   return {
-    ceiling: () => ceiling,
-    floor: () => floor,
+    ceiling: () => (ceiling && !ceiling.destroyed) ? ceiling : null,
+    floor: () => (floor && !floor.destroyed) ? floor : null,
     reset: function () {
+      // Stages may already have been destroyed by a global prop reset, so
+      // destroy() must be idempotent.
       if (ceiling) {
         ceiling.destroy()
       }
@@ -17,6 +19,7 @@ content.system.stages = (() => {
 
       ceiling = null
       floor = null
+      mix = 0
 
       return this
     },
@@ -27,24 +30,30 @@ content.system.stages = (() => {
       const ceilingT = ti + 1,
         floorT = ti
 
-      if (!ceiling) {
-        ceiling = content.system.stages.stage.create(ceilingT)
+      // Reuse the stages already sitting on the target boundaries and retire the
+      // rest. Large jumps therefore create at most two stages rather than one
+      // for every skipped second, and a stage is only ever generated once.
+      const previous = [floor, ceiling].filter((stage, index, stages) => stage && !stage.destroyed && stages.indexOf(stage) === index)
+
+      floor = null
+      ceiling = null
+
+      for (const stage of previous) {
+        if (!floor && stage.t === floorT) {
+          floor = stage
+        } else if (!ceiling && stage.t === ceilingT) {
+          ceiling = stage
+        } else {
+          stage.destroy()
+        }
       }
 
       if (!floor) {
         floor = content.system.stages.stage.create(floorT)
       }
 
-      if (ceiling.t < ceilingT) {
-        floor.destroy()
-        floor = ceiling
+      if (!ceiling) {
         ceiling = content.system.stages.stage.create(ceilingT)
-      }
-
-      if (floor.t > floorT) {
-        ceiling.destroy()
-        ceiling = floor
-        floor = content.system.stages.stage.create(floorT)
       }
 
       mix = engine.utility.scale(t, floorT, ceilingT, 0, 1)
