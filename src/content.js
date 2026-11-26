@@ -93,6 +93,14 @@
     attaching: false,
     gestureBusy: false,
     lastUI: {},
+    // 每次“稿件上下文 / 信号源”切换都会 +1。旧代际迟到的响度消息一律丢弃，
+    // 防止旧源的测量把新视频已经命中的缓存增益再改回去。
+    generation: 0,
+    switchCount: 0,
+    // 最近一次达到缓存质量要求的测量，连同它产生时所属的上下文信息一起保存。
+    // 切换后再写缓存时必须写回这个 info 对应的旧 BV / UP 键，而不是当前 contextInfo。
+    pendingCacheWrite: null,
+    lastFlushPromise: null,
   };
 
   // ---------------------------------------------------------------------------
@@ -477,6 +485,22 @@
     if (state.els.status.dataset.tone !== tone) state.els.status.dataset.tone = tone;
   }
 
+  /**
+   * 测试模式下把关键切换事件追加到页面预置的 window.__bvbTimeline，
+   * 方便本地测试页 / CDP 脚本核对切换、缓存写入与迟到消息丢弃的顺序。
+   * 扩展正式环境（IS_TEST=false）不会写入。
+   */
+  function pushTimeline(entry) {
+    if (!IS_TEST) return;
+    try {
+      if (Array.isArray(window.__bvbTimeline)) {
+        window.__bvbTimeline.push({ at: Date.now(), ...entry });
+      }
+    } catch {
+      // 时间线仅用于测试，任何异常都不影响主逻辑
+    }
+  }
+
   function gainFor(lufs) {
     return Math.max(MIN_GAIN_DB, Math.min(MAX_GAIN_DB, state.targetLufs - lufs));
   }
@@ -508,14 +532,23 @@
     const m = state.meterData;
     const video = state.video;
     const blocks = m && Number.isFinite(m.blocks) ? m.blocks : 0;
-    const measured = m && Number.isFinite(m.integrated)
+    let measured = m && Number.isFinite(m.integrated)
       ? volumeCompensatedLufs(m.integrated)
       : (m && Number.isFinite(m.shortTerm) ? volumeCompensatedLufs(m.shortTerm) : null);
 
+    // 刚切换完、新测量还没出来时，面板参考值显示当前稿件命中的缓存值，
+    // 而不是留空或残留上一条视频的读数。
+    let referenceIsCache = false;
+    if (measured == null && state.cachedLufs != null) {
+      measured = state.cachedLufs;
+      referenceIsCache = true;
+    }
+
     const lufsText = measured == null ? '--' : measured.toFixed(1);
-    const lufsKey = `${lufsText}`;
+    const lufsKey = `${lufsText}${referenceIsCache ? ':cache' : ':live'}`;
     if (force || state.lastUI.lufs !== lufsKey) {
       state.els.lufsValue.textContent = lufsText;
+      state.els.lufsValue.dataset.source = referenceIsCache ? 'cache' : 'live';
       state.lastUI.lufs = lufsKey;
     }
 
@@ -549,6 +582,9 @@
     } else if (blocks > 0) {
       status = `测量中 · ${(0.4 + blocks * 0.1).toFixed(1)} 秒`;
       tone = 'warn';
+    } else if (state.usingCache && state.cachedLufs != null) {
+      status = `已套用历史校准 ${state.cachedLufs.toFixed(1)} LUFS`;
+      tone = 'active';
     } else {
       status = '准备测量…';
     }
@@ -633,8 +669,10 @@
     }
   }
 
-  async function writeCache(lufs) {
-    const info = state.contextInfo;
+  async function writeCache(lufs, ownerInfo) {
+    // 必须允许调用方显式指定归属上下文：切换稿件后 state.contextInfo 已经是新视频，
+    // 但旧视频迟到的归档写入仍要落在旧的 v:/u: 键下。
+    const info = ownerInfo || state.contextInfo;
     if (!info || !Number.isFinite(lufs)) return;
     const now = Date.now();
     const value = {
@@ -648,6 +686,7 @@
     for (const key of keys) state.cache[key] = value;
     pruneCache();
     state.lastCacheWriteAt = now;
+    pushTimeline({ type: 'cache-write', keys: keys.slice(), lufs: value.lufs });
     await storage.set('loudnessCache', state.cache);
   }
 
@@ -655,7 +694,44 @@
     if (!Number.isFinite(lufs)) return;
     const now = Date.now();
     if (now - state.lastCacheWriteAt < 8000) return;
-    writeCache(lufs).catch(() => {});
+    // 用测量产生时记录的上下文归属，避免切换后写进新稿件的键。
+    const ownerInfo = state.pendingCacheWrite && state.pendingCacheWrite.info;
+    writeCache(lufs, ownerInfo || state.contextInfo).catch(() => {});
+  }
+
+  /**
+   * 把“上一条稿件”最近一次稳定测量归档到它自己的 v:/u: 键下。
+   *
+   * 关键：同步取出归属 info 并同步触发 writeCache（async 函数在第一个 await
+   * 之前会同步完成 state.cache 的写入），所以调用方可以在本函数返回后立刻
+   * 替换 state.contextInfo，而不会让归属串到新稿件上。
+   */
+  function flushMeasurementToCache() {
+    const owned = state.pendingCacheWrite;
+    let lufs = null;
+    let info = null;
+
+    if (owned && Number.isFinite(owned.lufs) && owned.info) {
+      lufs = owned.lufs;
+      info = owned.info;
+    } else {
+      info = state.contextInfo;
+      const m = state.meterData;
+      if (m && Number.isFinite(m.integrated)) {
+        lufs = volumeCompensatedLufs(m.integrated);
+      } else if (Number.isFinite(state.lastStableLufs)) {
+        lufs = volumeCompensatedLufs(state.lastStableLufs);
+      }
+    }
+
+    if (!info || !Number.isFinite(lufs)) return Promise.resolve();
+    const writePromise = writeCache(lufs, info).catch((error) => {
+      console.warn(LOG_PREFIX, '切换归档缓存失败', error);
+    });
+    state.lastFlushPromise = writePromise;
+    // 新上下文的自动写入节流重新计时，不被旧稿件的归档时间戳压住。
+    state.lastCacheWriteAt = 0;
+    return writePromise;
   }
 
   // ---------------------------------------------------------------------------
@@ -729,6 +805,8 @@
     if (!video || video.__bvbBound) return;
     video.__bvbBound = true;
     video.addEventListener('play', () => {
+      // 站内换源后同一个元素再次 play：先跑统一的换源对齐，再确认音频图。
+      notePossibleSourceChange(video, 'play');
       ensureContext().then((ok) => {
         if (ok) attach(video);
       }).catch(() => {});
@@ -754,8 +832,13 @@
       }, 250);
       updateUI(true);
     });
+    // currentSrc 的更新时机在不同内核上略有差异，loadstart / loadedmetadata
+    // 都走同一个去重后的换源入口，和 500 ms tick 完全等价。
+    video.addEventListener('loadstart', () => {
+      notePossibleSourceChange(video, 'loadstart');
+    });
     video.addEventListener('loadedmetadata', () => {
-      state.currentSrc = video.currentSrc;
+      notePossibleSourceChange(video, 'loadedmetadata');
       updateUI(true);
     });
   }
@@ -964,10 +1047,28 @@
           blocks: state.fallbackBlocks,
           peak,
           fallback: true,
-        });
+        }, state.generation);
       }
     }, 100);
     return true;
+  }
+
+  /**
+   * 用当前 state.generation 重新绑定测量端口。
+   * 同一个 <video> 换源时不会重建 AudioWorklet 图，靠递增代际 + 重绑闭包
+   * 让切换前已经在事件队列里 / 旧闭包上的 loudness 消息失效。
+   */
+  function rebindMeterPort() {
+    const port = state.meterPort;
+    if (!port) return;
+    const token = state.generation;
+    port.onmessage = (event) => {
+      if (token !== state.generation) {
+        pushTimeline({ type: 'meter-stale-drop', token, generation: state.generation });
+        return;
+      }
+      handleMeter(event.data, token);
+    };
   }
 
   async function setupMeter(source) {
@@ -981,7 +1082,6 @@
         channelCountMode: 'explicit',
         channelInterpretation: 'speakers',
       });
-      node.port.onmessage = (event) => handleMeter(event.data);
       source.connect(node);
 
       const silent = state.ctx.createGain();
@@ -993,6 +1093,9 @@
       state.meterPort = node.port;
       state.silentNode = silent;
       state.unsupportedReason = '';
+      // 用当前代际绑定 onmessage；切换稿件时 alignPlaybackContext 会重新绑定，
+      // 旧闭包收到的迟到消息会因 token 过期而被丢弃。
+      rebindMeterPort();
       return true;
     } catch (error) {
       console.warn(LOG_PREFIX, 'AudioWorklet 不可用，改用兼容模式', error);
@@ -1013,6 +1116,9 @@
       return;
     }
     if (state.source && state.gain && state.attachedVideo === video) return;
+
+    // 换到另一个 video 元素前，先把旧元素的测量归档到旧上下文键下。
+    flushMeasurementToCache();
 
     state.attaching = true;
     try {
@@ -1052,22 +1158,9 @@
         return;
       }
 
-      state.lastCacheBlocks = 0;
-      state.usingCache = '';
-      state.cachedLufs = null;
-      const cached = lookupCache();
-      if (cached) {
-        state.cachedLufs = cached.lufs;
-        state.usingCache = cached.key.startsWith('u:') ? 'up' : 'video';
-        if (state.enabled) applyGain(gainFor(cached.lufs), true);
-      } else if (state.enabled) {
-        applyGain(0, true);
-      } else {
-        applyGain(0, true);
-      }
-      resetMeter(true);
-      state.status = 'measuring';
-      updateUI(true);
+      // 与“同一元素换源 / URL 上下文变化”走完全相同的对齐路径：
+      // 递增代际、重置测量、按新 BV/UP 命中缓存、归零或施加增益、刷新面板。
+      alignPlaybackContext(state.contextInfo || readContext(), video, 'attach');
     } finally {
       state.attaching = false;
     }
@@ -1077,13 +1170,47 @@
   // 测量结果与增益控制
   // ---------------------------------------------------------------------------
 
-  function handleMeter(message) {
+  function handleMeter(message, token = state.generation) {
     if (!message || message.type !== 'loudness') return;
+    // 代际守卫：切换稿件后，旧源迟到的 loudness 消息在这里被彻底丢弃，
+    // 既不能改增益，也不能写缓存或面板读数。
+    if (token !== state.generation) {
+      pushTimeline({
+        type: 'meter-stale-drop',
+        reason: 'token',
+        token,
+        generation: state.generation,
+        blocks: Number.isFinite(message.blocks) ? message.blocks : null,
+      });
+      return;
+    }
+    // Worklet 代际栅栏：切换前已排队、切换后才派发到新闭包上的旧报告仍带旧 epoch。
+    // 测试注入的合成消息可以不带 epoch（只受 token 守卫约束）。
+    if (Number.isFinite(message.epoch) && message.epoch !== state.generation) {
+      pushTimeline({
+        type: 'meter-stale-drop',
+        reason: 'epoch',
+        epoch: message.epoch,
+        generation: state.generation,
+        blocks: Number.isFinite(message.blocks) ? message.blocks : null,
+      });
+      return;
+    }
     if (!Number.isFinite(message.blocks)) return;
     state.meterData = message;
 
     if (message.blocks >= 25 && Number.isFinite(message.integrated)) {
       state.lastStableLufs = message.integrated;
+    }
+
+    if (Number.isFinite(message.integrated)) {
+      // 记录测量产生时的上下文归属；切换后归档旧测量要用旧 info 写旧键。
+      state.pendingCacheWrite = {
+        lufs: volumeCompensatedLufs(message.integrated),
+        info: state.contextInfo,
+        generation: state.generation,
+        blocks: message.blocks,
+      };
     }
 
     maybeAdapt(message);
@@ -1174,7 +1301,7 @@
       state.fallbackLufs = null;
     }
     if (sendToWorklet && state.meterPort) {
-      try { state.meterPort.postMessage({ type: 'reset' }); } catch {}
+      try { state.meterPort.postMessage({ type: 'reset', epoch: state.generation }); } catch {}
     }
   }
 
@@ -1182,32 +1309,151 @@
   // 导航与生命周期
   // ---------------------------------------------------------------------------
 
-  async function onNewContext(info) {
-    state.contextInfo = info;
-    state.key = info.key;
+  /**
+   * 清掉“重新测量”按钮留下的瞬时状态，避免上一条视频的 1.5 s 强制中性窗口
+   * 和延时 reapply 跑到新视频上。
+   */
+  function clearManualResetTransient() {
+    if (ensurePanel.resetTimer) {
+      clearTimeout(ensurePanel.resetTimer);
+      ensurePanel.resetTimer = null;
+    }
+    state.forceNeutralUntil = 0;
+    state.lastAdaptAt = 0;
+  }
+
+  /**
+   * 统一的上下文切换对齐路径。
+   *
+   * 三种真实触发最终都汇聚到这里，保证行为完全一致：
+   *   1. tick 发现 URL 中的 BV / 页面 UP 主变化（onNewContext）；
+   *   2. 同一个 <video> 元素的 currentSrc 变化（B 站站内换稿最常见）；
+   *   3. tick 找到另一个 <video> 元素后调用 attach，attach 尾部也调用本函数。
+   *
+   * 旧测量的缓存归档由调用方在替换 contextInfo 之前调用
+   * flushMeasurementToCache() 完成；本函数只负责新上下文的对齐：
+   * 递增代际作废迟到消息 → 清空测量/面板 → 命中 v:/u: 缓存并立即施加增益，
+   * 没有缓存则增益归零。
+   */
+  function alignPlaybackContext(info, video, reason) {
+    state.generation += 1;
+    state.switchCount += 1;
+    if (info) {
+      state.contextInfo = info;
+      state.key = info.key;
+    }
+    if (video) state.video = video;
+
+    clearManualResetTransient();
+    if (state.volumeTimer) {
+      clearTimeout(state.volumeTimer);
+      state.volumeTimer = null;
+    }
+    state.volumeChanging = false;
+
     state.usingCache = '';
     state.cachedLufs = null;
     state.lastCacheBlocks = 0;
     resetMeter(true);
+    rebindMeterPort();
 
-    const cached = lookupCache(info);
+    const resolvedInfo = info || state.contextInfo;
+    const cached = lookupCache(resolvedInfo);
     if (cached) {
       state.cachedLufs = cached.lufs;
       state.usingCache = cached.key.startsWith('u:') ? 'up' : 'video';
-      if (state.enabled && state.gain) applyGain(gainFor(cached.lufs), true);
-    } else if (state.gain && state.enabled) {
-      applyGain(0, true);
     }
+
+    if (state.gain && state.ctx) {
+      if (cached && state.enabled) {
+        applyGain(gainFor(cached.lufs), true);
+      } else {
+        // 无缓存、扩展关闭：一律回到 0 dB，绝不沿用旧视频增益。
+        applyGain(0, true);
+      }
+    } else {
+      // 音频图尚未建立（还没有用户手势），调试读数也应反映中性增益。
+      state.appliedDb = 0;
+    }
+
+    state.status = 'measuring';
+    pushTimeline({
+      type: 'context-align',
+      reason: reason || '',
+      bv: resolvedInfo && resolvedInfo.bv,
+      mid: resolvedInfo && resolvedInfo.mid,
+      cacheKey: cached ? cached.key : '',
+      usingCache: state.usingCache,
+      appliedDb: state.appliedDb,
+      generation: state.generation,
+    });
+    updateUI(true);
+    return cached;
+  }
+
+  function onNewContext(info) {
+    // 必须先按旧 contextInfo 归档旧测量：flush 的同步前缀就会捕获归属 info
+    // 并完成 state.cache 写入，随后 align 才替换 contextInfo。
+    const writePromise = flushMeasurementToCache();
+    alignPlaybackContext(info, state.video, 'context');
+    return writePromise;
+  }
+
+  /** currentSrc 确实变化时：重新读 BV/UP、归档旧源、走统一对齐。 */
+  function handleSourceChanged(video, reason) {
+    const info = readContext();
+    const writePromise = flushMeasurementToCache();
+    alignPlaybackContext(info, video, reason || 'source');
+    return writePromise;
+  }
+
+  /**
+   * 所有可能发现“同一 video 换源”的入口（tick / loadstart / loadedmetadata /
+   * play）都调用这里。用 state.currentSrc 去重，保证一次换源只对齐一次。
+   */
+  function notePossibleSourceChange(video, reason) {
+    if (!video) return null;
+    const src = video.currentSrc || video.src || '';
+    if (!src) return null;
+    if (!state.currentSrc) {
+      state.currentSrc = src;
+      return null;
+    }
+    if (src === state.currentSrc) return null;
+    state.currentSrc = src;
+    return handleSourceChanged(video, reason);
+  }
+
+  /**
+   * UP 主的 mid 往往比 BV / 播放器更晚渲染出来。切换瞬间可能只按 v: 未命中、
+   * 也没有 mid 可查 u:；当 tick 发现 mid 新出现时，若还没进入实测自适应，
+   * 用完整 info 再命中一次缓存并立即施加增益。
+   */
+  function maybeApplyLateUpCache(info, previousMid) {
+    if (!info || !info.mid || info.mid === previousMid) return;
+    if (state.usingCache) return;
+    const blocks = state.meterData && Number.isFinite(state.meterData.blocks)
+      ? state.meterData.blocks
+      : 0;
+    if (blocks >= 25) return;
+    const cached = lookupCache(info);
+    if (!cached) return;
+    state.cachedLufs = cached.lufs;
+    state.usingCache = cached.key.startsWith('u:') ? 'up' : 'video';
+    if (state.enabled && state.gain) applyGain(gainFor(cached.lufs), true);
     updateUI(true);
   }
 
   async function tick() {
     ensurePanel();
     const info = readContext();
-    if (info.key !== state.key) {
+    const contextKeyChanged = info.key !== state.key;
+    if (contextKeyChanged) {
       await onNewContext(info);
     } else if (info.mid || info.upName) {
+      const previousMid = state.contextInfo ? state.contextInfo.mid : '';
       state.contextInfo = info;
+      maybeApplyLateUpCache(info, previousMid);
     }
 
     const video = findMainVideo();
@@ -1225,22 +1471,36 @@
     }
 
     bindVideo(video);
-    if (video !== state.video) {
+
+    const elementChanged = video !== state.video;
+    if (elementChanged) {
       state.video = video;
-      state.currentSrc = video.currentSrc;
+      state.currentSrc = video.currentSrc || '';
     }
+
     if (state.ctx && state.ctx.state === 'running' && state.attachedVideo !== video) {
       await attach(video);
-    } else if (video.currentSrc && state.currentSrc && video.currentSrc !== state.currentSrc) {
-      state.currentSrc = video.currentSrc;
-      resetMeter(true);
-      state.lastCacheBlocks = 0;
-      const cached = lookupCache();
-      if (cached && state.enabled) {
-        state.cachedLufs = cached.lufs;
-        state.usingCache = cached.key.startsWith('u:') ? 'up' : 'video';
-        applyGain(gainFor(cached.lufs), true);
+      updateUI();
+      return;
+    }
+
+    if (!elementChanged) {
+      const src = video.currentSrc || '';
+      const srcChanged = Boolean(src && state.currentSrc && src !== state.currentSrc);
+      if (srcChanged) {
+        state.currentSrc = src;
+        if (!contextKeyChanged) {
+          // URL 上下文没有在本 tick 刚对齐过，这里补走完整的换源对齐；
+          // 若 contextKeyChanged，顶部 onNewContext 已用同一份最新 info
+          // 走过统一路径，避免一次切换重复递增代际。
+          await handleSourceChanged(video, 'tick');
+        }
+      } else if (src && !state.currentSrc) {
+        state.currentSrc = src;
       }
+    } else {
+      const src = video.currentSrc || '';
+      if (src && src !== state.currentSrc) state.currentSrc = src;
     }
     updateUI();
   }
@@ -1280,9 +1540,8 @@
     });
     document.addEventListener('fullscreenchange', placePanel);
     window.addEventListener('pagehide', () => {
-      if (state.meterData && Number.isFinite(state.meterData.integrated)) {
-        writeCache(volumeCompensatedLufs(state.meterData.integrated)).catch(() => {});
-      }
+      // 走归属感知的归档：即使刚切到新稿件，最后一条测量仍写回它自己的旧键。
+      flushMeasurementToCache();
     });
   }
 
@@ -1298,25 +1557,78 @@
   }
 
   if (IS_TEST) {
+    const referenceLufsForDebug = () => {
+      const m = state.meterData;
+      if (m && Number.isFinite(m.integrated)) return volumeCompensatedLufs(m.integrated);
+      if (m && Number.isFinite(m.shortTerm)) return volumeCompensatedLufs(m.shortTerm);
+      return state.cachedLufs;
+    };
+
     window.__bvbDebug = () => ({
       ctxState: state.ctx ? state.ctx.state : null,
       video: state.video ? state.video.currentSrc : null,
       source: Boolean(state.source),
+      attachedVideo: state.attachedVideo ? state.attachedVideo.currentSrc : null,
       appliedDb: state.appliedDb,
       targetLufs: state.targetLufs,
       enabled: state.enabled,
       meterData: state.meterData,
       usingCache: state.usingCache,
+      cachedLufs: state.cachedLufs,
+      referenceLufs: referenceLufsForDebug(),
       statusText: state.els ? state.els.status.textContent : '',
       footText: state.els ? state.els.foot.textContent : '',
+      lufsText: state.els ? state.els.lufsValue.textContent : '',
+      resetPending: Boolean(ensurePanel.resetTimer) || performance.now() < state.forceNeutralUntil,
       workletMode: state.workletMode,
       fallbackMode: state.fallbackMode,
       extApi: extApi ? extApi.name : 'page',
       unsupportedReason: state.unsupportedReason,
+      // 上下文切换 / 代际 / 缓存归属，供切换类验收读取。
+      contextKey: state.key,
+      bv: state.contextInfo ? state.contextInfo.bv : '',
+      mid: state.contextInfo ? state.contextInfo.mid : '',
+      generation: state.generation,
+      switchCount: state.switchCount,
+      currentSrcTracked: state.currentSrc,
+      cacheKeys: Object.keys(state.cache || {}),
+      pendingCache: state.pendingCacheWrite
+        ? {
+          lufs: state.pendingCacheWrite.lufs,
+          generation: state.pendingCacheWrite.generation,
+          key: state.pendingCacheWrite.info ? state.pendingCacheWrite.info.key : '',
+          bv: state.pendingCacheWrite.info ? state.pendingCacheWrite.info.bv : '',
+        }
+        : null,
     });
     window.__bvbForceAttach = () => {
       if (state.video) return attach(state.video);
       return null;
+    };
+    // 直接替换内存缓存（验收脚本无需考虑 localStorage 与 boot 加载时序）。
+    window.__bvbSetCache = (entries = {}) => {
+      state.cache = { ...entries };
+      return Object.keys(state.cache);
+    };
+    window.__bvbGetCache = () => JSON.parse(JSON.stringify(state.cache || {}));
+    // 模拟一帧响度消息。默认按当前代际投递；{ stale: true } 模拟旧源迟到消息，
+    // 也可用 { generation: n } 精确指定代际。
+    window.__bvbEmitMeter = (data, options = {}) => {
+      const token = Number.isFinite(options.generation)
+        ? options.generation
+        : (options.stale ? state.generation - 1 : state.generation);
+      handleMeter(data, token);
+      return window.__bvbDebug();
+    };
+    // 触发一次归属感知的缓存归档写入，返回 Promise 以便等待 localStorage 落盘。
+    window.__bvbFlushCache = () => flushMeasurementToCache() || Promise.resolve();
+    // 不等 500 ms tick，立即执行一次 tick。
+    window.__bvbTick = () => tick();
+    // 不走 currentSrc 去重，强制按当前 readContext() 做一次统一对齐。
+    window.__bvbAlignNow = (reason = 'debug') => {
+      const writePromise = flushMeasurementToCache();
+      alignPlaybackContext(readContext(), state.video, reason);
+      return writePromise || Promise.resolve();
     };
   }
 

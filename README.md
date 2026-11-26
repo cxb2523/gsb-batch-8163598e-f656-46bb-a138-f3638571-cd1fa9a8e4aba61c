@@ -207,12 +207,18 @@ node tools/pack.mjs
 # Chromium：需要本机有 Edge 或 Chrome
 node test/e2e/run.mjs
 
+# 站内换稿专项：同一 <video> 换 currentSrc / 换到另一个 video 元素、
+# v:/u: 缓存命中、无缓存归零、旧源迟到消息丢弃、缓存写回旧 BV 键、面板对齐
+node test/e2e/switch-run.mjs
+
 # Firefox：需要本机有 Firefox，并且先 npm install（会装 web-ext）
 npm install
 node test/e2e/run-firefox.mjs
 ```
 
 Chromium 测试会在页面里直接注入 `content.js`，验证音频图与增益；Firefox 测试走的是真实链路：用 `web-ext` 在 Firefox 里临时安装扩展（不需要签名），页面把面板读数回传给本地服务器，再断言增益方向。两个测试都会确认安静段提升 `+15 dB`、大声段衰减到约 `-4 dB`。
+
+站内换稿专项使用 `test/e2e/switch-harness.html`，同样只访问本地文件、不依赖 B 站网络。测试模式下 `content.js` 额外提供 `__bvbSetCache` / `__bvbEmitMeter(msg, { stale: true })` / `__bvbFlushCache` / `__bvbAlignNow` 等调试接口，并把切换与丢弃事件写入 `window.__bvbTimeline`。
 
 > DSH 的 `workspace-write` 沙箱会拦截 Chromium 的 mojo 进程通信，也会让 Firefox 的无头进程拿不到 GPU 子进程；在这个环境里跑 E2E 需要 `danger-full-access`。普通本机终端直接运行即可。
 

@@ -126,13 +126,13 @@ class LoudnessProcessor extends AudioWorkletProcessor {
     this.coefficients = makeKWeightingCoefficients(sampleRate);
     this.port.onmessage = (event) => {
       if (event.data && event.data.type === 'reset') {
-        this.reset();
+        this.reset(event.data.epoch);
       }
     };
-    this.reset();
+    this.reset(0);
   }
 
-  reset() {
+  reset(epoch) {
     this.filters = [];
     this.ring = new Float64Array(this.blockSize);
     this.ringIndex = 0;
@@ -143,6 +143,10 @@ class LoudnessProcessor extends AudioWorkletProcessor {
     this.peak = 0;
     this.integratedCache = null;
     this.reportCounter = 0;
+    // 代际标识：主线程每次切换稿件 / reset 时下发新的 epoch。
+    // 切换前已经进入消息队列的报告仍带旧 epoch，主线程据此丢弃。
+    if (Number.isFinite(epoch)) this.epoch = epoch;
+    else if (!Number.isFinite(this.epoch)) this.epoch = 0;
   }
 
   ensureChannels(channelCount) {
@@ -177,6 +181,7 @@ class LoudnessProcessor extends AudioWorkletProcessor {
 
     this.port.postMessage({
       type: 'loudness',
+      epoch: this.epoch,
       momentary,
       shortTerm,
       recent: recentGated,

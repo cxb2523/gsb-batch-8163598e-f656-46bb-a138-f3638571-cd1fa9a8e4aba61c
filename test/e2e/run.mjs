@@ -14,15 +14,16 @@
  */
 
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
-const PORT = Number(process.env.BVB_E2E_PORT || 8765);
-const DEBUG_PORT = Number(process.env.BVB_DEBUG_PORT || 9223);
+const PORT_PREFERRED = Number(process.env.BVB_E2E_PORT || 8765);
+const DEBUG_PORT_PREFERRED = Number(process.env.BVB_DEBUG_PORT || 9223);
 const EDGE = process.env.EDGE_PATH
   || [
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -51,7 +52,7 @@ const MIME = {
   '.png': 'image/png',
 };
 
-function startServer() {
+function startServer(port) {
   const server = createServer((req, res) => {
     try {
       const urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
@@ -92,7 +93,29 @@ function startServer() {
     }
   });
   return new Promise((resolvePromise) => {
-    server.listen(PORT, '127.0.0.1', () => resolvePromise(server));
+    server.listen(port, '127.0.0.1', () => resolvePromise(server));
+  });
+}
+
+function isPortFree(port) {
+  return new Promise((resolvePromise) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolvePromise(false));
+    probe.once('listening', () => probe.close(() => resolvePromise(true)));
+    probe.listen(port, '127.0.0.1');
+  });
+}
+
+// 默认端口被占用时（例如本机还跑着别的调试服务）退到一个空闲端口，
+// 保持设置了 BVB_E2E_PORT / BVB_DEBUG_PORT 时仍优先使用指定值。
+async function pickPort(preferred) {
+  if (await isPortFree(preferred)) return preferred;
+  return new Promise((resolvePromise) => {
+    const probe = net.createServer();
+    probe.listen(0, '127.0.0.1', () => {
+      const port = probe.address().port;
+      probe.close(() => resolvePromise(port));
+    });
   });
 }
 
@@ -116,11 +139,13 @@ function sleep(ms) {
 }
 
 async function run() {
-  const server = await startServer();
+  const port = await pickPort(PORT_PREFERRED);
+  const debugPort = await pickPort(DEBUG_PORT_PREFERRED);
+  const server = await startServer(port);
   const profile = join(HERE, '.edge-profile');
   rmSync(profile, { recursive: true, force: true });
 
-  const url = `http://127.0.0.1:${PORT}/test/e2e/harness.html`;
+  const url = `http://127.0.0.1:${port}/test/e2e/harness.html`;
   const browser = spawn(EDGE, [
     '--headless=new',
     '--disable-gpu',
@@ -128,7 +153,7 @@ async function run() {
     '--no-default-browser-check',
     '--disable-crash-reporter',
     '--autoplay-policy=no-user-gesture-required',
-    `--remote-debugging-port=${DEBUG_PORT}`,
+    `--remote-debugging-port=${debugPort}`,
     `--user-data-dir=${profile}`,
     '--window-size=1000,700',
     url,
@@ -138,15 +163,23 @@ async function run() {
   browser.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
   const cleanup = async () => {
-    try { browser.kill(); } catch {}
+    try {
+      if (browser.pid && process.platform === 'win32') {
+        execSync(`taskkill /PID ${browser.pid} /T /F`, { stdio: 'ignore' });
+      } else {
+        browser.kill();
+      }
+    } catch {
+      try { browser.kill(); } catch {}
+    }
     await new Promise((r) => setTimeout(r, 500));
     try { server.close(); } catch {}
     rmSync(profile, { recursive: true, force: true });
   };
 
   try {
-    const version = await waitForJson(`http://127.0.0.1:${DEBUG_PORT}/json/version`, 15000);
-    const targets = await waitForJson(`http://127.0.0.1:${DEBUG_PORT}/json/list`, 5000);
+    const version = await waitForJson(`http://127.0.0.1:${debugPort}/json/version`, 15000);
+    const targets = await waitForJson(`http://127.0.0.1:${debugPort}/json/list`, 5000);
     const page = targets.find((target) => target.type === 'page');
     if (!page) throw new Error('没有找到页面调试目标');
 

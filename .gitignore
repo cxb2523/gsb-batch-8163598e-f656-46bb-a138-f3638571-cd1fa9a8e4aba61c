@@ -7,6 +7,7 @@ dist/
 
 # 测试临时文件
 test/e2e/.edge-profile/
+test/e2e/.switch-profile-*/
 test/e2e/.firefox-ext/
 test/e2e/.firefox-e2e.log
 .edge-profile/
