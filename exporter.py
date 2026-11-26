@@ -64,8 +64,8 @@ class ExportManager:
 
         self._tracks = []         # audio file paths in play order
         self._chapters = []       # {'start': sec, 'title': str}
-        self._cur = None          # {'duration': sec}
-        self._offset = 0.0
+        self._cur = None          # {'path','duration','title','start'}
+        self._offset = 0.0        # video seconds already covered by chapters
 
     # ------------------------------------------------------------------ start
     def start(self, width, height):
@@ -125,16 +125,44 @@ class ExportManager:
         return {}
 
     # ----------------------------------------------------------------- tracks
-    def begin_track(self, path, duration, title):
-        """Call whenever a track starts playing from 0:00 while recording."""
+    def begin_track(self, path, duration, title, previous_completed=True):
+        """Call whenever a track starts playing from 0:00 while recording.
+
+        `previous_completed` says whether the track before this one ran to its
+        natural end. Then its chapter advances by its real (decoded) duration,
+        which is exactly how much audio the merged file contains. If it was
+        cut short, the actually played position is used instead.
+        """
         with self._lock:
             if not self.is_recording:
                 return
             if self._cur is not None:
-                self._offset += self._cur["duration"]
-            self._cur = {"duration": max(float(duration), 0.1)}
+                prev = self._cur
+                if previous_completed:
+                    advance = prev["duration"]
+                elif prev["played"] is not None:
+                    advance = prev["played"]
+                else:
+                    advance = 0.0     # skipped before a single frame was played
+                self._offset += max(0.0, advance)
+            label = title or os.path.basename(path)
+            self._cur = {"path": path,
+                         "duration": max(float(duration), 0.1),
+                         "title": label,
+                         "played": None}
             self._tracks.append(path)
-            self._chapters.append({"start": self._offset, "title": title or os.path.basename(path)})
+            self._chapters.append({"start": self._offset, "title": label})
+
+    def update_position(self, track_pos):
+        """Feed the live play position of the current track (once per frame)."""
+        if track_pos is None:
+            return
+        with self._lock:
+            if not self.is_recording or self._cur is None:
+                return
+            pos = min(max(float(track_pos), 0.0), self._cur["duration"])
+            if self._cur["played"] is None or pos > self._cur["played"]:
+                self._cur["played"] = pos
 
     # ----------------------------------------------------------------- frames
     def frames_due(self, track_pos):
@@ -178,8 +206,12 @@ class ExportManager:
         exact end of the audio (otherwise it stops at the current position)."""
         if not self.is_recording:
             return
-        if natural_end and self._cur is not None and getattr(self, "_last_frame", None):
-            missing = int((self._offset + self._cur["duration"]) * self.fps) - self.frames
+        if self._cur is not None and getattr(self, "_last_frame", None):
+            if natural_end:
+                missing = int((self._offset + self._cur["duration"]) * self.fps) - self.frames
+            else:
+                played = self._cur["played"] or 0.0
+                missing = int((self._offset + played) * self.fps) - self.frames
             if missing > 0:
                 self.write(self._last_frame, missing)
         self.is_recording = False

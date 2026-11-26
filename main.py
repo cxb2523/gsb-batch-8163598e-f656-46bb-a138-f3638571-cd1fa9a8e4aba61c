@@ -87,7 +87,6 @@ class HotVisualizer:
         self.clean_mode = False        # H: only visuals + song title/artist
         self.auto_chapter = True       # M: every song gets its own look
         self._seen_index = -1
-        self._seen_serial = 0
         self.cur_level = 0
         self.cur_peak = 0
         self._font_cache = {}
@@ -534,6 +533,7 @@ class HotVisualizer:
         if not ex.start(w, h):
             self.notify(ex.status)
             return
+        fp.discard_start_events()   # chapters begin with this export's first track
         fp.restart_track()   # export always starts at 0:00 of the current song
         self.notify("Export läuft: ab jetzt wird die Playlist bis zum Ende aufgenommen (E/R = stoppen)")
 
@@ -665,14 +665,19 @@ class HotVisualizer:
                         self.mode = (self.mode + 1) % len(self.mode_names)
                         self.color_palette_index = (self.color_palette_index + 1) % len(self.palettes)
                     self._seen_index = fp.index
-                if fp.track_serial != self._seen_serial:
-                    self._seen_serial = fp.track_serial
-                    if ex.is_recording and fp.is_analyzed:
-                        label = f"{fp.artist} - {fp.title}" if fp.artist else fp.title
-                        ex.begin_track(fp.file_path, fp.duration, label)
+                # Every track start is queued by FileProcessor with a snapshot
+                # of its own data. Reporting them all in order means a fast
+                # chain of short tracks cannot collapse into one chapter and
+                # a late prefetch can never relabel an older start.
+                for ev in fp.pop_start_events():
+                    if ex.is_recording:
+                        label = f"{ev['artist']} - {ev['title']}" if ev['artist'] else ev['title']
+                        ex.begin_track(ev['path'], ev['duration'], label,
+                                       ev['previous_natural_end'])
+                if ex.is_recording:
+                    ex.update_position(fp.get_position())
                 if ex.is_recording and fp.ended_all:
                     self.stop_export(natural_end=True)
-
             # ---- draw: visuals + title (these two end up in the export)
             self.screen.fill((10, 10, 20))
             draw_modes[self.mode](fft_data, beat_detected)
