@@ -275,9 +275,9 @@ class VexelPNGExport {
             ctx.scale(scale, scale);
             ctx.translate(padding - x, padding - y);
 
-            ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-            ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
-            ctx.rotate(this.vexel.viewport.rotation);
+            // Use the engine's single view transform so the exported image
+            // matches the on-screen viewport exactly (including rotation).
+            this.vexel.applyViewTransform(ctx);
 
             for (const shape of this.vexel.shapes) {
                 if (shape.visible !== false) {

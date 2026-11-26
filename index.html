@@ -763,7 +763,22 @@
 <!-- Dependencies -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/spideythedev/vexel@main/dist/vexel.js"></script>
+<!--
+  Load the local engine source so the playground exercises this repository.
+  (Load order matters: utilities first, then the core engine, then tools.)
+-->
+<script src="src/utils/color.js"></script>
+<script src="src/utils/geometry.js"></script>
+<script src="src/utils/math.js"></script>
+<script src="src/core/vexel.js"></script>
+<script src="src/core/viewport.js"></script>
+<script src="src/core/canvas.js"></script>
+<script src="src/core/renderer.js"></script>
+<script src="src/core/engine.js"></script>
+<script src="src/core/coordinate.js"></script>
+<script src="src/tools/select.js"></script>
+<script src="src/tools/pen.js"></script>
+<script src="src/renderer/webgl.js"></script>
 
 <script>
 (() => {
@@ -1033,6 +1048,12 @@ console.log('Shapes:', vex.shapes.length);
 
       grid: false
     });
+
+    // Enable mouse selection (drag/resize/rotate) and marquee on the canvas.
+    if (typeof VexelSelectTool !== 'undefined') {
+      vex.selectTool = new VexelSelectTool(vex);
+      vex.selectTool.activate();
+    }
   }
 
   /* Execute */

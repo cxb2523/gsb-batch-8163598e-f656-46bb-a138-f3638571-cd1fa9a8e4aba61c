@@ -199,11 +199,7 @@ class VexelEventSystem {
 
         if (e.ctrlKey || e.metaKey) {
             const delta = e.deltaY > 0 ? 0.9 : 1.1;
-            const newZoom = Math.max(0.001, Math.min(100, this.vexel.viewport.zoom * delta));
-
-            this.vexel.viewport.x = mouseX - (mouseX - this.vexel.viewport.x) * (newZoom / this.vexel.viewport.zoom);
-            this.vexel.viewport.y = mouseY - (mouseY - this.vexel.viewport.y) * (newZoom / this.vexel.viewport.zoom);
-            this.vexel.viewport.zoom = newZoom;
+            this.vexel.setZoom(this.vexel.viewport.zoom * delta, mouseX, mouseY);
         } else if (e.shiftKey) {
             this.vexel.viewport.x -= e.deltaY;
         } else {
@@ -312,9 +308,7 @@ class VexelEventSystem {
             const cx = (touches[0].clientX + touches[1].clientX) / 2;
             const cy = (touches[0].clientY + touches[1].clientY) / 2;
 
-            this.vexel.viewport.zoom = Math.max(0.001, Math.min(100, newZoom));
-            this.vexel.viewport.x = cx - rect.left - this.pinchCenter.x * this.vexel.viewport.zoom;
-            this.vexel.viewport.y = cy - rect.top - this.pinchCenter.y * this.vexel.viewport.zoom;
+            this.vexel.setZoom(newZoom, cx - rect.left, cy - rect.top);
             this.vexel.dirty = true;
 
             this._emit('pinch', {

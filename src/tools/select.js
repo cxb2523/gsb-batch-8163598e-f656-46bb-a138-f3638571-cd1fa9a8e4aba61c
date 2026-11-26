@@ -57,10 +57,10 @@ class VexelSelectTool {
 
     _getCanvasPoint(e) {
         const rect = this.vexel.container.getBoundingClientRect();
-        return {
-            x: (e.clientX - rect.left - this.vexel.viewport.x) / this.vexel.viewport.zoom,
-            y: (e.clientY - rect.top - this.vexel.viewport.y) / this.vexel.viewport.zoom
-        };
+        return this.vexel.screenToWorld(
+            e.clientX - rect.left,
+            e.clientY - rect.top
+        );
     }
 
     _handleMouseDown(e) {
@@ -473,8 +473,7 @@ class VexelSelectTool {
         const h = Math.abs(this.marqueeEnd.y - this.marqueeStart.y);
 
         ctx.save();
-        ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-        ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+        this.vexel.applyViewTransform(ctx);
 
         ctx.fillStyle = 'rgba(74, 144, 217, 0.1)';
         ctx.fillRect(x, y, w, h);
@@ -496,8 +495,7 @@ class VexelSelectTool {
         const cy = bounds.y - 30;
 
         ctx.save();
-        ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-        ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+        this.vexel.applyViewTransform(ctx);
 
         ctx.strokeStyle = '#4A90D9';
         ctx.lineWidth = 1.5 / this.vexel.viewport.zoom;

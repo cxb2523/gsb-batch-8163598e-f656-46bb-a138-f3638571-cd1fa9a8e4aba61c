@@ -428,10 +428,13 @@ class VexelGesture {
             const scale = currentDistance / this.pinchStartDistance;
             const newZoom = Math.max(0.001, Math.min(100, this.pinchStartZoom * scale));
 
-            const rect = this.vexel.container.getBoundingClientRect();
-            this.vexel.viewport.zoom = newZoom;
-            this.vexel.viewport.x = this.pinchCenter.x - (this.pinchCenter.x - this.vexel.viewport.x) * (newZoom / this.pinchStartZoom);
-            this.vexel.viewport.y = this.pinchCenter.y - (this.pinchCenter.y - this.vexel.viewport.y) * (newZoom / this.pinchStartZoom);
+            // Keep the pinch centre fixed under the fingers using the shared
+            // zoom helper (handles clamping + anchor math consistently).
+            if (typeof this.vexel.setZoom === 'function') {
+                this.vexel.setZoom(newZoom, this.pinchCenter.x, this.pinchCenter.y);
+            } else {
+                this.vexel.viewport.zoom = newZoom;
+            }
             this.vexel.dirty = true;
 
             if (this.rotating) {
@@ -439,8 +442,9 @@ class VexelGesture {
                     touches[1].clientY - touches[0].clientY,
                     touches[1].clientX - touches[0].clientX
                 );
-                const angleDiff = (currentAngle - this.rotateStartAngle) * (180 / Math.PI);
-                this.vexel.viewport.rotation = (this.rotateStartRotation + angleDiff) % 360;
+                // viewport.rotation is radians (ctx.rotate convention).
+                const angleDiff = currentAngle - this.rotateStartAngle;
+                this.vexel.viewport.rotation = (this.rotateStartRotation + angleDiff) % (Math.PI * 2);
                 this.vexel.dirty = true;
             }
         }

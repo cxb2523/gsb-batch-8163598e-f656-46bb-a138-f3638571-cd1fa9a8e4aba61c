@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vexel — Viewport Consistency Checks</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 16px;
+      font-family: Inter, -apple-system, "Segoe UI", sans-serif;
+      background: #111110; color: #f5f3f0;
+    }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    p.sub { color: #aaa49d; font-size: 12px; margin: 0 0 14px; }
+    #stage {
+      position: relative; width: 640px; height: 420px;
+      background: #ffffff; border: 1px solid #302e2b; border-radius: 8px;
+      overflow: hidden;
+    }
+    #summary { margin: 12px 0 6px; font-size: 13px; font-weight: 650; }
+    #summary.pass { color: #7bd9a2; }
+    #summary.fail { color: #ff7777; }
+    #log {
+      width: 640px; max-height: 240px; overflow-y: auto;
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px;
+      line-height: 1.7; background: #181817; border: 1px solid #302e2b;
+      border-radius: 8px; padding: 10px 12px; white-space: pre-wrap;
+    }
+    .log-line { padding: 1px 0; }
+    .log-line.pass { color: #7bd9a2; }
+    .log-line.fail { color: #ff7777; }
+    .log-line.info { color: #83b9f7; }
+    button {
+      margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 7px;
+      background: #ff6538; color: #fff; font-weight: 650; cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>Vexel — Viewport Consistency Checks</h1>
+  <p class="sub">Runs zoom+pan alignment, double-resize stability, export/screen parity, and WebGL-failure fallback.</p>
+  <div id="stage"></div>
+  <div id="summary">Running…</div>
+  <button id="runBtn">Re-run checks</button>
+  <div id="log"></div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    const MODULES = [
+      '../src/utils/color.js',
+      '../src/core/vexel.js',
+      '../src/core/viewport.js',
+      '../src/core/canvas.js',
+      '../src/core/renderer.js',
+      '../src/core/engine.js',
+      '../src/core/coordinate.js',
+      '../src/tools/select.js',
+      '../src/renderer/webgl.js'
+    ];
+
+    const $ = (sel) => document.querySelector(sel);
+
+    function loadScripts(paths, onDone) {
+      let remaining = paths.length;
+      const errors = [];
+      paths.forEach((src) => {
+        const el = document.createElement('script');
+        el.src = src;
+        el.onload = () => { if (--remaining === 0) onDone(errors); };
+        el.onerror = () => { errors.push(src); if (--remaining === 0) onDone(errors); };
+        document.head.appendChild(el);
+      });
+    }
+
+    function log(message, cls) {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (cls || '');
+      line.textContent = message;
+      $('#log').appendChild(line);
+    }
+
+    function diffPixels(a, b, threshold) {
+      if (!a || !b || a.width !== b.width || a.height !== b.height) {
+        return { total: Infinity, mismatched: Infinity };
+      }
+      const da = a.getContext('2d').getImageData(0, 0, a.width, a.height).data;
+      const db = b.getContext('2d').getImageData(0, 0, b.width, b.height).data;
+      let mismatched = 0;
+      const tol = threshold === undefined ? 40 : threshold;
+      for (let i = 0; i < da.length; i += 4) {
+        const d = Math.abs(da[i] - db[i]) + Math.abs(da[i + 1] - db[i + 1]) +
+          Math.abs(da[i + 2] - db[i + 2]) + Math.abs(da[i + 3] - db[i + 3]);
+        if (d > tol) mismatched++;
+      }
+      return { total: da.length / 4, mismatched };
+    }
+
+    function countColor(canvas, predicate) {
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let count = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        if (predicate(data[i], data[i + 1], data[i + 2], data[i + 3])) count++;
+      }
+      return count;
+    }
+
+    function createEngine(host) {
+      return new window.Vexel({
+        container: host,
+        width: host.clientWidth,
+        height: host.clientHeight,
+        autoRender: false
+      });
+    }
+
+    function buildScene(vex) {
+      vex.clear();
+      vex.rectangle(60, 50, 180, 120, { fill: '#FF5722', stroke: '#1c1917', strokeWidth: 3, cornerRadius: 12 });
+      vex.ellipse(360, 120, 60, 60, { fill: '#3B82F6', opacity: 0.85 });
+      vex.polygon(520, 110, 3, 55, { fill: '#22C55E' });
+      vex.text(80, 230, 'Viewport sync', { fontSize: 26, fontWeight: '800', fill: '#0F766E' });
+      return vex.shapes[0];
+    }
+
+    async function runChecks() {
+      const host = $('#stage');
+      host.innerHTML = '';
+      $('#log').innerHTML = '';
+      log('Starting viewport consistency checks…', 'info');
+
+      let failures = 0;
+      const pass = (name) => { log('PASS  ' + name, 'pass'); };
+      const fail = (name, detail) => { failures++; log('FAIL  ' + name + ' — ' + detail, 'fail'); };
+
+      /* ---------------- 1. zoom + pan selection alignment ------------ */
+      try {
+        const vex = createEngine(host);
+        // Minimal scene: only the rectangle under test, so the blue selection
+        // outline is the sole blue element in the frame.
+        vex.clear();
+        const rect = vex.rectangle(60, 50, 180, 120, { fill: '#FF5722', stroke: '#1c1917', strokeWidth: 3, cornerRadius: 12 });
+        vex.select(rect);
+        // Zoom 2x about the origin, then pan so the whole rectangle stays
+        // inside the viewport (a clipped outline cannot be edge-compared).
+        vex.setZoom(2, 0, 0);
+        vex.panBy(30, 20);
+        vex.render();
+
+        const composed = document.createElement('canvas');
+        composed.width = vex.width;
+        composed.height = vex.height;
+        const cctx = composed.getContext('2d');
+        cctx.fillStyle = '#ffffff';
+        cctx.fillRect(0, 0, composed.width, composed.height);
+        cctx.drawImage(vex.canvas, 0, 0, vex.width, vex.height);
+        cctx.drawImage(vex.overlayCanvas, 0, 0, vex.width, vex.height);
+
+        let minBX = Infinity, minBY = Infinity, maxBX = -Infinity, maxBY = -Infinity;
+        const data = cctx.getImageData(0, 0, composed.width, composed.height).data;
+        for (let y = 0; y < composed.height; y++) {
+          for (let x = 0; x < composed.width; x++) {
+            const i = (y * composed.width + x) * 4;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            if (b > 140 && r < 150 && g > 100 && g < 200) {
+              minBX = Math.min(minBX, x); maxBX = Math.max(maxBX, x);
+              minBY = Math.min(minBY, y); maxBY = Math.max(maxBY, y);
+            }
+          }
+        }
+
+        // Ground truth: project the shape's world bounds through the
+        // authoritative viewport transform (CSS px).
+        const bounds = rect.getBounds();
+        const tl = vex.worldToScreen(bounds.x, bounds.y);
+        const br = vex.worldToScreen(bounds.x + bounds.width, bounds.y + bounds.height);
+        const expMinX = Math.min(tl.x, br.x);
+        const expMinY = Math.min(tl.y, br.y);
+        const expMaxX = Math.max(tl.x, br.x);
+        const expMaxY = Math.max(tl.y, br.y);
+        // Resize handles extend ~half a 7px box plus a stroke outside the
+        // outline, so blue pixels legitimately sit a few px past the bounds.
+        const tol = 6;
+
+        if (minBX === Infinity) {
+          fail('zoom+pan selection alignment', 'selection outline pixels not found');
+        } else {
+          const d = [
+            Math.abs(minBX - expMinX),
+            Math.abs(minBY - expMinY),
+            Math.abs(maxBX - expMaxX),
+            Math.abs(maxBY - expMaxY)
+          ];
+          log(`info  outline box (${minBX},${minBY})-(${maxBX},${maxBY}); projected bounds (${expMinX.toFixed(1)},${expMinY.toFixed(1)})-(${expMaxX.toFixed(1)},${expMaxY.toFixed(1)})`, 'info');
+          if (d.every((v) => v <= tol)) {
+            pass(`zoom+pan selection alignment (outline within ${tol}px of projected bounds)`);
+          } else {
+            fail('zoom+pan selection alignment', `outline vs projected edge deltas ${d.map((v) => v.toFixed(1))}px`);
+          }
+        }
+        vex.destroy();
+      } catch (e) {
+        fail('zoom+pan selection alignment', e.message);
+      }
+
+      /* ---------------- 2. two resizes, no shift ---------------- */
+      try {
+        const vex = createEngine(host);
+        buildScene(vex);
+        // Capture the logical size before resizing; the engine mutates the
+        // container width/height, so re-reading it mid-test is wrong.
+        const baseW = vex.width;
+        const baseH = vex.height;
+        vex.setZoom(1.6, 120, 90);
+        vex.panBy(20, 15);
+        vex.render();
+
+        const snapshot = (engine) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = engine.canvas.width;
+          canvas.height = engine.canvas.height;
+          canvas.getContext('2d').drawImage(engine.canvas, 0, 0);
+          return canvas;
+        };
+
+        const baseline = snapshot(vex);
+
+        vex.resize(baseW + 64, baseH + 48);
+        vex.render();
+        vex.resize(baseW, baseH);
+        vex.render();
+
+        const after = snapshot(vex);
+
+        const diff = diffPixels(baseline, after, 40);
+        if (diff.mismatched === 0) {
+          pass('double resize keeps shapes unshifted (0 px diff)');
+        } else {
+          fail('double resize keeps shapes unshifted', `${diff.mismatched}/${diff.total} px differ`);
+        }
+
+        const m = vex.ctx.getTransform();
+        if (Math.abs(m.a - vex.pixelRatio) < 1e-6 && Math.abs(m.d - vex.pixelRatio) < 1e-6) {
+          pass('DPR transform not accumulated after resizes');
+        } else {
+          fail('DPR transform not accumulated after resizes', `a=${m.a}, d=${m.d}, expected ${vex.pixelRatio}`);
+        }
+        vex.destroy();
+      } catch (e) {
+        fail('double resize keeps shapes unshifted', e.message);
+      }
+
+      /* ---------------- 3. export matches screen (no prior frame) ---- */
+      try {
+        const vex = createEngine(host);
+        buildScene(vex);
+        // Include rotation + zoom + pan so the export must reproduce the full
+        // view transform, not just an axis-aligned offset.
+        vex.setViewport({ zoom: 1.6, rotation: Math.PI / 6 });
+        vex.panBy(60, 30);
+
+        // No vex.render() first: export must render independently.
+        const exported = vex.renderToCanvas({ scale: vex.pixelRatio, background: '#ffffff' });
+
+        vex.render();
+        const screen = document.createElement('canvas');
+        screen.width = exported.width;
+        screen.height = exported.height;
+        const sctx = screen.getContext('2d');
+        sctx.fillStyle = '#ffffff';
+        sctx.fillRect(0, 0, screen.width, screen.height);
+        sctx.drawImage(vex.canvas, 0, 0, screen.width, screen.height);
+
+        const diff = diffPixels(screen, exported, 40);
+        if (diff.mismatched === 0) {
+          pass('export matches the on-screen viewport (0 px diff)');
+        } else {
+          fail('export matches the on-screen viewport', `${diff.mismatched}/${diff.total} px differ`);
+        }
+        vex.destroy();
+      } catch (e) {
+        fail('export matches the on-screen viewport', e.message);
+      }
+
+      /* ---------------- 4. forced WebGL failure ---------------- */
+      try {
+        const RealWebGL = window.VexelWebGLRenderer;
+        class FailingWebGL {
+          constructor(vexel) { this.vexel = vexel; }
+          init() { throw new Error('forced WebGL failure (test)'); }
+          destroy() {}
+          getStats() { return { initialized: false }; }
+        }
+        window.VexelWebGLRenderer = FailingWebGL;
+
+        const vex = createEngine(host);
+        buildScene(vex);
+        const result = vex.setBackend('webgl');
+
+        if (result !== 'canvas2d' || vex.backend !== 'canvas2d') {
+          fail('WebGL failure falls back to Canvas2D', 'backend is ' + vex.backend);
+        } else {
+          const canvases = host.querySelectorAll('canvas');
+          if (canvases.length !== 2) {
+            fail('WebGL failure falls back to Canvas2D', `${canvases.length} canvas elements (expected 2)`);
+          } else if (vex.webglRenderer) {
+            fail('WebGL failure falls back to Canvas2D', 'stale WebGL renderer retained');
+          } else {
+            vex.render();
+            const drawn = countColor(vex.canvas, (r, g, b, a) => a > 0 && (r > 150 || b > 100 || g > 90));
+            if (drawn > 0) {
+              pass('WebGL failure falls back to Canvas2D and still draws');
+            } else {
+              fail('WebGL failure falls back to Canvas2D', 'nothing drawn after fallback');
+            }
+          }
+        }
+
+        window.VexelWebGLRenderer = RealWebGL;
+        vex.destroy();
+      } catch (e) {
+        window.VexelWebGLRenderer = window.VexelWebGLRenderer;
+        fail('WebGL failure falls back to Canvas2D', e.message);
+      }
+
+      const summary = failures === 0
+        ? 'All viewport consistency checks passed.'
+        : failures + ' check(s) failed.';
+      log(summary, failures === 0 ? 'pass' : 'fail');
+      $('#summary').textContent = summary;
+      $('#summary').className = failures === 0 ? 'pass' : 'fail';
+    }
+
+    loadScripts(MODULES, (errors) => {
+      if (errors.length) {
+        log('Failed to load: ' + errors.join(', '), 'fail');
+        $('#summary').textContent = 'Module load failed.';
+        $('#summary').className = 'fail';
+        return;
+      }
+      $('#runBtn').addEventListener('click', runChecks);
+      runChecks();
+    });
+  })();
+  </script>
+</body>
+</html>

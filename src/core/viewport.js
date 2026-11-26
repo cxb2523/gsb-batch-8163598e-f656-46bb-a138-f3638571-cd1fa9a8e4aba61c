@@ -1,12 +1,18 @@
 // src/core/viewport.js
+//
+// Adapter over the engine's authoritative viewport state. The engine
+// (`vexel.viewport`) is the only object that owns offset/zoom/rotation; this
+// class adds smooth-animation helpers on top of it so there is exactly one
+// source of truth consumed by the main canvas, overlay, hit-testing and
+// exports.
 
 class VexelViewport {
     constructor(vexel) {
         this.vexel = vexel;
-        this.x = 0;
-        this.y = 0;
-        this.zoom = 1;
-        this.rotation = 0;
+        // Make sure the shared state exists even if constructed standalone.
+        if (!vexel.viewport) {
+            vexel.viewport = { x: 0, y: 0, zoom: 1, rotation: 0 };
+        }
         this.minZoom = 0.001;
         this.maxZoom = 100;
         this.zoomSensitivity = 0.001;
@@ -17,6 +23,8 @@ class VexelViewport {
         this.homeRotation = 0;
         this.smoothZoom = true;
         this.smoothPan = true;
+        // Animation targets are separate from the live values, but live
+        // values always live on vexel.viewport.
         this.targetX = 0;
         this.targetY = 0;
         this.targetZoom = 1;
@@ -26,51 +34,68 @@ class VexelViewport {
         this.animationId = null;
         this.constraints = null;
         this.padding = { top: 0, right: 0, bottom: 0, left: 0 };
+        this._syncTargetsFromState();
+    }
+
+    /* ---- authoritative live state accessors ---- */
+
+    get state() {
+        return this.vexel.viewport;
+    }
+
+    get x() { return this.vexel.viewport.x; }
+    set x(value) { this.vexel.viewport.x = value; }
+
+    get y() { return this.vexel.viewport.y; }
+    set y(value) { this.vexel.viewport.y = value; }
+
+    get zoom() { return this.vexel.viewport.zoom; }
+    set zoom(value) { this.vexel.viewport.zoom = this._clampZoom(value); }
+
+    get rotation() { return this.vexel.viewport.rotation; }
+    set rotation(value) { this.vexel.viewport.rotation = value; }
+
+    _clampZoom(value) {
+        const min = Math.min(this.minZoom, this.maxZoom);
+        const max = Math.max(this.minZoom, this.maxZoom);
+        return Math.max(min, Math.min(max, value));
+    }
+
+    _syncTargetsFromState() {
+        const vp = this.vexel.viewport;
+        this.targetX = vp.x;
+        this.targetY = vp.y;
+        this.targetZoom = vp.zoom;
+        this.targetRotation = vp.rotation;
+    }
+
+    _syncToVexel() {
+        // Live values already alias vexel.viewport; just flag a redraw.
+        this.vexel.dirty = true;
     }
 
     pan(dx, dy) {
         this.targetX += dx;
         this.targetY += dy;
-
-        if (this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
     panTo(x, y) {
         this.targetX = x;
         this.targetY = y;
-
-        if (this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.x = x;
-            this.y = y;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
     zoomAt(factor, cx, cy) {
         const oldZoom = this.targetZoom;
-        this.targetZoom = Math.max(this.minZoom, Math.min(this.maxZoom, this.targetZoom * factor));
+        this.targetZoom = this._clampZoom(this.targetZoom * factor);
 
         if (cx !== undefined && cy !== undefined) {
-            this.targetX = cx - (cx - this.targetX) * (this.targetZoom / oldZoom);
-            this.targetY = cy - (cy - this.targetY) * (this.targetZoom / oldZoom);
+            const ratio = this.targetZoom / oldZoom;
+            this.targetX = cx - (cx - this.targetX) * ratio;
+            this.targetY = cy - (cy - this.targetY) * ratio;
         }
-
-        if (this.smoothZoom) {
-            this._startSmoothAnimation();
-        } else {
-            this.zoom = this.targetZoom;
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
     zoomIn(factor = 1.2) {
@@ -102,20 +127,13 @@ class VexelViewport {
         const contentHeight = maxY - minY + padding * 2;
         const zoomX = (this.vexel.width - this.padding.left - this.padding.right) / contentWidth;
         const zoomY = (this.vexel.height - this.padding.top - this.padding.bottom) / contentHeight;
-        const zoom = Math.min(zoomX, zoomY, 1);
+        const zoom = this._clampZoom(Math.min(zoomX, zoomY, 1));
 
         this.targetZoom = zoom;
         this.targetX = (this.vexel.width - contentWidth * zoom) / 2 - minX * zoom + padding * zoom + this.padding.left;
         this.targetY = (this.vexel.height - contentHeight * zoom) / 2 - minY * zoom + padding * zoom + this.padding.top;
-
-        if (this.smoothZoom || this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.zoom = this.targetZoom;
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this._syncToVexel();
-        }
+        this.targetRotation = 0;
+        this._commit();
     }
 
     zoomToSelection() {
@@ -125,28 +143,22 @@ class VexelViewport {
     }
 
     zoomToPercent(percent) {
-        this.targetZoom = percent / 100;
+        this.targetZoom = this._clampZoom(percent / 100);
         this.targetX = (this.vexel.width - this.vexel.width * this.targetZoom) / 2;
         this.targetY = (this.vexel.height - this.vexel.height * this.targetZoom) / 2;
-
-        if (this.smoothZoom || this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.zoom = this.targetZoom;
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
+    // Rotation is stored in radians (matching ctx.rotate). These helpers
+    // accept radians too, for consistency with the authoritative state.
     rotate(angle) {
-        this.targetRotation = (this.targetRotation + angle) % 360;
+        this.targetRotation = (this.targetRotation + angle) % (Math.PI * 2);
         this.rotation = this.targetRotation;
         this._syncToVexel();
     }
 
     rotateTo(angle) {
-        this.targetRotation = angle % 360;
+        this.targetRotation = angle % (Math.PI * 2);
         this.rotation = this.targetRotation;
         this._syncToVexel();
     }
@@ -156,16 +168,7 @@ class VexelViewport {
         this.targetY = this.homeY;
         this.targetZoom = this.homeZoom;
         this.targetRotation = this.homeRotation;
-
-        if (this.smoothZoom || this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.x = this.homeX;
-            this.y = this.homeY;
-            this.zoom = this.homeZoom;
-            this.rotation = this.homeRotation;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
     setHome() {
@@ -210,10 +213,28 @@ class VexelViewport {
         }
     }
 
+    _commit() {
+        if (this.smoothZoom || this.smoothPan) {
+            this._startSmoothAnimation();
+        } else {
+            this.animating = false;
+            this._applyConstraints();
+            this.vexel.viewport.x = this.targetX;
+            this.vexel.viewport.y = this.targetY;
+            this.vexel.viewport.zoom = this._clampZoom(this.targetZoom);
+            this.vexel.viewport.rotation = this.targetRotation;
+            this._syncToVexel();
+        }
+    }
+
     _startSmoothAnimation() {
         if (this.animating) return;
         this.animating = true;
-        this._animateStep();
+        const step = () => {
+            if (!this.animating) return;
+            this._animateStep();
+        };
+        this.animationId = requestAnimationFrame(step);
     }
 
     _animateStep() {
@@ -222,53 +243,38 @@ class VexelViewport {
         const dz = this.targetZoom - this.zoom;
 
         if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01 && Math.abs(dz) < 0.0001) {
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this.zoom = this.targetZoom;
             this.animating = false;
+            this._applyConstraints();
+            this.vexel.viewport.x = this.targetX;
+            this.vexel.viewport.y = this.targetY;
+            this.vexel.viewport.zoom = this._clampZoom(this.targetZoom);
+            this.vexel.viewport.rotation = this.targetRotation;
             this._syncToVexel();
             return;
         }
 
-        this.x += dx * this.animationSpeed;
-        this.y += dy * this.animationSpeed;
-        this.zoom += dz * this.animationSpeed;
+        const nextX = this.x + dx * this.animationSpeed;
+        const nextY = this.y + dy * this.animationSpeed;
+        const nextZoom = this._clampZoom(this.zoom + dz * this.animationSpeed);
 
-        this._applyConstraints();
+        this.vexel.viewport.x = nextX;
+        this.vexel.viewport.y = nextY;
+        this.vexel.viewport.zoom = nextZoom;
         this._syncToVexel();
 
         this.animationId = requestAnimationFrame(() => this._animateStep());
     }
 
-    _syncToVexel() {
-        this.vexel.viewport.x = this.x;
-        this.vexel.viewport.y = this.y;
-        this.vexel.viewport.zoom = this.zoom;
-        this.vexel.viewport.rotation = this.rotation;
-        this.vexel.dirty = true;
-    }
-
     screenToWorld(screenX, screenY) {
-        return {
-            x: (screenX - this.x) / this.zoom,
-            y: (screenY - this.y) / this.zoom
-        };
+        return this.vexel.screenToWorld(screenX, screenY);
     }
 
     worldToScreen(worldX, worldY) {
-        return {
-            x: worldX * this.zoom + this.x,
-            y: worldY * this.zoom + this.y
-        };
+        return this.vexel.worldToScreen(worldX, worldY);
     }
 
     getVisibleBounds() {
-        return {
-            x: -this.x / this.zoom,
-            y: -this.y / this.zoom,
-            width: this.vexel.width / this.zoom,
-            height: this.vexel.height / this.zoom
-        };
+        return this.vexel.getVisibleWorldBounds();
     }
 
     isShapeVisible(shape) {
@@ -295,7 +301,9 @@ class VexelViewport {
     setZoomLimits(min, max) {
         this.minZoom = min;
         this.maxZoom = max;
-        this.targetZoom = Math.max(min, Math.min(max, this.targetZoom));
+        const zoom = this._clampZoom(this.vexel.viewport.zoom);
+        this.vexel.viewport.zoom = zoom;
+        this.targetZoom = this._clampZoom(this.targetZoom);
     }
 
     getZoomPercent() {
@@ -303,23 +311,13 @@ class VexelViewport {
     }
 
     getCenter() {
-        return {
-            x: (this.vexel.width / 2 - this.x) / this.zoom,
-            y: (this.vexel.height / 2 - this.y) / this.zoom
-        };
+        return this.vexel.screenToWorld(this.vexel.width / 2, this.vexel.height / 2);
     }
 
     centerOn(x, y) {
         this.targetX = this.vexel.width / 2 - x * this.targetZoom;
         this.targetY = this.vexel.height / 2 - y * this.targetZoom;
-
-        if (this.smoothPan) {
-            this._startSmoothAnimation();
-        } else {
-            this.x = this.targetX;
-            this.y = this.targetY;
-            this._syncToVexel();
-        }
+        this._commit();
     }
 
     serialize() {
@@ -337,24 +335,23 @@ class VexelViewport {
 
     deserialize(data) {
         if (!data) return;
-        this.x = data.x || 0;
-        this.y = data.y || 0;
-        this.zoom = data.zoom || 1;
-        this.rotation = data.rotation || 0;
+        this.vexel.viewport.x = data.x || 0;
+        this.vexel.viewport.y = data.y || 0;
+        this.vexel.viewport.zoom = this._clampZoom(data.zoom || 1);
+        this.vexel.viewport.rotation = data.rotation || 0;
         this.homeX = data.homeX || 0;
         this.homeY = data.homeY || 0;
         this.homeZoom = data.homeZoom || 1;
         this.homeRotation = data.homeRotation || 0;
-        this.targetX = this.x;
-        this.targetY = this.y;
-        this.targetZoom = this.zoom;
-        this.targetRotation = this.rotation;
+        this._syncTargetsFromState();
         this._syncToVexel();
     }
 
     destroy() {
+        this.animating = false;
         if (this.animationId) {
             cancelAnimationFrame(this.animationId);
+            this.animationId = null;
         }
     }
 }

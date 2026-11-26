@@ -1,0 +1,11 @@
+{
+  "name": "vexel",
+  "version": "1.0.0",
+  "description": "The Vector Graphics Engine for the Web",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node test/viewport-consistency.test.js",
+    "test:viewport": "node test/viewport-consistency.test.js"
+  }
+}

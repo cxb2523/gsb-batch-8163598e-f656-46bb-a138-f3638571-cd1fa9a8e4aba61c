@@ -1,16 +1,15 @@
 // src/core/canvas.js
+//
+// Canvas controller/helpers. Viewport state and drawing live on the engine
+// (`vexel.viewport`, `vexel.applyViewTransform`); this class only exposes
+// convenience APIs and delegates so it cannot drift from the overlay or
+// from exports.
 
 class VexelCanvas {
     constructor(vexel) {
         this.vexel = vexel;
-        this.width = vexel.width;
-        this.height = vexel.height;
-        this.zoom = 1;
         this.minZoom = 0.001;
         this.maxZoom = 100;
-        this.panX = 0;
-        this.panY = 0;
-        this.rotation = 0;
         this.gridVisible = false;
         this.gridSize = 20;
         this.gridColor = 'rgba(128,128,128,0.15)';
@@ -37,29 +36,29 @@ class VexelCanvas {
         this.animationId = null;
     }
 
+    /* ---- delegate to authoritative engine state ---- */
+
+    get width() { return this.vexel.width; }
+    get height() { return this.vexel.height; }
+    get zoom() { return this.vexel.viewport.zoom; }
+    get panX() { return this.vexel.viewport.x; }
+    get panY() { return this.vexel.viewport.y; }
+    get rotation() { return this.vexel.viewport.rotation; }
+
     resize(width, height) {
-        this.width = width;
-        this.height = height;
         this.vexel.resize(width, height);
     }
 
+    get pixelRatio() {
+        return this.vexel.pixelRatio;
+    }
+
     setZoom(zoom, cx, cy) {
-        const oldZoom = this.zoom;
-        this.zoom = Math.max(this.minZoom, Math.min(this.maxZoom, zoom));
-
-        if (cx !== undefined && cy !== undefined) {
-            this.panX = cx - (cx - this.panX) * (this.zoom / oldZoom);
-            this.panY = cy - (cy - this.panY) * (this.zoom / oldZoom);
-        }
-
-        this.vexel.viewport.zoom = this.zoom;
-        this.vexel.viewport.x = this.panX;
-        this.vexel.viewport.y = this.panY;
-        this.vexel.dirty = true;
+        this.vexel.setZoom(zoom, cx, cy);
     }
 
     zoomIn(factor = 1.2, cx, cy) {
-        if (!cx && !cy) {
+        if (cx === undefined || cy === undefined) {
             cx = this.width / 2;
             cy = this.height / 2;
         }
@@ -71,6 +70,7 @@ class VexelCanvas {
     }
 
     zoomToFit(shapes, padding = 50) {
+        const vp = this.vexel.viewport;
         if (!shapes || shapes.length === 0) {
             this.resetView();
             return;
@@ -87,17 +87,12 @@ class VexelCanvas {
 
         const contentWidth = maxX - minX + padding * 2;
         const contentHeight = maxY - minY + padding * 2;
-        const zoomX = this.width / contentWidth;
-        const zoomY = this.height / contentHeight;
-        const zoom = Math.min(zoomX, zoomY, 1);
+        const zoom = this.vexel.clampZoom(Math.min(this.width / contentWidth, this.height / contentHeight, 1));
 
-        this.zoom = zoom;
-        this.panX = (this.width - contentWidth * zoom) / 2 - minX * zoom + padding * zoom;
-        this.panY = (this.height - contentHeight * zoom) / 2 - minY * zoom + padding * zoom;
-
-        this.vexel.viewport.zoom = this.zoom;
-        this.vexel.viewport.x = this.panX;
-        this.vexel.viewport.y = this.panY;
+        vp.zoom = zoom;
+        vp.x = (this.width - contentWidth * zoom) / 2 - minX * zoom + padding * zoom;
+        vp.y = (this.height - contentHeight * zoom) / 2 - minY * zoom + padding * zoom;
+        vp.rotation = 0;
         this.vexel.dirty = true;
     }
 
@@ -108,35 +103,21 @@ class VexelCanvas {
     }
 
     resetView() {
-        this.zoom = 1;
-        this.panX = 0;
-        this.panY = 0;
-        this.rotation = 0;
-        this.vexel.viewport.zoom = 1;
-        this.vexel.viewport.x = 0;
-        this.vexel.viewport.y = 0;
-        this.vexel.viewport.rotation = 0;
-        this.vexel.dirty = true;
+        this.vexel.resetView();
     }
 
     pan(dx, dy) {
-        this.panX += dx;
-        this.panY += dy;
+        const vp = this.vexel.viewport;
+        vp.x += dx;
+        vp.y += dy;
 
         if (this.bounceEnabled) {
             const overscrollX = this._calculateOverscrollX();
             const overscrollY = this._calculateOverscrollY();
-
-            if (overscrollX !== 0) {
-                this.panX -= overscrollX * this.bounceDamping;
-            }
-            if (overscrollY !== 0) {
-                this.panY -= overscrollY * this.bounceDamping;
-            }
+            if (overscrollX !== 0) vp.x -= overscrollX * this.bounceDamping;
+            if (overscrollY !== 0) vp.y -= overscrollY * this.bounceDamping;
         }
 
-        this.vexel.viewport.x = this.panX;
-        this.vexel.viewport.y = this.panY;
         this.vexel.dirty = true;
     }
 
@@ -205,17 +186,11 @@ class VexelCanvas {
     }
 
     screenToCanvas(screenX, screenY) {
-        return {
-            x: (screenX - this.panX) / this.zoom,
-            y: (screenY - this.panY) / this.zoom
-        };
+        return this.vexel.screenToWorld(screenX, screenY);
     }
 
     canvasToScreen(canvasX, canvasY) {
-        return {
-            x: canvasX * this.zoom + this.panX,
-            y: canvasY * this.zoom + this.panY
-        };
+        return this.vexel.worldToScreen(canvasX, canvasY);
     }
 
     setGrid(visible, size, color, thickColor, thickEvery) {
@@ -225,7 +200,7 @@ class VexelCanvas {
         if (thickColor !== undefined) this.gridThickColor = thickColor;
         if (thickEvery !== undefined) this.gridThickEvery = thickEvery;
         this.vexel.gridEnabled = visible;
-        this.vexel.snapSize = size || this.vexel.snapSize;
+        if (size !== undefined) this.vexel.snapSize = size;
         this.vexel.dirty = true;
     }
 
@@ -234,7 +209,7 @@ class VexelCanvas {
         if (size !== undefined) this.snapSize = size;
         if (threshold !== undefined) this.snapThreshold = threshold;
         this.vexel.snapEnabled = enabled;
-        this.vexel.snapSize = size || this.vexel.snapSize;
+        if (size !== undefined) this.vexel.snapSize = size;
     }
 
     snapPoint(x, y) {
@@ -253,11 +228,7 @@ class VexelCanvas {
     }
 
     addGuide(orientation, position, color = '#FF5722') {
-        this.guides.push({
-            orientation,
-            position,
-            color
-        });
+        this.guides.push({ orientation, position, color });
         this.guidesVisible = true;
         this.vexel.dirty = true;
         return this.guides.length - 1;
@@ -278,24 +249,25 @@ class VexelCanvas {
     drawGuides(ctx) {
         if (!this.guidesVisible || this.guides.length === 0) return;
 
+        const vp = this.vexel.viewport;
+        const zoom = vp.zoom;
         ctx.save();
-        ctx.translate(this.panX, this.panY);
-        ctx.scale(this.zoom, this.zoom);
+        this.vexel.applyViewTransform(ctx);
 
         for (const guide of this.guides) {
             ctx.strokeStyle = guide.color || '#FF5722';
-            ctx.lineWidth = 1 / this.zoom;
-            ctx.setLineDash([4, 4]);
+            ctx.lineWidth = 1 / zoom;
+            ctx.setLineDash([4 / zoom, 4 / zoom]);
 
             if (guide.orientation === 'horizontal') {
                 ctx.beginPath();
-                ctx.moveTo(-this.panX / this.zoom, guide.position);
-                ctx.lineTo((this.width - this.panX) / this.zoom, guide.position);
+                ctx.moveTo(-vp.x / zoom, guide.position);
+                ctx.lineTo((this.width - vp.x) / zoom, guide.position);
                 ctx.stroke();
             } else {
                 ctx.beginPath();
-                ctx.moveTo(guide.position, -this.panY / this.zoom);
-                ctx.lineTo(guide.position, (this.height - this.panY) / this.zoom);
+                ctx.moveTo(guide.position, -vp.y / zoom);
+                ctx.lineTo(guide.position, (this.height - vp.y) / zoom);
                 ctx.stroke();
             }
 
@@ -307,96 +279,23 @@ class VexelCanvas {
 
     drawRulers(ctx) {
         if (!this.rulersVisible) return;
-
-        ctx.save();
-        ctx.fillStyle = '#f5f5f4';
-        ctx.fillRect(0, 0, this.width, this.rulerSize);
-        ctx.fillRect(0, 0, this.rulerSize, this.height);
-
-        ctx.strokeStyle = '#d6d3d1';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(0, 0, this.width, this.rulerSize);
-        ctx.strokeRect(0, 0, this.rulerSize, this.height);
-
-        ctx.fillStyle = '#78716c';
-        ctx.font = '9px -apple-system, sans-serif';
-
-        const step = this.gridSize * this.zoom;
-        const startX = this.panX % step;
-        const startY = this.panY % step;
-
-        for (let x = startX; x < this.width; x += step) {
-            if (x < this.rulerSize) continue;
-            const canvasX = (x - this.panX) / this.zoom;
-            ctx.fillText(Math.round(canvasX / this.gridSize) * this.gridSize, x + 2, 12);
-        }
-
-        for (let y = startY; y < this.height; y += step) {
-            if (y < this.rulerSize) continue;
-            const canvasY = (y - this.panY) / this.zoom;
-            ctx.save();
-            ctx.translate(12, y + 2);
-            ctx.rotate(-Math.PI / 2);
-            ctx.fillText(Math.round(canvasY / this.gridSize) * this.gridSize, 0, 0);
-            ctx.restore();
-        }
-
-        ctx.restore();
+        this.vexel.rulersVisible = true;
+        this.vexel.rulerSize = this.rulerSize;
+        this.vexel._drawRulers(ctx);
     }
 
     drawGrid(ctx) {
         if (!this.gridVisible) return;
-
-        ctx.save();
-        ctx.translate(this.panX, this.panY);
-        ctx.scale(this.zoom, this.zoom);
-
-        const gridSize = this.gridSize;
-        const startX = Math.floor(-this.panX / this.zoom / gridSize) * gridSize;
-        const startY = Math.floor(-this.panY / this.zoom / gridSize) * gridSize;
-        const endX = Math.ceil((this.width - this.panX) / this.zoom / gridSize) * gridSize;
-        const endY = Math.ceil((this.height - this.panY) / this.zoom / gridSize) * gridSize;
-
-        ctx.strokeStyle = this.gridColor;
-        ctx.lineWidth = 0.5;
-
-        ctx.beginPath();
-        for (let x = startX; x <= endX; x += gridSize) {
-            if (x % (gridSize * this.gridThickEvery) === 0) continue;
-            ctx.moveTo(x, startY);
-            ctx.lineTo(x, endY);
-        }
-        for (let y = startY; y <= endY; y += gridSize) {
-            if (y % (gridSize * this.gridThickEvery) === 0) continue;
-            ctx.moveTo(startX, y);
-            ctx.lineTo(endX, y);
-        }
-        ctx.stroke();
-
-        ctx.strokeStyle = this.gridThickColor;
-        ctx.lineWidth = 1;
-
-        ctx.beginPath();
-        for (let x = startX; x <= endX; x += gridSize * this.gridThickEvery) {
-            ctx.moveTo(x, startY);
-            ctx.lineTo(x, endY);
-        }
-        for (let y = startY; y <= endY; y += gridSize * this.gridThickEvery) {
-            ctx.moveTo(startX, y);
-            ctx.lineTo(endX, y);
-        }
-        ctx.stroke();
-
-        ctx.restore();
+        this.vexel.gridEnabled = true;
+        this.vexel.gridSize = this.gridSize;
+        this.vexel.gridColor = this.gridColor;
+        this.vexel.gridThickColor = this.gridThickColor;
+        this.vexel.gridThickEvery = this.gridThickEvery;
+        this.vexel._drawGrid(ctx);
     }
 
     getVisibleBounds() {
-        return {
-            x: -this.panX / this.zoom,
-            y: -this.panY / this.zoom,
-            width: this.width / this.zoom,
-            height: this.height / this.zoom
-        };
+        return this.vexel.getVisibleWorldBounds();
     }
 
     getVisibleShapes(shapes) {

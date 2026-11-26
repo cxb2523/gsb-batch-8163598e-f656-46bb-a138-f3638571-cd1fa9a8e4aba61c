@@ -49,10 +49,10 @@ class VexelPenTool {
 
     _getCanvasPoint(e) {
         const rect = this.vexel.container.getBoundingClientRect();
-        return {
-            x: (e.clientX - rect.left - this.vexel.viewport.x) / this.vexel.viewport.zoom,
-            y: (e.clientY - rect.top - this.vexel.viewport.y) / this.vexel.viewport.zoom
-        };
+        return this.vexel.screenToWorld(
+            e.clientX - rect.left,
+            e.clientY - rect.top
+        );
     }
 
     _onPointerDown(e) {
@@ -249,10 +249,10 @@ class VexelPencilTool {
 
     _getCanvasPoint(e) {
         const rect = this.vexel.container.getBoundingClientRect();
-        return {
-            x: (e.clientX - rect.left - this.vexel.viewport.x) / this.vexel.viewport.zoom,
-            y: (e.clientY - rect.top - this.vexel.viewport.y) / this.vexel.viewport.zoom
-        };
+        return this.vexel.screenToWorld(
+            e.clientX - rect.left,
+            e.clientY - rect.top
+        );
     }
 
     activate() {
@@ -403,11 +403,12 @@ class VexelBrushTool {
 
     _getCanvasPoint(e) {
         const rect = this.vexel.container.getBoundingClientRect();
-        return {
-            x: (e.clientX - rect.left - this.vexel.viewport.x) / this.vexel.viewport.zoom,
-            y: (e.clientY - rect.top - this.vexel.viewport.y) / this.vexel.viewport.zoom,
-            pressure: e.pressure || 0.5
-        };
+        const point = this.vexel.screenToWorld(
+            e.clientX - rect.left,
+            e.clientY - rect.top
+        );
+        point.pressure = e.pressure || 0.5;
+        return point;
     }
 
     activate() {
@@ -474,13 +475,13 @@ class VexelBrushTool {
     _renderStroke() {
         if (this.points.length < 2) return;
 
-        this.vexel.renderer.clear();
-        this.vexel.renderer.renderAll();
+        // Full repaint of the scene (main canvas + selection overlay) via the
+        // shared render path, then overlay the in-progress stroke preview.
+        this.vexel.render();
 
         const ctx = this.vexel.ctx;
         ctx.save();
-        ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-        ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+        this.vexel.applyViewTransform(ctx);
 
         ctx.strokeStyle = this.strokeColor;
         ctx.lineCap = 'round';

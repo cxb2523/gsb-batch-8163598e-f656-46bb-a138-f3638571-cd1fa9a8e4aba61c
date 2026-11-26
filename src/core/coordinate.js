@@ -11,16 +11,27 @@ class VexelCoordinateSystem {
     }
 
     screenToWorld(screenX, screenY) {
-        return {
-            x: (screenX - this.vexel.viewport.x) / this.vexel.viewport.zoom,
-            y: (screenY - this.vexel.viewport.y) / this.vexel.viewport.zoom
-        };
+        if (typeof this.vexel.screenToWorld === 'function') {
+            return this.vexel.screenToWorld(screenX, screenY);
+        }
+        const vp = this.vexel.viewport;
+        const cos = Math.cos(vp.rotation || 0);
+        const sin = Math.sin(vp.rotation || 0);
+        const dx = (screenX - vp.x) / vp.zoom;
+        const dy = (screenY - vp.y) / vp.zoom;
+        return { x: dx * cos + dy * sin, y: -dx * sin + dy * cos };
     }
 
     worldToScreen(worldX, worldY) {
+        if (typeof this.vexel.worldToScreen === 'function') {
+            return this.vexel.worldToScreen(worldX, worldY);
+        }
+        const vp = this.vexel.viewport;
+        const cos = Math.cos(vp.rotation || 0);
+        const sin = Math.sin(vp.rotation || 0);
         return {
-            x: worldX * this.vexel.viewport.zoom + this.vexel.viewport.x,
-            y: worldY * this.vexel.viewport.zoom + this.vexel.viewport.y
+            x: vp.x + vp.zoom * (worldX * cos - worldY * sin),
+            y: vp.y + vp.zoom * (worldX * sin + worldY * cos)
         };
     }
 

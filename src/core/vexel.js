@@ -2,16 +2,20 @@
 
 class Vexel {
     constructor(config = {}) {
-        this.container = typeof config.container === 'string' 
-            ? document.querySelector(config.container) 
+        this.container = typeof config.container === 'string'
+            ? document.querySelector(config.container)
             : config.container || document.body;
-        this.width = config.width || 800;
-        this.height = config.height || 600;
+        this.width = Math.max(1, Math.round(config.width || 800));
+        this.height = Math.max(1, Math.round(config.height || 600));
         this.zoomEnabled = config.zoom !== false;
         this.panEnabled = config.pan !== false;
         this.gridEnabled = config.grid || false;
         this.snapEnabled = config.snap || false;
         this.snapSize = config.snapSize || 10;
+        this.gridSize = config.gridSize || this.snapSize || 20;
+        this.gridColor = config.gridColor || 'rgba(128,128,128,0.15)';
+        this.gridThickColor = config.gridThickColor || 'rgba(128,128,128,0.3)';
+        this.gridThickEvery = config.gridThickEvery || 5;
         this.theme = config.theme || 'dark';
         this.locale = config.locale || 'en';
         this.plugins = [];
@@ -20,8 +24,22 @@ class Vexel {
         this.selectedShapes = [];
         this.clipboard = [];
         this.history = { undo: [], redo: [], maxSteps: config.maxHistory || 100 };
+
+        // Single authoritative viewport state. Everything (main canvas,
+        // overlay, hit-testing and exports) reads/writes this one object.
+        // x/y are CSS-pixel offsets, zoom is a scalar and rotation is radians.
         this.viewport = { x: 0, y: 0, zoom: 1, rotation: 0 };
+        this.minZoom = config.minZoom || 0.001;
+        this.maxZoom = config.maxZoom || 100;
+
+        this.pixelRatio = Vexel.getDevicePixelRatio();
+        this.backend = 'canvas2d';
+        this.webglRenderer = null;
         this.tool = 'select';
+        this.antialias = true;
+        this.rulersVisible = config.rulers || false;
+        this.rulerSize = config.rulerSize || 20;
+        this.selectTool = null;
         this.renderer = null;
         this.canvas = null;
         this.ctx = null;
@@ -30,7 +48,13 @@ class Vexel {
         this.frameId = null;
         this.dirty = true;
         this.destroyed = false;
+        this.autoRender = config.autoRender !== false;
         this._init();
+    }
+
+    static getDevicePixelRatio() {
+        const ratio = typeof window !== 'undefined' ? window.devicePixelRatio : 1;
+        return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
     }
 
     _init() {
@@ -48,112 +72,539 @@ class Vexel {
         this.container.style.height = this.height + 'px';
 
         this.canvas = document.createElement('canvas');
-        this.canvas.width = this.width * window.devicePixelRatio;
-        this.canvas.height = this.height * window.devicePixelRatio;
-        this.canvas.style.width = this.width + 'px';
-        this.canvas.style.height = this.height + 'px';
+        this.canvas.dataset.vexelLayer = 'scene';
         this.canvas.style.position = 'absolute';
         this.canvas.style.top = '0';
         this.canvas.style.left = '0';
         this.ctx = this.canvas.getContext('2d');
-        this.ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
 
         this.overlayCanvas = document.createElement('canvas');
-        this.overlayCanvas.width = this.width * window.devicePixelRatio;
-        this.overlayCanvas.height = this.height * window.devicePixelRatio;
-        this.overlayCanvas.style.width = this.width + 'px';
-        this.overlayCanvas.style.height = this.height + 'px';
+        this.overlayCanvas.dataset.vexelLayer = 'overlay';
         this.overlayCanvas.style.position = 'absolute';
         this.overlayCanvas.style.top = '0';
         this.overlayCanvas.style.left = '0';
         this.overlayCanvas.style.pointerEvents = 'none';
         this.overlayCtx = this.overlayCanvas.getContext('2d');
-        this.overlayCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+        // Sizes both backing stores from the same DPR and resets every
+        // transform. This is the only place that decides pixel dimensions.
+        this._resizeCanvases();
 
         this.container.appendChild(this.canvas);
         this.container.appendChild(this.overlayCanvas);
     }
 
+    /**
+     * Rebuild both canvas backing stores for the current logical size and
+     * devicePixelRatio. Assigning width/height resets the context, so we
+     * explicitly re-apply the DPR transform afterwards. This prevents
+     * zoom/DPR scaling from accumulating across repeated resizes.
+     */
+    _resizeCanvases() {
+        this.pixelRatio = Vexel.getDevicePixelRatio();
+        const pixelWidth = Math.max(1, Math.round(this.width * this.pixelRatio));
+        const pixelHeight = Math.max(1, Math.round(this.height * this.pixelRatio));
+
+        for (const canvas of [this.canvas, this.overlayCanvas]) {
+            if (!canvas) continue;
+            canvas.width = pixelWidth;
+            canvas.height = pixelHeight;
+            canvas.style.width = this.width + 'px';
+            canvas.style.height = this.height + 'px';
+        }
+
+        for (const ctx of [this.ctx, this.overlayCtx]) {
+            if (!ctx) continue;
+            ctx.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
+        }
+    }
+
     _setupRenderer() {
+        // Public aliases used by tools/plugins. They always go through the
+        // single shared render path so main canvas and overlay cannot drift.
         this.renderer = {
-            clear: () => {
-                this.ctx.clearRect(0, 0, this.width, this.height);
-                this.overlayCtx.clearRect(0, 0, this.width, this.height);
-            },
-            renderAll: () => {
-                this.renderer.clear();
-                if (this.gridEnabled) this._drawGrid();
-                this.ctx.save();
-                this.ctx.translate(this.viewport.x, this.viewport.y);
-                this.ctx.scale(this.viewport.zoom, this.viewport.zoom);
-                this.ctx.rotate(this.viewport.rotation);
-                for (const shape of this.shapes) {
-                    if (shape.visible !== false) shape.draw(this.ctx);
-                }
-                this.ctx.restore();
-                this._drawSelectionHandles();
-                this.dirty = false;
-            }
+            clear: () => this.clearCanvas(),
+            renderAll: () => this.render(),
+            render: () => this.render(),
+            setBackend: (backend) => this.setBackend(backend)
         };
     }
 
-    _drawGrid() {
-        const gridSize = this.snapSize * this.viewport.zoom;
-        const offsetX = this.viewport.x % gridSize;
-        const offsetY = this.viewport.y % gridSize;
-        this.ctx.strokeStyle = 'rgba(128,128,128,0.15)';
-        this.ctx.lineWidth = 0.5;
-        this.ctx.beginPath();
-        for (let x = offsetX; x < this.width; x += gridSize) {
-            this.ctx.moveTo(x, 0);
-            this.ctx.lineTo(x, this.height);
+    /* ------------------------------------------------------------------ */
+    /* Viewport: single source of truth                                    */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Apply the authoritative viewport transform (offset + rotation + zoom)
+     * to any 2D context. Main canvas, overlay and exports all use this.
+     */
+    applyViewTransform(ctx) {
+        const vp = this.viewport;
+        ctx.translate(vp.x, vp.y);
+        ctx.rotate(vp.rotation || 0);
+        ctx.scale(vp.zoom, vp.zoom);
+        return ctx;
+    }
+
+    getViewTransform() {
+        return {
+            x: this.viewport.x,
+            y: this.viewport.y,
+            zoom: this.viewport.zoom,
+            rotation: this.viewport.rotation,
+            pixelRatio: this.pixelRatio
+        };
+    }
+
+    screenToWorld(screenX, screenY) {
+        const vp = this.viewport;
+        const cos = Math.cos(vp.rotation || 0);
+        const sin = Math.sin(vp.rotation || 0);
+        const dx = (screenX - vp.x) / vp.zoom;
+        const dy = (screenY - vp.y) / vp.zoom;
+        return {
+            x: dx * cos + dy * sin,
+            y: -dx * sin + dy * cos
+        };
+    }
+
+    worldToScreen(worldX, worldY) {
+        const vp = this.viewport;
+        const cos = Math.cos(vp.rotation || 0);
+        const sin = Math.sin(vp.rotation || 0);
+        return {
+            x: vp.x + vp.zoom * (worldX * cos - worldY * sin),
+            y: vp.y + vp.zoom * (worldX * sin + worldY * cos)
+        };
+    }
+
+    clampZoom(zoom) {
+        return Math.max(this.minZoom, Math.min(this.maxZoom, zoom));
+    }
+
+    /**
+     * Change zoom while keeping the given screen anchor point fixed under
+     * the cursor. Shared by wheel handling and all zoom helpers.
+     */
+    setZoom(zoom, anchorX, anchorY) {
+        const oldZoom = this.viewport.zoom;
+        const newZoom = this.clampZoom(zoom);
+        if (!Number.isFinite(newZoom) || newZoom === oldZoom) {
+            this.viewport.zoom = newZoom;
+            this.dirty = true;
+            return this.viewport.zoom;
         }
-        for (let y = offsetY; y < this.height; y += gridSize) {
-            this.ctx.moveTo(0, y);
-            this.ctx.lineTo(this.width, y);
+
+        if (anchorX !== undefined && anchorY !== undefined) {
+            const ratio = newZoom / oldZoom;
+            this.viewport.x = anchorX - (anchorX - this.viewport.x) * ratio;
+            this.viewport.y = anchorY - (anchorY - this.viewport.y) * ratio;
         }
-        this.ctx.stroke();
+
+        this.viewport.zoom = newZoom;
+        this.dirty = true;
+        return newZoom;
+    }
+
+    zoomAt(factor, anchorX, anchorY) {
+        return this.setZoom(this.viewport.zoom * factor, anchorX, anchorY);
+    }
+
+    panBy(dx, dy) {
+        this.viewport.x += dx;
+        this.viewport.y += dy;
+        this.dirty = true;
+    }
+
+    setViewport({ x, y, zoom, rotation } = {}) {
+        if (x !== undefined) this.viewport.x = x;
+        if (y !== undefined) this.viewport.y = y;
+        if (zoom !== undefined) this.viewport.zoom = this.clampZoom(zoom);
+        if (rotation !== undefined) this.viewport.rotation = rotation;
+        this.dirty = true;
+    }
+
+    resetView() {
+        // Mutate in place so any adapter/tool holding this object stays valid.
+        this.viewport.x = 0;
+        this.viewport.y = 0;
+        this.viewport.zoom = 1;
+        this.viewport.rotation = 0;
+        this.dirty = true;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rendering                                                           */
+    /* ------------------------------------------------------------------ */
+
+    clearCanvas() {
+        const pixelWidth = this.canvas ? this.canvas.width : 0;
+        const pixelHeight = this.canvas ? this.canvas.height : 0;
+        if (this.ctx) {
+            this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+            this.ctx.clearRect(0, 0, pixelWidth, pixelHeight);
+            this.ctx.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
+        }
+        if (this.overlayCtx) {
+            this.overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+            this.overlayCtx.clearRect(0, 0, pixelWidth, pixelHeight);
+            this.overlayCtx.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
+        }
+    }
+
+    render() {
+        if (this.destroyed) return;
+
+        this.clearCanvas();
+
+        const ctx = this.ctx;
+
+        if (this.gridEnabled) this._drawGrid(ctx);
+
+        if (this.backend === 'webgl' && this.webglRenderer) {
+            this._renderWebGLScene();
+        } else {
+            this._renderCanvasShapes(ctx);
+        }
+
+        // Rulers sit on top of the artwork (they are fixed UI chrome).
+        if (this.rulersVisible) this._drawRulers(ctx);
+
+        this.renderSelectionOverlay(this.overlayCtx);
+
+        this.dirty = false;
+        this._fireEvent('render', { viewport: this.getViewTransform() });
+    }
+
+    _drawShapes2D(ctx, shapes = this.shapes) {
+        for (const shape of shapes) {
+            if (shape && shape.visible !== false) shape.draw(ctx);
+        }
+    }
+
+    _renderCanvasShapes(ctx) {
+        ctx.save();
+        if (this.antialias !== false) {
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+        }
+        this._applyViewTransform(ctx, this.viewport);
+        this._drawShapes2D(ctx);
+        ctx.restore();
+    }
+
+    _renderWebGLScene() {
+        try {
+            const renderer = this.webglRenderer;
+            renderer.begin();
+            const supported = [];
+            const unsupported = [];
+            for (const shape of this.shapes) {
+                if (!shape || shape.visible === false) continue;
+                if (renderer.supportsShape && renderer.supportsShape(shape)) {
+                    supported.push(shape);
+                } else {
+                    unsupported.push(shape);
+                }
+            }
+            for (const shape of supported) renderer.drawShape(shape);
+            renderer.end();
+
+            if (unsupported.length === 0) {
+                // Composite the WebGL canvas into the main 2D canvas so the
+                // overlay/grid stay in one shared coordinate space.
+                this.ctx.drawImage(renderer.canvas, 0, 0, this.width, this.height);
+            } else {
+                // Mixed scene: fall back to Canvas2D for everything so z-order
+                // stays correct and no shape silently disappears.
+                this._renderCanvasShapes(this.ctx);
+            }
+        } catch (error) {
+            console.warn('WebGL render failed, falling back to Canvas2D:', error);
+            this._fallbackToCanvas2D();
+            // The current frame was already cleared; redraw it via Canvas2D
+            // now so the user never sees a blank canvas for one frame.
+            this._renderCanvasShapes(this.ctx);
+        }
+    }
+
+    _drawGrid(ctx) {
+        this._drawGridOn(ctx, this.viewport);
+    }
+
+    _drawGridOn(ctx, viewport) {
+        const zoom = viewport.zoom;
+        const gridSize = this.gridSize;
+        if (!gridSize || gridSize <= 0 || zoom <= 0) return;
+
+        const worldBounds = this._visibleWorldBoundsFor(viewport);
+        const startX = Math.floor(worldBounds.x / gridSize) * gridSize;
+        const startY = Math.floor(worldBounds.y / gridSize) * gridSize;
+        const endX = Math.ceil((worldBounds.x + worldBounds.width) / gridSize) * gridSize;
+        const endY = Math.ceil((worldBounds.y + worldBounds.height) / gridSize) * gridSize;
+
+        ctx.save();
+        this._applyViewTransform(ctx, viewport);
+        ctx.strokeStyle = this.gridColor;
+        ctx.lineWidth = 0.5 / zoom;
+
+        ctx.beginPath();
+        for (let x = startX; x <= endX; x += gridSize) {
+            ctx.moveTo(x, startY);
+            ctx.lineTo(x, endY);
+        }
+        for (let y = startY; y <= endY; y += gridSize) {
+            ctx.moveTo(startX, y);
+            ctx.lineTo(endX, y);
+        }
+        ctx.stroke();
+
+        if (this.gridThickEvery > 1) {
+            ctx.strokeStyle = this.gridThickColor;
+            ctx.lineWidth = 1 / zoom;
+            ctx.beginPath();
+            for (let x = startX; x <= endX; x += gridSize * this.gridThickEvery) {
+                ctx.moveTo(x, startY);
+                ctx.lineTo(x, endY);
+            }
+            for (let y = startY; y <= endY; y += gridSize * this.gridThickEvery) {
+                ctx.moveTo(startX, y);
+                ctx.lineTo(endX, y);
+            }
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    _applyViewTransform(ctx, vp) {
+        ctx.translate(vp.x, vp.y);
+        ctx.rotate(vp.rotation || 0);
+        ctx.scale(vp.zoom, vp.zoom);
+    }
+
+    _visibleWorldBoundsFor(vp) {
+        const corners = [
+            this._screenToWorldFor(vp, 0, 0),
+            this._screenToWorldFor(vp, this.width, 0),
+            this._screenToWorldFor(vp, this.width, this.height),
+            this._screenToWorldFor(vp, 0, this.height)
+        ];
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of corners) {
+            minX = Math.min(minX, p.x);
+            minY = Math.min(minY, p.y);
+            maxX = Math.max(maxX, p.x);
+            maxY = Math.max(maxY, p.y);
+        }
+        return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+    }
+
+    _screenToWorldFor(vp, screenX, screenY) {
+        const cos = Math.cos(vp.rotation || 0);
+        const sin = Math.sin(vp.rotation || 0);
+        const dx = (screenX - vp.x) / vp.zoom;
+        const dy = (screenY - vp.y) / vp.zoom;
+        return { x: dx * cos + dy * sin, y: -dx * sin + dy * cos };
+    }
+
+    _drawRulers(ctx) {
+        const rulerSize = this.rulerSize || 20;
+        ctx.save();
+        ctx.fillStyle = '#f5f5f4';
+        ctx.fillRect(0, 0, this.width, rulerSize);
+        ctx.fillRect(0, 0, rulerSize, this.height);
+        ctx.strokeStyle = '#d6d3d1';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0, 0, this.width, rulerSize);
+        ctx.strokeRect(0, 0, rulerSize, this.height);
+
+        ctx.fillStyle = '#78716c';
+        ctx.font = '9px -apple-system, sans-serif';
+        ctx.textBaseline = 'middle';
+
+        const gridSize = this.gridSize || 20;
+        const step = gridSize * this.viewport.zoom;
+        if (step < 1) {
+            ctx.restore();
+            return;
+        }
+        const startX = this.viewport.x % step;
+        const startY = this.viewport.y % step;
+
+        for (let x = startX; x < this.width; x += step) {
+            if (x < rulerSize) continue;
+            const world = this.screenToWorld(x, 0);
+            ctx.fillText(Math.round(world.x / gridSize) * gridSize, x + 2, 12);
+        }
+        for (let y = startY; y < this.height; y += step) {
+            if (y < rulerSize) continue;
+            const world = this.screenToWorld(0, y);
+            ctx.save();
+            ctx.translate(12, y + 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText(Math.round(world.y / gridSize) * gridSize, 0, 0);
+            ctx.restore();
+        }
+        ctx.restore();
     }
 
     _drawSelectionHandles() {
-        if (this.selectedShapes.length === 0) return;
-        this.overlayCtx.save();
-        this.overlayCtx.translate(this.viewport.x, this.viewport.y);
-        this.overlayCtx.scale(this.viewport.zoom, this.viewport.zoom);
-        for (const shape of this.selectedShapes) {
-            const bounds = shape.getBounds();
-            this.overlayCtx.strokeStyle = '#4A90D9';
-            this.overlayCtx.lineWidth = 1.5 / this.viewport.zoom;
-            this.overlayCtx.setLineDash([4, 4]);
-            this.overlayCtx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
-            this.overlayCtx.setLineDash([]);
-            this._drawHandle(bounds.x, bounds.y);
-            this._drawHandle(bounds.x + bounds.width, bounds.y);
-            this._drawHandle(bounds.x, bounds.y + bounds.height);
-            this._drawHandle(bounds.x + bounds.width, bounds.y + bounds.height);
-            this._drawHandle(bounds.x + bounds.width / 2, bounds.y);
-            this._drawHandle(bounds.x + bounds.width / 2, bounds.y + bounds.height);
-            this._drawHandle(bounds.x, bounds.y + bounds.height / 2);
-            this._drawHandle(bounds.x + bounds.width, bounds.y + bounds.height / 2);
-        }
-        this.overlayCtx.restore();
+        // Kept for backwards compatibility; delegates to the shared overlay.
+        this.renderSelectionOverlay(this.overlayCtx);
     }
 
-    _drawHandle(x, y) {
-        const size = 7 / this.viewport.zoom;
-        this.overlayCtx.fillStyle = '#ffffff';
-        this.overlayCtx.strokeStyle = '#4A90D9';
-        this.overlayCtx.lineWidth = 1.5 / this.viewport.zoom;
-        this.overlayCtx.beginPath();
-        this.overlayCtx.rect(x - size / 2, y - size / 2, size, size);
-        this.overlayCtx.fill();
-        this.overlayCtx.stroke();
+    renderSelectionOverlay(ctx) {
+        if (!ctx) return;
+        const selected = this.selectedShapes;
+        if (!selected || selected.length === 0) {
+            if (this.selectTool && this.selectTool.marquee) {
+                this.selectTool.drawMarquee(ctx);
+            }
+            return;
+        }
+
+        const zoom = this.viewport.zoom;
+        ctx.save();
+        this._applyViewTransform(ctx, this.viewport);
+
+        for (const shape of selected) {
+            const bounds = shape.getBounds();
+            const handleSize = 7 / zoom;
+
+            ctx.strokeStyle = '#4A90D9';
+            ctx.lineWidth = 1.5 / zoom;
+            ctx.setLineDash([4 / zoom, 4 / zoom]);
+            ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
+            ctx.setLineDash([]);
+
+            const handles = [
+                { x: bounds.x, y: bounds.y },
+                { x: bounds.x + bounds.width, y: bounds.y },
+                { x: bounds.x, y: bounds.y + bounds.height },
+                { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
+                { x: bounds.x + bounds.width / 2, y: bounds.y },
+                { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height },
+                { x: bounds.x, y: bounds.y + bounds.height / 2 },
+                { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 }
+            ];
+
+            for (const h of handles) {
+                this._drawHandle(ctx, h.x, h.y, handleSize / 2);
+            }
+        }
+        ctx.restore();
+
+        if (this.selectTool && this.selectTool.marquee) {
+            this.selectTool.drawMarquee(ctx);
+        }
+        if (this.selectTool && selected.length === 1) {
+            this.selectTool.drawRotationHandle(ctx);
+        }
+    }
+
+    _drawHandle(ctx, x, y, half) {
+        const zoom = this.viewport.zoom;
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#4A90D9';
+        ctx.lineWidth = 1.5 / zoom;
+        ctx.fillRect(x - half, y - half, half * 2, half * 2);
+        ctx.strokeRect(x - half, y - half, half * 2, half * 2);
+    }
+
+    getVisibleWorldBounds() {
+        return this._visibleWorldBoundsFor(this.viewport);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Backends                                                            */
+    /* ------------------------------------------------------------------ */
+
+    setBackend(backend) {
+        const aliases = { '2d': 'canvas2d', canvas: 'canvas2d', gpu: 'webgl' };
+        backend = aliases[backend] || backend;
+
+        if (backend === this.backend && backend !== 'webgl') {
+            return this.backend;
+        }
+
+        if (backend === 'canvas2d' || backend === undefined) {
+            this._destroyWebGL();
+            this.backend = 'canvas2d';
+            this.dirty = true;
+            return this.backend;
+        }
+
+        if (backend !== 'webgl') {
+            console.warn(`Backend "${backend}" not supported. Using canvas2d.`);
+            this._destroyWebGL();
+            this.backend = 'canvas2d';
+            this.dirty = true;
+            return this.backend;
+        }
+
+        const ok = this._initWebGL();
+        if (!ok) {
+            this._destroyWebGL();
+            this.backend = 'canvas2d';
+            this.dirty = true;
+            return this.backend;
+        }
+
+        this.backend = 'webgl';
+        this.dirty = true;
+        return this.backend;
+    }
+
+    _initWebGL() {
+        if (typeof window === 'undefined') return false;
+        const WebGLRenderer = window.VexelWebGLRenderer;
+        if (typeof WebGLRenderer !== 'function') return false;
+        if (this.webglRenderer) return true;
+
+        let renderer = null;
+        try {
+            renderer = new WebGLRenderer(this);
+            const ok = renderer.init({
+                width: this.width,
+                height: this.height,
+                pixelRatio: this.pixelRatio
+            });
+            if (!ok) {
+                if (renderer.destroy) renderer.destroy();
+                return false;
+            }
+            this.webglRenderer = renderer;
+            return true;
+        } catch (error) {
+            console.warn('WebGL initialization failed:', error);
+            if (renderer && renderer.destroy) renderer.destroy();
+            this.webglRenderer = null;
+            return false;
+        }
+    }
+
+    _destroyWebGL() {
+        if (this.webglRenderer) {
+            try {
+                this.webglRenderer.destroy();
+            } catch (error) {
+                console.warn('Error destroying WebGL renderer:', error);
+            }
+            this.webglRenderer = null;
+        }
+    }
+
+    _fallbackToCanvas2D() {
+        this._destroyWebGL();
+        this.backend = 'canvas2d';
+        this.dirty = true;
     }
 
     _startLoop() {
+        if (!this.autoRender) return;
         const loop = () => {
             if (this.destroyed) return;
-            if (this.dirty) this.renderer.renderAll();
+            if (this.dirty) this.render();
             this.frameId = requestAnimationFrame(loop);
         };
         this.frameId = requestAnimationFrame(loop);
@@ -164,22 +615,20 @@ class Vexel {
         let panStart = { x: 0, y: 0 };
         let panViewportStart = { x: 0, y: 0 };
 
-        this.container.addEventListener('wheel', (e) => {
+        this._wheelHandler = (e) => {
             if (!this.zoomEnabled) return;
             e.preventDefault();
-            const delta = e.deltaY > 0 ? 0.9 : 1.1;
-            const newZoom = Math.max(0.01, Math.min(100, this.viewport.zoom * delta));
             const rect = this.container.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
-            this.viewport.x = mouseX - (mouseX - this.viewport.x) * (newZoom / this.viewport.zoom);
-            this.viewport.y = mouseY - (mouseY - this.viewport.y) * (newZoom / this.viewport.zoom);
-            this.viewport.zoom = newZoom;
-            this.dirty = true;
-        }, { passive: false });
+            const delta = e.deltaY > 0 ? 0.9 : 1.1;
+            this.setZoom(this.viewport.zoom * delta, mouseX, mouseY);
+        };
+        this.container.addEventListener('wheel', this._wheelHandler, { passive: false });
 
-        this.container.addEventListener('mousedown', (e) => {
+        this._mouseDownHandler = (e) => {
             if (e.button === 1 || (e.button === 0 && e.altKey)) {
+                if (!this.panEnabled) return;
                 isPanning = true;
                 panStart = { x: e.clientX, y: e.clientY };
                 panViewportStart = { x: this.viewport.x, y: this.viewport.y };
@@ -189,29 +638,34 @@ class Vexel {
             if (e.button === 0) {
                 this._handleMouseDown(e);
             }
-        });
+        };
+        this.container.addEventListener('mousedown', this._mouseDownHandler);
 
-        window.addEventListener('mousemove', (e) => {
+        this._mouseMoveHandler = (e) => {
             if (isPanning) {
                 this.viewport.x = panViewportStart.x + (e.clientX - panStart.x);
                 this.viewport.y = panViewportStart.y + (e.clientY - panStart.y);
                 this.dirty = true;
             }
-        });
+        };
+        window.addEventListener('mousemove', this._mouseMoveHandler);
 
-        window.addEventListener('mouseup', () => {
+        this._mouseUpHandler = () => {
             if (isPanning) {
                 isPanning = false;
                 this.container.style.cursor = 'default';
             }
-        });
+        };
+        window.addEventListener('mouseup', this._mouseUpHandler);
     }
 
     _handleMouseDown(e) {
         const rect = this.container.getBoundingClientRect();
-        const x = (e.clientX - rect.left - this.viewport.x) / this.viewport.zoom;
-        const y = (e.clientY - rect.top - this.viewport.y) / this.viewport.zoom;
-        this._fireEvent('mousedown', { x, y, originalEvent: e });
+        const point = this.screenToWorld(
+            e.clientX - rect.left,
+            e.clientY - rect.top
+        );
+        this._fireEvent('mousedown', { x: point.x, y: point.y, originalEvent: e });
     }
 
     _fireEvent(name, data) {
@@ -341,15 +795,11 @@ class Vexel {
     }
 
     zoomIn(factor = 1.1) {
-        this.viewport.zoom *= factor;
-        this.viewport.zoom = Math.min(100, this.viewport.zoom);
-        this.dirty = true;
+        this.setZoom(this.viewport.zoom * factor, this.width / 2, this.height / 2);
     }
 
     zoomOut(factor = 0.9) {
-        this.viewport.zoom *= factor;
-        this.viewport.zoom = Math.max(0.01, this.viewport.zoom);
-        this.dirty = true;
+        this.setZoom(this.viewport.zoom * factor, this.width / 2, this.height / 2);
     }
 
     zoomToFit(padding = 50) {
@@ -366,14 +816,11 @@ class Vexel {
         const contentHeight = maxY - minY + padding * 2;
         const zoomX = this.width / contentWidth;
         const zoomY = this.height / contentHeight;
-        this.viewport.zoom = Math.min(zoomX, zoomY);
+        this.viewport.zoom = this.clampZoom(Math.min(zoomX, zoomY));
         this.viewport.x = (this.width - contentWidth * this.viewport.zoom) / 2 - minX * this.viewport.zoom + padding * this.viewport.zoom;
         this.viewport.y = (this.height - contentHeight * this.viewport.zoom) / 2 - minY * this.viewport.zoom + padding * this.viewport.zoom;
-        this.dirty = true;
-    }
-
-    resetView() {
-        this.viewport = { x: 0, y: 0, zoom: 1, rotation: 0 };
+        // Fit assumes an unrotated view so the content is fully visible.
+        this.viewport.rotation = 0;
         this.dirty = true;
     }
 
@@ -436,7 +883,11 @@ class Vexel {
     load(data) {
         if (!data || !data.shapes) return;
         this.clear();
-        this.viewport = { ...data.viewport };
+        const vp = data.viewport || {};
+        this.viewport.x = vp.x || 0;
+        this.viewport.y = vp.y || 0;
+        this.viewport.zoom = this.clampZoom(vp.zoom || 1);
+        this.viewport.rotation = vp.rotation || 0;
         for (const shapeData of data.shapes) {
             const shape = this._deserializeShape(shapeData);
             if (shape) this.shapes.push(shape);
@@ -473,15 +924,58 @@ class Vexel {
         return svg;
     }
 
+    /**
+     * Render the current viewport to an offscreen canvas. This is
+     * independent of whether the on-screen canvas has painted a frame yet,
+     * so it always reflects the authoritative viewport state.
+     */
+    renderToCanvas(options = {}) {
+        const {
+            scale = 1,
+            background = '#ffffff',
+            viewport = this.viewport,
+            includeGrid = this.gridEnabled,
+            width = this.width,
+            height = this.height
+        } = options;
+
+        const canvas = document.createElement('canvas');
+        const pixelRatio = Math.max(0.0001, scale);
+        canvas.width = Math.max(1, Math.round(width * pixelRatio));
+        canvas.height = Math.max(1, Math.round(height * pixelRatio));
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+        if (background && background !== 'transparent') {
+            ctx.fillStyle = background;
+            ctx.fillRect(0, 0, width, height);
+        }
+
+        if (includeGrid) {
+            this._drawGridOn(ctx, viewport);
+        }
+
+        ctx.save();
+        ctx.translate(viewport.x, viewport.y);
+        ctx.rotate(viewport.rotation || 0);
+        ctx.scale(viewport.zoom, viewport.zoom);
+        this._drawShapes2D(ctx);
+        ctx.restore();
+
+        return canvas;
+    }
+
     exportPNG(scale = 1) {
-        return new Promise((resolve) => {
-            const exportCanvas = document.createElement('canvas');
-            exportCanvas.width = this.width * scale;
-            exportCanvas.height = this.height * scale;
-            const exportCtx = exportCanvas.getContext('2d');
-            exportCtx.scale(scale, scale);
-            exportCtx.drawImage(this.canvas, 0, 0);
-            exportCanvas.toBlob((blob) => resolve(blob), 'image/png');
+        return new Promise((resolve, reject) => {
+            try {
+                const canvas = this.renderToCanvas({ scale });
+                canvas.toBlob((blob) => {
+                    if (blob) resolve(blob);
+                    else reject(new Error('Failed to encode PNG'));
+                }, 'image/png');
+            } catch (error) {
+                reject(error);
+            }
         });
     }
 
@@ -498,29 +992,63 @@ class Vexel {
         }
     }
 
+    /**
+     * Resize the logical drawing surface. The viewport's zoom/offset/
+     * rotation are kept, but both canvas backing stores are rebuilt at the
+     * current devicePixelRatio with transforms fully reset, so repeated
+     * resizes never accumulate scale.
+     */
     resize(width, height) {
-        this.width = width;
-        this.height = height;
-        this.container.style.width = width + 'px';
-        this.container.style.height = height + 'px';
-        this.canvas.width = width * window.devicePixelRatio;
-        this.canvas.height = height * window.devicePixelRatio;
-        this.canvas.style.width = width + 'px';
-        this.canvas.style.height = height + 'px';
-        this.ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-        this.overlayCanvas.width = width * window.devicePixelRatio;
-        this.overlayCanvas.height = height * window.devicePixelRatio;
-        this.overlayCanvas.style.width = width + 'px';
-        this.overlayCanvas.style.height = height + 'px';
-        this.overlayCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        const w = Math.max(1, Math.round(Number(width) || 1));
+        const h = Math.max(1, Math.round(Number(height) || 1));
+        if (w === this.width && h === this.height && this.pixelRatio === Vexel.getDevicePixelRatio()) {
+            return;
+        }
+
+        this.width = w;
+        this.height = h;
+        this.container.style.width = w + 'px';
+        this.container.style.height = h + 'px';
+
+        this._resizeCanvases();
+
+        if (this.webglRenderer) {
+            this.webglRenderer.resize(w, h, this.pixelRatio);
+        }
+
         this.dirty = true;
     }
 
     destroy() {
         this.destroyed = true;
         cancelAnimationFrame(this.frameId);
-        this.container.removeChild(this.canvas);
-        this.container.removeChild(this.overlayCanvas);
+        this.frameId = null;
+
+        this._destroyWebGL();
+
+        if (this._wheelHandler) {
+            this.container.removeEventListener('wheel', this._wheelHandler);
+        }
+        if (this._mouseDownHandler) {
+            this.container.removeEventListener('mousedown', this._mouseDownHandler);
+        }
+        if (this._mouseMoveHandler && typeof window !== 'undefined') {
+            window.removeEventListener('mousemove', this._mouseMoveHandler);
+        }
+        if (this._mouseUpHandler && typeof window !== 'undefined') {
+            window.removeEventListener('mouseup', this._mouseUpHandler);
+        }
+
+        for (const canvas of [this.canvas, this.overlayCanvas]) {
+            if (canvas && canvas.parentNode === this.container) {
+                this.container.removeChild(canvas);
+            }
+        }
+
+        this.canvas = null;
+        this.overlayCanvas = null;
+        this.ctx = null;
+        this.overlayCtx = null;
         this.shapes = [];
         this.layers = [];
         this.plugins = [];

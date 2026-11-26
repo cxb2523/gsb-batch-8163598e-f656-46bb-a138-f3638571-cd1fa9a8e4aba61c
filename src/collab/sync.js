@@ -406,8 +406,7 @@ class VexelCursor {
         const now = Date.now();
 
         ctx.save();
-        ctx.translate(this.vexel.viewport.x, this.vexel.viewport.y);
-        ctx.scale(this.vexel.viewport.zoom, this.vexel.viewport.zoom);
+        this.vexel.applyViewTransform(ctx);
 
         for (const [userId, cursor] of Object.entries(cursors)) {
             if (now - cursor.timestamp > 10000) continue;

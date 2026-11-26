@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Vexel — WebGL backend check</title>
+  <style>
+    body { margin: 0; padding: 16px; background: #111110; color: #f5f3f0;
+      font-family: Inter, sans-serif; }
+    #stage { position: relative; width: 480px; height: 320px; background: #fff; }
+    #out { margin-top: 12px; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="out"></div>
+  <script>
+  (function () {
+    const MODULES = [
+      '../src/utils/color.js', '../src/core/vexel.js', '../src/core/viewport.js',
+      '../src/core/canvas.js', '../src/core/renderer.js', '../src/core/engine.js',
+      '../src/core/coordinate.js', '../src/tools/select.js', '../src/renderer/webgl.js'
+    ];
+    const out = [];
+    function say(s) { out.push(s); document.getElementById('out').textContent = out.join('\n'); }
+
+    function load(paths, done) {
+      let n = paths.length; const errs = [];
+      paths.forEach((src) => {
+        const el = document.createElement('script');
+        el.src = src;
+        el.onload = () => { if (--n === 0) done(errs); };
+        el.onerror = () => { errs.push(src); if (--n === 0) done(errs); };
+        document.head.appendChild(el);
+      });
+    }
+
+    function coloredPixels(canvas) {
+      const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2], a = d[i + 3];
+        // Count visibly non-white, non-transparent pixels only.
+        if (a > 0 && (r < 230 || g < 230 || b < 230)) n++;
+      }
+      return n;
+    }
+
+    load(MODULES, (errs) => {
+      if (errs.length) { say('LOAD FAIL ' + errs.join(',')); return; }
+      const host = document.getElementById('stage');
+      const vex = new Vexel({ container: host, width: 480, height: 320, autoRender: false });
+      vex.rectangle(40, 40, 160, 100, { fill: '#FF5722' });
+      vex.ellipse(300, 120, 70, 50, { fill: '#3B82F6' });
+
+      const backend = vex.setBackend('webgl');
+      say('setBackend(webgl) -> ' + backend);
+      if (vex.webglRenderer) {
+        say('webgl stats: ' + JSON.stringify(vex.webglRenderer.getStats()));
+      }
+      // Zoom + pan then render, and check the composited main canvas.
+      vex.setZoom(1.7, 120, 90);
+      vex.panBy(25, 12);
+      vex.render();
+      if (vex.backend === 'webgl') {
+        const bg = document.createElement('canvas');
+        bg.width = vex.canvas.width; bg.height = vex.canvas.height;
+        const c = bg.getContext('2d');
+        c.fillStyle = '#fff'; c.fillRect(0, 0, bg.width, bg.height);
+        c.drawImage(vex.canvas, 0, 0);
+        say('composited colored px: ' + coloredPixels(bg));
+      }
+      // Switch back to 2D and confirm it still draws.
+      vex.setBackend('canvas2d');
+      vex.render();
+      say('after back-to-2d colored px: ' + coloredPixels(vex.canvas));
+      say('canvas count: ' + host.querySelectorAll('canvas').length);
+      say('DONE');
+      document.title = 'DONE';
+    });
+  })();
+  </script>
+</body>
+</html>
