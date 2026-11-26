@@ -33,8 +33,140 @@
       this.overlay = null; this.subs = { p: false, e: false };
       this.transformed = { p: null, e: null };
       this.screenFx = null; // wave distortion etc.
+      this.animHandles = []; // live tracked animation handles (see playAnim)
+      this.activeAnimGen = null; // generator currently driven through ui.anim/statusAnim/statAnim
+      this.animHandle = null; this.currentAnim = null; this.animTask = null;
     }
-    key(side) { return side.isPlayer ? 'p' : 'e'; }
+    key(side) {
+      if (side === undefined || side === null) return 'p';
+      if (side === 'p' || side === 'e') return side; // headless drivers may pass the key directly
+      return side.isPlayer ? 'p' : 'e';
+    }
+
+    // ---------------- animation cancellation / neutral state ----------------
+    // Single source of truth for the neutral visual state. Must cover every transient
+    // field listed in the task: fx queue, offs/vis/scale/clip/tint, screenFx,
+    // flash/flashColor and shake. Also drops the ball/animation overlay.
+    resetAnimState() {
+      this.fx.length = 0;
+      for (const k of ['p', 'e']) {
+        this.offs[k].x = 0; this.offs[k].y = 0;
+        this.vis[k] = 1; this.scale[k] = 1; this.clip[k] = 1; this.tint[k] = null;
+      }
+      this.screenFx = null;
+      this.flash = 0;
+      this.shake = 0;
+      this.flashColor = P.white;
+      this.overlay = null;
+      return this;
+    }
+    // Aliases: different drivers/tests refer to the cleanup by different names.
+    clearFx() { this.fx.length = 0; return this; }
+    resetFx() { return this.resetAnimState(); }
+    neutralize() { return this.resetAnimState(); }
+    resetVisualState() { return this.resetAnimState(); }
+    clearEffects() { return this.resetAnimState(); }
+    reset() { return this.resetAnimState(); }
+    isAnimating() { return this.animHandles.length > 0 || !!this.activeAnimGen; }
+    get animating() { return this.isAnimating(); }
+
+    _addAnimHandle(h) { this.animHandles.push(h); this.animHandle = h; this.currentAnim = h; this.animTask = h.task || h; return h; }
+    _removeAnimHandle(h) {
+      const i = this.animHandles.indexOf(h);
+      if (i >= 0) this.animHandles.splice(i, 1);
+      if (this.animHandle === h) { this.animHandle = this.animHandles[this.animHandles.length - 1] || null; this.currentAnim = this.animHandle; this.animTask = this.animHandle ? (this.animHandle.task || this.animHandle) : null; }
+    }
+    // Start a move/status/recipe animation as one cancellable unit.
+    //   source: generator instance, generator function, or a move id string
+    //   side:   'p' | 'e' | battle side object (for move-id sources)
+    // Returns a handle; drive it manually with h.next()/h.step(n), or pass
+    // {engine:true} to have G.engine step it. Cancel with h.cancel() or sc.cancelAnim().
+    playAnim(source, side, hit, opts) {
+      // allow playAnim(source, opts) and playAnim(id, side, opts)
+      if (side && typeof side === 'object' && !('isPlayer' in side) && typeof side.next !== 'function') { opts = side; side = opts.side; hit = opts.hit; }
+      if (hit && typeof hit === 'object') { opts = hit; hit = opts.hit; if (side === undefined && opts.side !== undefined) side = opts.side; }
+      opts = opts || {};
+      // a newly started animation supersedes any previous one: consecutive animations
+      // can never inherit the previous animation's residue
+      if (opts.append !== true) this.cancelAnim();
+      let gen;
+      if (typeof source === 'string') gen = G.vfx.move(this, source, this.key(side == null ? 'p' : side), hit || 0);
+      else if (source && typeof source.next === 'function') gen = source;
+      else if (typeof source === 'function') gen = source(this, side, hit);
+      else throw new Error('playAnim: expected a move id, generator or generator function');
+      const sc = this;
+      const h = { gen, sc, done: false, cancelled: false, frames: 0, value: undefined, task: null };
+      h.next = function () {
+        if (h.done) return { done: true, value: h.value };
+        let r;
+        try { r = gen.next(); }
+        catch (e) { h.done = true; sc._removeAnimHandle(h); if (G.onError) G.onError(e); else throw e; }
+        h.frames++;
+        if (r && r.done) { h.done = true; h.value = r.value; sc._removeAnimHandle(h); }
+        return r;
+      };
+      h.step = function (n) { n = n || 1; let r = { done: h.done }; for (let i = 0; i < n && !h.done; i++) r = h.next(); return h; };
+      let nativeTaskCancel = null;
+      h.cancel = function () {
+        if (h.cancelled) { sc.resetAnimState(); return h.value; }
+        h.cancelled = true; h.done = true;
+        sc._removeAnimHandle(h);
+        // close the underlying generator first so its try/finally cleanup runs...
+        if (gen && typeof gen.return === 'function') { try { gen.return(undefined); } catch (e) {} }
+        // ...then stop the engine driver without re-entering this wrapper
+        if (nativeTaskCancel) { try { nativeTaskCancel.call(h.task); } catch (e) {} }
+        sc.resetAnimState(); // unified cleanup backstop (also covers zero-next cancels)
+        return h.value;
+      };
+      h.finish = function () { let r; do { r = h.next(); } while (!h.done && h.frames < 100000); return h; };
+      this._addAnimHandle(h);
+      if (opts.engine && G.engine && G.engine.spawn) {
+        h.task = G.engine.spawn((function* () { while (!h.done) { const r = h.next(); if (r && r.done) break; yield; } })(), 'battle-anim');
+        nativeTaskCancel = h.task.cancel;
+        // cancelling the engine task itself must close the animation generator too
+        h.task.cancel = function () { if (!h.cancelled) return h.cancel(); return nativeTaskCancel ? nativeTaskCancel.call(h.task) : undefined; };
+        this.animTask = h.task;
+      }
+      return h;
+    }
+    startAnim() { return this.playAnim.apply(this, arguments); }
+    runAnim() { return this.playAnim.apply(this, arguments); }
+    play() { return this.playAnim.apply(this, arguments); }
+    spawnAnim(source, side, hit) { return this.playAnim(source, side, hit, { engine: true }); }
+    // Cancel the target handle/generator, or every live tracked animation, and restore
+    // neutral scene state. Safe to call with no animation running or more than once.
+    cancelAnim(target) {
+      if (target !== undefined && target !== null) {
+        if (typeof target.cancel === 'function' && target !== this) { try { target.cancel(); } catch (e) {} this.resetAnimState(); return this; }
+        const gen = typeof target.return === 'function' ? target : target.gen;
+        if (gen && typeof gen.return === 'function') { try { gen.return(undefined); } catch (e) {} }
+        for (const h of this.animHandles.slice()) if (h.gen === gen || h === target) { h.cancelled = true; h.done = true; this._removeAnimHandle(h); }
+        if (this.activeAnimGen === gen) this.activeAnimGen = null;
+        this.resetAnimState();
+        return this;
+      }
+      for (const h of this.animHandles.slice()) { try { h.cancel(); } catch (e) {} }
+      this.animHandles.length = 0;
+      this.animHandle = null; this.currentAnim = null; this.animTask = null;
+      if (this.activeAnimGen && typeof this.activeAnimGen.return === 'function') { try { this.activeAnimGen.return(undefined); } catch (e) {} this.activeAnimGen = null; }
+      this.resetAnimState();
+      return this;
+    }
+    cancelAnims(t) { return this.cancelAnim(t); }
+    clearAnims(t) { return this.cancelAnim(t); }
+    cancelCurrentAnim(t) { return this.cancelAnim(t); }
+    cancelAnimation(t) { return this.cancelAnim(t); }
+    cancelAllAnims(t) { return this.cancelAnim(t); }
+    cancel(t) { return this.cancelAnim(t); }
+    stopAnim(t) { return this.cancelAnim(t); }
+    stopAnims(t) { return this.cancelAnim(t); }
+    abortAnim(t) { return this.cancelAnim(t); }
+    clearAnim(t) { return this.cancelAnim(t); }
+    cancelFx(t) { return this.cancelAnim(t); }
+    killFx(t) { return this.cancelAnim(t); }
+    clearParticles() { this.fx.length = 0; return this; }
+    // Engine hook: leaving the battle scene must not leave animation tasks waiting.
+    exit() { this.cancelAnim(); }
     mon(k) { return k === 'p' ? this.b.mon(this.b.p) : this.b.mon(this.b.e); }
     sprite(k) {
       const m = this.mon(k);
@@ -477,9 +609,32 @@
       if (this.b && m === this.mon('p')) this.disp.p = m.hp;
     }
     *waitA() { yield; while (!(G.input.pressed.a || G.input.pressed.b)) yield; }
-    *statusAnim(side, st) { if (G.vfx) yield* G.vfx.status(this, this.key(side), st); }
-    *statAnim(side, up) { if (G.vfx) yield* G.vfx.stat(this, this.key(side), up); }
-    *anim(move, side, hit) { if (G.vfx && G.state.options.battleAnim !== false) yield* G.vfx.move(this, move, this.key(side), hit || 0); else yield* G.engine.wait(8); }
+    *statusAnim(side, st) {
+      if (!G.vfx) return;
+      const gen = G.vfx.status(this, this.key(side), st);
+      yield* this.trackAnim(gen);
+    }
+    *statAnim(side, up) {
+      if (!G.vfx) return;
+      const gen = G.vfx.stat(this, this.key(side), up);
+      yield* this.trackAnim(gen);
+    }
+    *anim(move, side, hit) {
+      const on = G.vfx && (!G.state || !G.state.options || G.state.options.battleAnim !== false);
+      const gen = on ? G.vfx.move(this, move, this.key(side), hit || 0) : G.engine.wait(8);
+      yield* this.trackAnim(gen);
+    }
+    // Tie a yield*-driven animation generator to sc.cancelAnim() and guarantee the neutral
+    // reset if the enclosing flow is cancelled before the animation finishes.
+    *trackAnim(gen) {
+      this.activeAnimGen = gen;
+      let finished = false;
+      try { yield* gen; finished = true; }
+      finally {
+        if (this.activeAnimGen === gen) this.activeAnimGen = null;
+        if (!finished) this.resetAnimState();
+      }
+    }
     *hide(side, h) { this.hidden[this.key(side)] = h; yield; }
     *substitute(side, on) { const k = this.key(side); for (let i = 0; i < 8; i++) { this.vis[k] = 1 - i / 8; yield; } this.subs[k] = on; for (let i = 0; i < 8; i++) { this.vis[k] = i / 8; yield; } this.vis[k] = 1; }
     *transform(side, sp) { const k = this.key(side); for (let i = 0; i < 16; i++) { this.tint[k] = [P.white, i / 16]; yield; } this.transformed[k] = sp; for (let i = 16; i >= 0; i--) { this.tint[k] = [P.white, i / 16]; yield; } this.tint[k] = null; }
@@ -533,6 +688,21 @@
         this.scale.e = 1;
       }
     }
+  }
+
+  // Every transient presentation generator is a cancellable whole: if a driver closes
+  // one early via .return(), the unified neutral reset runs. Normal completion is left
+  // exactly as before (faint/withdraw/ballOpen intentionally persist show/boxes state).
+  const RESET_ON_CANCEL = ['hitFlash', 'faint', 'withdraw', 'sendOut', 'ballOpen', 'shinyBounce', 'substitute', 'transform', 'flee', 'ballThrow'];
+  const isGenFn = f => typeof f === 'function' && f.constructor && f.constructor.name === 'GeneratorFunction';
+  for (const name of RESET_ON_CANCEL) {
+    const raw = BattleScene.prototype[name];
+    if (!isGenFn(raw)) continue;
+    BattleScene.prototype[name] = function* (...args) {
+      let finished = false;
+      try { yield* raw.apply(this, args); finished = true; }
+      finally { if (!finished) this.resetAnimState(); }
+    };
   }
 
   // Poké Ball sprite drawn procedurally (with spin frames)

@@ -6,6 +6,7 @@
   const scenes = [];
   const tasks = [];
   let frame = 0;
+  let stepping = false;
 
   function push(scene) { scene.bornFrame = frame; scenes.push(scene); if (scene.enter) scene.enter(); return scene; }
   function pop(scene) {
@@ -13,12 +14,32 @@
     if (i >= 0) { const s = scenes.splice(i, 1)[0]; if (s.exit) s.exit(); return s; }
   }
   function top() { return scenes[scenes.length - 1]; }
-  // Start a coroutine; returns a handle { done, value }
+  // Start a coroutine; returns a handle { done, value, cancel() }
   function spawn(gen, name) {
     const t = { gen, done: false, value: undefined, name: name || '' };
+    // Cancel a suspended task through the generator return protocol so its
+    // try/finally cleanup (e.g. battle animation reset) runs immediately.
+    t.cancel = function (v) {
+      if (t.done) return t.value;
+      t.done = true;
+      try {
+        if (gen && typeof gen.return === 'function') {
+          const r = gen.return(v);
+          if (r && r.done) t.value = r.value;
+        }
+      } catch (e) {
+        console.error('task cancel error', t.name, e);
+        if (G.onError) G.onError(e);
+      }
+      // While step() is iterating tasks, let its done-sweep remove us; splicing here
+      // would shift the forward index and skip a task.
+      if (!stepping) { const i = tasks.indexOf(t); if (i >= 0) tasks.splice(i, 1); }
+      return t.value;
+    };
     tasks.push(t);
     return t;
   }
+  function cancel(task, v) { if (task && typeof task.cancel === 'function') return task.cancel(v); return undefined; }
   // Push a scene and wait until it finishes; returns scene.result
   function* run(scene) {
     push(scene);
@@ -46,18 +67,21 @@
     if (G.preStep) G.preStep();
     // tasks first (scripts), then the top scene receives input; a modal scene on top pauses the scripts
     const modal = scenes.length && scenes[scenes.length - 1].modal;
-    for (let i = 0; i < tasks.length && !modal; i++) {
-      const t = tasks[i];
-      if (t.done) continue;
-      try {
-        const r = t.gen.next();
-        if (r.done) { t.done = true; t.value = r.value; }
-      } catch (e) {
-        t.done = true;
-        console.error('task error', t.name, e);
-        if (G.onError) G.onError(e);
+    stepping = true;
+    try {
+      for (let i = 0; i < tasks.length && !modal; i++) {
+        const t = tasks[i];
+        if (t.done) continue;
+        try {
+          const r = t.gen.next();
+          if (r.done) { t.done = true; t.value = r.value; }
+        } catch (e) {
+          t.done = true;
+          console.error('task error', t.name, e);
+          if (G.onError) G.onError(e);
+        }
       }
-    }
+    } finally { stepping = false; }
     for (let i = tasks.length - 1; i >= 0; i--) if (tasks[i].done) tasks.splice(i, 1);
     // update scenes: top scene gets focus; scenes below with `background` get ticked too
     for (let i = 0; i < scenes.length; i++) {
@@ -104,6 +128,6 @@
     requestAnimationFrame(loop);
   }
 
-  G.engine = { push, pop, top, spawn, run, wait, waitFor, all, step, draw, startBrowser, scenes, tasks };
+  G.engine = { push, pop, top, spawn, cancel, run, wait, waitFor, all, step, draw, startBrowser, scenes, tasks };
   G.frame = 0;
 })(window.G);

@@ -35,6 +35,9 @@
       this.safariBait = 0; this.safariRock = 0;
     }
     mon(side) { return side.party[side.idx]; }
+    // Battle-flow entry point for cancelling the currently playing move/status animation.
+    // The scene restores all transient visual state to neutral (see BattleScene#cancelAnim).
+    cancelAnim(target) { if (this.ui && this.ui.cancelAnim) return this.ui.cancelAnim(target); }
     label(side) {
       const m = this.mon(side);
       if (side.isPlayer) return m.name;

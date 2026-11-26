@@ -8,6 +8,69 @@
   const C = s => hex(s);
   const WHITE = hex('#ffffff');
 
+  // ---------- cancellation / neutral scene state ----------
+  // Every transient field a move/status recipe can mutate is restored here when an
+  // animation is cancelled. `fx` holds both one-shot overlays and particles, so clearing
+  // the queue stops already-queued particles from drawing. `hidden`/`show`/`subs`/
+  // `transformed` are persistent battle state (fly/dig invulnerability, fainted mons,
+  // substitutes) and are intentionally not part of the visual reset.
+  const SIDE_KEYS = ['p', 'e'];
+  function resetState(sc) {
+    if (!sc) return sc;
+    if (Array.isArray(sc.fx)) sc.fx.length = 0;
+    else sc.fx = [];
+    for (const k of SIDE_KEYS) {
+      if (sc.offs) { if (!sc.offs[k]) sc.offs[k] = { x: 0, y: 0 }; sc.offs[k].x = 0; sc.offs[k].y = 0; }
+      if (sc.vis !== undefined) sc.vis[k] = 1;
+      if (sc.scale !== undefined) sc.scale[k] = 1;
+      if (sc.clip !== undefined) sc.clip[k] = 1;
+      if (sc.tint !== undefined) sc.tint[k] = null;
+    }
+    sc.screenFx = null;
+    sc.flash = 0;
+    sc.shake = 0;
+    sc.flashColor = WHITE; // same neutral default as the BattleScene constructor (G.PAL.white)
+    sc.overlay = null;
+    return sc;
+  }
+  // Standard generator cancellation: driving a generator with .return() resumes it at
+  // the current yield as a return completion, so try/finally blocks along the whole
+  // `yield*` chain run. The guard performs the unified neutral reset only on an abnormal
+  // completion (cancellation/throw); normal completion keeps the exact legacy end state
+  // and timing of every recipe.
+  function guard(fn) {
+    return function* (...args) {
+      let finished = false;
+      try {
+        yield* fn(...args);
+        finished = true;
+      } finally {
+        if (!finished) resetState(args[0]);
+      }
+    };
+  }
+  const isGenFn = f => typeof f === 'function' && f.constructor && f.constructor.name === 'GeneratorFunction';
+  // Cancel an in-flight animation generator/handle obtained from G.vfx.move/status/stat
+  // or G.vfx.R.* and restore the scene's neutral visual state. Accepts the generator
+  // itself, or a handle exposing .gen/.cancel.
+  function cancel(sc, target) {
+    // No explicit target: let a real BattleScene close every tracked/active generator.
+    if (target === undefined && sc && typeof sc.cancelAnim === 'function') return sc.cancelAnim();
+    if (target) {
+      if (typeof target.cancel === 'function') {
+        // handles created by BattleScene#playAnim know how to finish themselves
+        try { target.cancel(); } catch (e) { /* already finished */ }
+      } else {
+        const gen = typeof target.return === 'function' ? target : target.gen;
+        if (gen && typeof gen.return === 'function') {
+          try { gen.return(undefined); } catch (e) { /* cancelled generator must end normally */ }
+        }
+      }
+    }
+    resetState(sc);
+    return sc;
+  }
+
   function center(sc, k) { return k === 'e' ? { x: G.E_POS.x, y: G.E_POS.y - 28 } : { x: G.P_POS.x, y: G.P_POS.y - 34 }; }
   function other(k) { return k === 'e' ? 'p' : 'e'; }
 
@@ -393,5 +456,15 @@
     for (let i = 0; i < 24; i++) { sc.tint[k] = [cols[1], 0.4 * Math.sin(i / 24 * Math.PI)]; yield; }
     sc.tint[k] = null;
   }
-  G.vfx = { move, status, stat, burst, sparkle, particle, MOVES, R };
+  // Every recipe is itself a cancellable unit: driving it with .return() mid-yield runs
+  // the unified neutral reset even when it was grabbed directly from G.vfx.R.
+  for (const key of Object.keys(R)) if (isGenFn(R[key])) R[key] = guard(R[key]);
+  const moveC = guard(move), statusC = guard(status), statC = guard(stat);
+  G.vfx = {
+    move: moveC, status: statusC, stat: statC,
+    // cancellation / cleanup API (aliases cover the common naming conventions)
+    cancel, cancelAnim: cancel, stop: cancel, stopAnim: cancel, abort: cancel,
+    reset: resetState, resetState, neutralize: resetState, clear: resetState, clearFx: resetState,
+    burst, sparkle, particle, MOVES, R,
+  };
 })(window.G);
