@@ -7,10 +7,40 @@ export interface RaycastHit {
   splatIndex: number;
   distance: number;
   position: Float32Array;
+  /** Present when the hit came from resident tile data published by BVHBuilder. */
+  tileId?: number;
+}
+
+/**
+ * CPU-side snapshot of the currently resident splat set, published by
+ * BVHBuilder after a successful rebuild. `tileIds[i]` is the owning tile of
+ * splat `i`, so evicted tiles can never appear in query results.
+ */
+export interface ResidentSplatData {
+  positions: Float32Array; // xyz interleaved
+  tileIds: Uint32Array;    // one tileId per splat
+  splatCount: number;
 }
 
 export class SplatRaycaster {
+  private residentData: ResidentSplatData | null = null;
+  private destroyed = false;
+
   constructor(private device?: any, private bvhBuffer?: any) {}
+
+  /**
+   * Publishes (or clears, with `null`) the resident splat snapshot used by
+   * queries that don't pass explicit positions. Called by BVHBuilder when a
+   * rebuild commits, starts, or fails. No-op after destroy().
+   */
+  public setResidentData(data: ResidentSplatData | null): void {
+    if (this.destroyed) return;
+    this.residentData = data;
+  }
+
+  public getResidentData(): ResidentSplatData | null {
+    return this.residentData;
+  }
 
   /**
    * Ray-AABB Slab intersection test.
@@ -52,19 +82,42 @@ export class SplatRaycaster {
     return tmin >= 0 ? tmin : (tmax >= 0 ? tmax : null);
   }
 
+  /**
+   * Intersects a ray against the splat set.
+   *
+   * When `splatPositions` is provided explicitly it is used as-is (legacy
+   * behaviour). Otherwise the most recently committed resident tile data is
+   * used; if no rebuild has completed successfully yet, the latest rebuild
+   * failed, or the raycaster has been destroyed, this returns `null` rather
+   * than serving stale data or throwing.
+   */
   public async intersectRay(ray: Ray, splatPositions?: Float32Array): Promise<RaycastHit | null> {
-    if (!splatPositions || splatPositions.length === 0) {
+    if (this.destroyed) {
       return null;
+    }
+
+    let positions: Float32Array;
+    let tileIds: Uint32Array | null = null;
+
+    if (splatPositions !== undefined) {
+      if (splatPositions.length === 0) return null;
+      positions = splatPositions;
+    } else {
+      if (!this.residentData || this.residentData.splatCount === 0) {
+        return null;
+      }
+      positions = this.residentData.positions;
+      tileIds = this.residentData.tileIds;
     }
 
     let closestDist = Infinity;
     let hitIndex = -1;
-    const numSplats = splatPositions.length / 3;
+    const numSplats = positions.length / 3;
 
     for (let i = 0; i < numSplats; i++) {
-      const px = splatPositions[i * 3];
-      const py = splatPositions[i * 3 + 1];
-      const pz = splatPositions[i * 3 + 2];
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
       const radius = 0.5;
 
       const dist = this.intersectBox(
@@ -87,14 +140,20 @@ export class SplatRaycaster {
       ray.origin[2] + ray.direction[2] * closestDist
     ]);
 
-    return {
+    const hit: RaycastHit = {
       splatIndex: hitIndex,
       distance: closestDist,
       position: hitPos
     };
+    if (tileIds) {
+      hit.tileId = tileIds[hitIndex];
+    }
+    return hit;
   }
 
   public destroy(): void {
+    this.destroyed = true;
+    this.residentData = null;
     if (this.bvhBuffer && typeof this.bvhBuffer.destroy === 'function') {
       this.bvhBuffer.destroy();
     }
