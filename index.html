@@ -1056,7 +1056,78 @@ function render() {
 // bubbles (a sine whose pitch rises as it closes, which is how real bubbles ring), the
 // magnet of a sub thump, a mains hum and a crackle of tiny filtered noise grains.
 const Au = { ctx: null, out: null, bus: null, verbIn: null, noise: null, flowG: null, flowF: null, flowP: null,
-  humG: null, humF: null, muted: false, bubbleDebt: 0, crackleDebt: 0 };
+  humG: null, humF: null, muted: false, bubbleDebt: 0, crackleDebt: 0,
+  // logical ramp targets, so tests/inspection can read the intended level without
+  // waiting for an AudioParam automation to converge
+  targets: { out: 0, hum: 0, flow: 0 } };
+const MASTER_VOL = 0.85, HUM_VOL = 0.022;
+// The three outside-world conditions that jointly decide whether sound may exist.
+// Focus starts optimistic: a foreground load is focused, and no AudioContext can
+// exist before a gesture anyway. We deliberately do not seed from document.hasFocus(),
+// which stays false in some headless embedders until a real input event; genuine
+// blur/focus events and every key/pointer init correct the flag.
+const view = {
+  visible: typeof document.hidden === 'boolean' ? !document.hidden : document.visibilityState !== 'hidden',
+  focused: true,
+};
+// Visibility is always re-read from the DOM here, so a document.hidden stub takes
+// effect even without a visibilitychange dispatch. Focus stays event-tracked:
+// a synthetic blur does not change document.hasFocus(), and some headless
+// embedders report hasFocus() === false even while receiving input.
+const soundOutputAllowed = () => {
+  view.visible = !document.hidden && document.visibilityState !== 'hidden';
+  return !Au.muted && view.visible && view.focused;
+};
+let gateWasOpen = false;  // last reconciled gate state, for edge-triggered queue cleanup
+// hard zero: cancel in-flight automation (including delayed erupt/retract hum
+// ramps) so no already-scheduled path can leak sound through a closed gate
+function audioParamSilence(p, t) {
+  if (!p) return;
+  try { if (p.cancelScheduledValues) p.cancelScheduledValues(t); } catch {}
+  try { p.setValueAtTime(0, t); } catch {}
+  try { p.value = 0; } catch {}
+}
+function audioParamTarget(p, v, t, tau) {
+  if (!p) return;
+  try { if (p.cancelScheduledValues) p.cancelScheduledValues(t); } catch {}
+  try { p.setTargetAtTime(v, t, tau); }
+  catch { try { p.value = v; } catch {} }  // minimal/mock AudioParams without automation
+}
+// Single source of truth for the master bus and the continuous voices. Called on
+// mute toggles and visibility/focus transitions. Never creates Au.ctx itself.
+function reconcileAudio() {
+  if (!Au.ctx || !Au.out) { gateWasOpen = false; return; }
+  const t = Au.ctx.currentTime || 0;
+  const allow = soundOutputAllowed();
+  // edge-triggered discard: anything queued across a close/open transition belongs
+  // to the muted/hidden/blurred period and must not fire after the gate reopens
+  if (gateWasOpen !== allow || !allow) S.events.length = 0;
+  if (!gateWasOpen && allow) { Au.bubbleDebt = 0; Au.crackleDebt = 0; }
+  gateWasOpen = allow;
+  Au.targets.out = allow ? MASTER_VOL : 0;
+  if (allow) audioParamTarget(Au.out.gain, MASTER_VOL, t, 0.03);
+  else audioParamSilence(Au.out.gain, t);
+  // the magnet hum exists only while the switch is on behind an open gate
+  Au.targets.hum = allow && S.on ? HUM_VOL : 0;
+  if (Au.humG) {
+    if (Au.targets.hum > 0) audioParamTarget(Au.humG.gain, HUM_VOL, t, 0.25);
+    else audioParamSilence(Au.humG.gain, t);
+  }
+  // flow is re-driven from simulation velocity by the next flushAudio; when the
+  // gate closes it must stop immediately rather than linger on its last ramp
+  if (!allow && Au.flowG) { Au.targets.flow = 0; audioParamSilence(Au.flowG.gain, t); }
+}
+function audioState() {
+  return {
+    muted: Au.muted, visible: view.visible, focused: view.focused,
+    enabled: soundOutputAllowed(), on: S.on, erupted: S.erupted,
+    hasContext: !!Au.ctx, contextState: Au.ctx ? Au.ctx.state : 'none',
+    events: S.events.length, targets: { ...Au.targets },
+    master: Au.out ? Au.out.gain.value : null,
+    hum: Au.humG ? Au.humG.gain.value : null,
+    flow: Au.flowG ? Au.flowG.gain.value : null,
+  };
+}
 function makeRoom(ctx, secs) {
   const n = Math.floor(ctx.sampleRate * secs), ir = ctx.createBuffer(2, n, ctx.sampleRate);
   for (let c = 0; c < 2; c++) {
@@ -1072,7 +1143,15 @@ function makeRoom(ctx, secs) {
   return ir;
 }
 function audioInit(offline) {
-  if (Au.ctx && !offline) { if (Au.ctx.state !== 'running') Au.ctx.resume(); return; }
+  if (Au.ctx && !offline) {
+    // reaching an audio init from a key/pointer handler proves the view is focused;
+    // only then re-sync, so routine pointerdowns don't cancel in-flight hum ramps
+    const refocused = !view.focused;
+    view.focused = true;
+    if (Au.ctx.state === 'suspended') { const p = Au.ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+    if (refocused) reconcileAudio();
+    return;
+  }
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC && !offline) return;
   const ctx = offline || new AC({ latencyHint: 'interactive' });
@@ -1081,7 +1160,9 @@ function audioInit(offline) {
   const limit = ctx.createDynamicsCompressor();
   limit.threshold.value = -3; limit.knee.value = 0; limit.ratio.value = 20; limit.attack.value = 0.001; limit.release.value = 0.08;
   const tone = ctx.createBiquadFilter(); tone.type = 'highshelf'; tone.frequency.value = 9000; tone.gain.value = -3;
-  const out = ctx.createGain(); out.gain.value = Au.muted ? 0 : 0.85;
+  const out = ctx.createGain();
+  // offline analysis always renders at full level; live output obeys the lifecycle gate
+  out.gain.value = offline ? MASTER_VOL : (soundOutputAllowed() ? MASTER_VOL : 0);
   const bus = ctx.createGain();
   bus.connect(glue); glue.connect(tone); tone.connect(limit); limit.connect(out); out.connect(ctx.destination);
   const verb = ctx.createConvolver(); verb.buffer = makeRoom(ctx, 2.2);
@@ -1110,8 +1191,9 @@ function audioInit(offline) {
   const lfo = ctx.createOscillator(); lfo.frequency.value = 0.23;
   const lfoG = ctx.createGain(); lfoG.gain.value = 90; lfo.connect(lfoG); lfoG.connect(humF.frequency); lfo.start();
   Object.assign(Au, { ctx, out, bus, verbIn, noise, flowG: g, flowF: bp, flowP: pan, humG, humF });
+  if (!offline) { view.focused = true; reconcileAudio(); }
 }
-const live = () => Au.ctx && Au.ctx.state === 'running' && !Au.muted;
+const live = () => !!Au.ctx && Au.ctx.state === 'running' && soundOutputAllowed();
 const panOf = (x) => clamp(x / 1.6, -0.85, 0.85);
 // one voice: a gain into a panner, dry to the bus with a send to the room
 function voice(pan, send) {
@@ -1205,12 +1287,16 @@ const SFX = {
 };
 // continuous voices, driven by the simulation every frame
 function flushAudio(dt) {
-  if (!live()) { S.events.length = 0; return; }
+  // gate closed (muted / hidden / blurred / context not running): discard every
+  // queued one-shot now so it can never pile up and fire on a later restore
+  if (!live()) { S.events.length = 0; Au.bubbleDebt = 0; Au.crackleDebt = 0; return; }
   for (const [type, a, x] of S.events) SFX[type](a, x);
   S.events.length = 0;
   const c = Au.ctx, now = c.currentTime;
   const v = Math.abs(S.body.v) + 0.5 * Math.abs(S.head.v);
-  Au.flowG.gain.setTargetAtTime(Math.min(v * 0.03, 0.12), now, 0.04);
+  const flowLevel = Math.min(v * 0.03, 0.12);
+  Au.targets.flow = flowLevel;
+  Au.flowG.gain.setTargetAtTime(flowLevel, now, 0.04);
   Au.flowF.frequency.setTargetAtTime(220 + v * 90, now, 0.05);
   Au.flowP.pan.setTargetAtTime(panOf(S.body.x), now, 0.05);
   // thick bubbling while it flows, more and smaller as it speeds up
@@ -1230,8 +1316,8 @@ function flushAudio(dt) {
   }
 }
 function setMuted(m) {
-  Au.muted = m;
-  if (Au.ctx) Au.out.gain.setTargetAtTime(m ? 0 : 0.85, Au.ctx.currentTime, 0.02);
+  Au.muted = !!m;
+  reconcileAudio();  // hard-silences every path on mute, rebuilds the hum on unmute
 }
 
 // ─── input ──────────────────────────────────────────────────────────────────
@@ -1318,10 +1404,34 @@ addEventListener('pointermove', (e) => {
   S.cursor.sx = e.clientX; S.cursor.sy = e.clientY; S.cursor.inside = true;
 });
 document.documentElement.addEventListener('pointerleave', () => { S.cursor.inside = false; });
-addEventListener('blur', () => { S.cursor.inside = false; });
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden && Au.ctx) { Au.flowG.gain.setValueAtTime(0, Au.ctx.currentTime); Au.humG.gain.setValueAtTime(0, Au.ctx.currentTime); }
-  else if (!document.hidden && Au.ctx && S.erupted && S.on) Au.humG.gain.setTargetAtTime(0.022, Au.ctx.currentTime, 0.4);
+// ─── lifecycle: visibility + window focus join mute in the output gate ───────
+// Hiding the tab or losing the window stops the continuous voices immediately;
+// returning re-runs reconcileAudio, which rebuilds the hum from S.on and lets
+// flushAudio rebuild the flow bed from the simulation's current velocity.
+function onWindowBlur() {
+  S.cursor.inside = false;
+  view.focused = false;
+  S.events.length = 0;  // don't carry one-shots across an inactive period
+  reconcileAudio();
+}
+function onWindowFocus() {
+  view.focused = true;
+  if (Au.ctx && Au.ctx.state === 'suspended') { const p = Au.ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+  reconcileAudio();
+}
+function onVisibilityChange() {
+  view.visible = document.visibilityState !== 'hidden' && !document.hidden;
+  if (!view.visible) S.events.length = 0;
+  else if (Au.ctx && Au.ctx.state === 'suspended') { const p = Au.ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+  reconcileAudio();
+}
+addEventListener('blur', onWindowBlur);
+addEventListener('focus', onWindowFocus);
+document.addEventListener('visibilitychange', onVisibilityChange);
+// back/forward cache restore: re-read visibility; focus/blur events maintain focus
+addEventListener('pageshow', () => {
+  view.visible = document.visibilityState !== 'hidden' && !document.hidden;
+  reconcileAudio();
 });
 
 // ─── loop ───────────────────────────────────────────────────────────────────
@@ -1374,6 +1484,7 @@ if (DEBUG) window.__ferro = {
     events.forEach(([at, type, a, x]) => oc.suspend(at).then(() => { SFX[type](a, x); oc.resume(); }));
     const buf = await oc.startRendering();
     Object.assign(Au, keep);
+    reconcileAudio();  // re-assert the live graph's mute/visibility/focus gains
     let peak = 0, sum = 0;
     for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); if (v > peak) peak = v; sum += v * v; } }
     const db = (v) => +(20 * Math.log10(Math.max(v, 1e-9))).toFixed(1);
@@ -1384,11 +1495,33 @@ if (DEBUG) window.__ferro = {
   step(ms) { advance(ms / 1000); render(); return this.info(); },
   info() {
     return {
-      on: S.on, t: +S.t.toFixed(3), hdr: HDR, audio: Au.ctx ? Au.ctx.state : 'none', muted: Au.muted, size: [W, H], pr: +pr.toFixed(2), quality: +quality.toFixed(2), ema: +ema.toFixed(1),
+      on: S.on, t: +S.t.toFixed(3), hdr: HDR, audio: Au.ctx ? Au.ctx.state : 'none', muted: Au.muted,
+      visible: view.visible, focused: view.focused, audible: soundOutputAllowed(),
+      size: [W, H], pr: +pr.toFixed(2), quality: +quality.toFixed(2), ema: +ema.toFixed(1),
       body: +S.body.x.toFixed(3), head: +S.head.x.toFixed(3), tail: +S.tail.x.toFixed(3),
       rings: S.ring.map(r => +r.x.toFixed(3)), edge: +S.edge.x.toFixed(3), glow: +S.glowI.toFixed(3),
       button: btn.getBoundingClientRect().toJSON(),
     };
+  },
+  // ── audio lifecycle inspection / deterministic verification ──────────────
+  // Exposing the live internals under ?debug lets local checks reproduce the
+  // mute × visibility × focus scenarios against the exact production objects.
+  Au, S, view,
+  audio: Au,  // alias for checks that look for __ferro.audio
+  audioState,
+  audioInit, setMuted, flushAudio, reconcileAudio,
+  // stubs document.hidden/visibilityState exactly like a hidden tab, then fires
+  // the real listener; pass false to restore the visible state
+  simulateVisibility(hidden) {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => !!hidden });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => hidden ? 'hidden' : 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    return audioState();
+  },
+  // fires the real window focus/blur listener
+  simulateFocus(focused) {
+    window.dispatchEvent(new Event(focused ? 'focus' : 'blur'));
+    return audioState();
   },
 };
 })();

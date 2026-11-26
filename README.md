@@ -24,6 +24,19 @@ download `index.html` and open it in a browser with webgl 2
 
 that's the whole install
 
+## verify the audio lifecycle
+
+`m` mute, tab visibility and window focus share one output gate, and the
+checks in [`verify/`](verify/README.md) reproduce every state transition:
+
+```bash
+npm run verify   # node >= 22, drives an installed chrome/edge over cdp, no deps
+```
+
+add `?debug` for the frame/audio inspection hooks, including
+`__ferro.soundCheck(events, secs)` for offline rendering
+
+
 ## license
 
 [mit](LICENSE)

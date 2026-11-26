@@ -1,0 +1,13 @@
+{
+  "name": "ferro-toggle",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Single-file ferrofluid dark-mode switch with synthesized WebAudio. Contains zero-dependency local verification for the audio lifecycle.",
+  "scripts": {
+    "test": "node verify/audio-lifecycle.mjs",
+    "verify": "node verify/audio-lifecycle.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
