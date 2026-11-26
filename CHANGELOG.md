@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Re-registering a sound pack whose sound URL changed now really refreshes playback: the cached players (normal and looped) are invalidated, the next play loads the new file, and sounds whose URL did not change keep their player and downloaded data
+- A player invalidated mid-playback is not destroyed under its subscribers: it finishes naturally (or is released by `stop()`/unmount) and its object URL is revoked once it is reclaimed
+- An in-flight load that started before a pack update no longer installs a player for the outdated file
+
 ## [1.2.0] - 2026-11-20
 
 ### Changed

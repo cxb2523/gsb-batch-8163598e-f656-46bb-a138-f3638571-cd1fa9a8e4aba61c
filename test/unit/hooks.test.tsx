@@ -8,7 +8,7 @@ vi.mock('../../src/runtime', async () => {
 });
 
 import { useSound, useSoundEnabled, useSoundOnChange } from '../../src/hooks';
-import { claimSound, freeSound, isSoundEnabled } from '../../src/runtime';
+import { abandonStaleSound, claimSound, freeSound, isSoundEnabled, isSoundPlayerStale } from '../../src/runtime';
 
 let mockHowl: ReturnType<typeof createMockHowl>;
 
@@ -144,6 +144,73 @@ describe('useSound', () => {
 
     expect(mockHowl.stop).toHaveBeenCalled();
     expect(freeSound).toHaveBeenCalled();
+  });
+
+  it('switches to a fresh player when its current one is invalidated by a hot update', async () => {
+    const oldHowl = createMockHowl();
+    const newHowl = createMockHowl();
+    vi.mocked(claimSound)
+      .mockResolvedValueOnce(oldHowl)
+      .mockResolvedValueOnce(newHowl);
+
+    const { result } = await renderUseSound();
+    await triggerPlay(result);
+    expect(oldHowl.play).toHaveBeenCalledTimes(1);
+
+    // A pack re-registration invalidated the old player
+    vi.mocked(isSoundPlayerStale).mockImplementation((howl) => howl === oldHowl);
+    await triggerPlay(result);
+
+    // The new play never reaches the stale player
+    expect(oldHowl.play).toHaveBeenCalledTimes(1);
+    expect(newHowl.play).toHaveBeenCalledTimes(1);
+    // The stale player's claim is kept so it can finish, not released on the spot
+    expect(freeSound).not.toHaveBeenCalledWith('ui/toggle_on');
+  });
+
+  it('stop() silences and releases players invalidated by a hot update', async () => {
+    const oldHowl = createMockHowl();
+    const newHowl = createMockHowl();
+    vi.mocked(claimSound)
+      .mockResolvedValueOnce(oldHowl)
+      .mockResolvedValueOnce(newHowl);
+
+    const { result } = await renderUseSound();
+    await triggerPlay(result);
+
+    vi.mocked(isSoundPlayerStale).mockImplementation((howl) => howl === oldHowl);
+    await triggerPlay(result);
+
+    act(() => result.current.stop());
+
+    expect(oldHowl.stop).toHaveBeenCalled();
+    expect(newHowl.stop).toHaveBeenCalled();
+    // Both claims are released: one for the abandoned player, one for the current player
+    expect(freeSound).toHaveBeenCalledWith('ui/toggle_on');
+  });
+
+  it('does not reuse a stale player when it is not playing', async () => {
+    const oldHowl = createMockHowl();
+    const newHowl = createMockHowl();
+    vi.mocked(claimSound)
+      .mockResolvedValueOnce(oldHowl)
+      .mockResolvedValueOnce(newHowl);
+
+    const { result } = await renderUseSound();
+    await triggerPlay(result);
+
+    vi.mocked(isSoundPlayerStale).mockImplementation((howl) => howl === oldHowl);
+    await triggerPlay(result);
+
+    // Playback ended on the old player: the hook releases its claim on it through the stale path so
+    // the newer player's claim stays intact
+    const endHandlers = oldHowl.on.mock.calls.filter(([event]) => event === 'end');
+    expect(endHandlers.length).toBeGreaterThan(0);
+    act(() => {
+      endHandlers[0][1](1);
+    });
+
+    expect(abandonStaleSound).toHaveBeenCalledWith('ui/toggle_on');
   });
 });
 

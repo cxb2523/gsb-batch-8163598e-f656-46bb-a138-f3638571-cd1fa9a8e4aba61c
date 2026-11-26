@@ -54,12 +54,44 @@ export function getCDNUrl(): string {
 const soundBlobCache: Record<string, Promise<Blob>> = {};
 
 // TODO: turn "subscriptions" into a list of ids for better lock tracking
-export type HowlEntry = { instance: Howl; subscriptions: number };
+export type HowlEntry = {
+  instance: Howl;
+  subscriptions: number;
+  /** The object URL the player was loaded from, revoked when the player is disposed */
+  objectUrl?: string;
+  /** Set when a sound pack re-registered with a different URL for this sound */
+  stale?: boolean;
+  /** Guards against unloading/revoking the same player twice */
+  disposed?: boolean;
+};
 
 /**
  * Cache of created Howl instances (only created when actually played)
  */
 const howlInstanceCache: Record<string, HowlEntry> = {};
+
+/**
+ * Players invalidated by a pack re-registration that are still subscribed or playing.
+ * They are kept around until they have no subscribers and are no longer playing, then disposed.
+ */
+const retiredHowlInstances: Record<string, HowlEntry[]> = {};
+
+/**
+ * Outstanding claims for each cache key, oldest first. A claim is tied to the exact player it was
+ * made on, so a play that started before a hot update is released against the old player even if a
+ * newer player now occupies the cache slot.
+ */
+const pendingClaims: Record<string, HowlEntry[]> = {};
+
+/**
+ * Bumped every time a sound's URL changes. Player creation captures the version before loading the
+ * blob and starts over when it changed in the meantime, so an in-flight load can never install a
+ * player for an outdated URL.
+ */
+const soundVersions: Record<string, number> = {};
+
+/** Resolve the cache entry behind a Howl, so callers can identify the player they hold */
+let entryByHowl = new WeakMap<Howl, HowlEntry>();
 
 /**
  * Which player a sound uses. Sounds play through an <audio> element (Howler's html5 mode), except
@@ -76,32 +108,69 @@ const cacheKey = (name: SoundName, { loop = false }: PlayerOptions = {}) => (loo
  * Make a sound loader function that first tries local files then falls back to CDN
  */
 export function makeRemoteSound(name: SoundName, options?: PlayerOptions): () => Promise<HowlEntry> {
-  return async () => {
-    // First fetch the blob data if not already in cache
-    if (!soundBlobCache[name]) {
-      soundBlobCache[name] = fetchSoundBlob(name);
-    }
-
-    // Create or return the Howl instance
-    return createOrGetHowlInstance(name, options);
-  };
+  return async () => createOrGetHowlInstance(name, options);
 }
 
 export async function claimSound(name: SoundName, options?: PlayerOptions): Promise<Howl> {
-  const entry = await makeRemoteSound(name, options)();
-  entry.subscriptions += 1;
+  const key = cacheKey(name, options);
+  for (;;) {
+    const entry = await makeRemoteSound(name, options)();
 
-  return entry.instance;
+    // A pack re-registration may have invalidated this player in the meantime. Never attach a new
+    // play to a stale player: start over so this play loads the sound's current URL.
+    if (entry.disposed || entry.stale) continue;
+
+    entry.subscriptions += 1;
+    (pendingClaims[key] ??= []).push(entry);
+
+    return entry.instance;
+  }
 }
 
 export function freeSound(name: SoundName, options?: PlayerOptions) {
   const key = cacheKey(name, options);
-  const entry = howlInstanceCache[key];
-  if (entry && entry.subscriptions > 0) entry.subscriptions -= 1;
+
+  // Release a claim on a current player. Claims on players invalidated by a hot update are released
+  // through abandonStaleSound instead, so a stale player never steals a fresh player's release.
+  if (!releaseClaim(key, (entry) => !entry.stale)) releaseClaim(key, (entry) => entry.stale === true);
 
   cleanupUnusedSound(key);
+  releaseRetiredSounds(key);
 
   return null;
+}
+
+/**
+ * Release a claim on a player invalidated by a sound pack hot update, once the caller is done with it
+ * (its playback ended, the hook stopped, or it switched to the new player). The retired player is
+ * then reclaimed once it is no longer playing.
+ * @internal
+ */
+export function abandonStaleSound(name: SoundName, options?: PlayerOptions): null {
+  const key = cacheKey(name, options);
+
+  releaseClaim(key, (entry) => entry.stale === true);
+  releaseRetiredSounds(key);
+
+  return null;
+}
+
+/**
+ * Release the oldest outstanding claim matching `matches`. Claims on players disposed by an earlier
+ * hot update are dropped on the way. Returns whether a claim was released.
+ */
+function releaseClaim(key: string, matches: (entry: HowlEntry) => boolean): boolean {
+  const claims = pendingClaims[key];
+  if (!claims) return false;
+
+  const index = claims.findIndex((entry) => entry.subscriptions > 0 && !entry.disposed && matches(entry));
+  if (index >= 0) claims[index].subscriptions -= 1;
+
+  const live = claims.filter((entry) => entry.subscriptions > 0 && !entry.disposed);
+  if (live.length > 0) pendingClaims[key] = live;
+  else delete pendingClaims[key];
+
+  return index >= 0;
 }
 
 /**
@@ -153,8 +222,99 @@ export function registerSounds(pack: SoundPack, options?: RegisterSoundsOptions)
   for (const name of addPack(pack, options)) {
     // Drop stale data for sounds whose URL changed
     delete soundBlobCache[name];
-    cleanupUnusedSound(name);
+    soundVersions[name] = (soundVersions[name] ?? 0) + 1;
+
+    // Invalidate cached players: the next play must load the new URL instead of reusing the old file
+    invalidatePlayers(name);
   }
+}
+
+/**
+ * Invalidate every cached player (normal and looped) of a sound whose URL changed.
+ *
+ * Players without subscribers and not playing are disposed right away. Players still in use are
+ * retired: they stay alive until their last subscriber frees them and their playback ends, then get
+ * disposed. They are removed from the cache immediately so new plays never reach the old file.
+ */
+function invalidatePlayers(name: SoundName): void {
+  for (const loop of [false, true]) {
+    const key = cacheKey(name, { loop });
+    const entry = howlInstanceCache[key];
+    if (!entry) continue;
+
+    delete howlInstanceCache[key];
+    entry.stale = true;
+
+    if (entry.subscriptions === 0 && !isPlaying(entry)) {
+      disposeEntry(entry);
+    } else {
+      (retiredHowlInstances[key] ??= []).push(entry);
+      // Reclaim the retired player on its own when its last playback finishes, even if nothing
+      // calls freeSound for it afterwards
+      entry.instance.on("end", () => {
+        // Howler marks the finished sound as stopped right after emitting "end", so check next tick
+        Promise.resolve().then(() => {
+          if (!entry.disposed && entry.subscriptions === 0) releaseRetiredSounds(key);
+        });
+      });
+    }
+  }
+}
+
+/**
+ * Whether a player was invalidated by a sound pack hot update. New plays must not use it.
+ * @internal
+ */
+export function isSoundPlayerStale(howl: Howl): boolean {
+  return entryByHowl.get(howl)?.stale === true;
+}
+
+/**
+ * Dispose every retired player of a sound that is no longer subscribed nor playing. Call after
+ * stopping a stale player so its object URL is released without waiting for another play.
+ * @internal
+ */
+export function sweepRetiredSounds(name: SoundName): void {
+  releaseRetiredSounds(cacheKey(name));
+  releaseRetiredSounds(cacheKey(name, { loop: true }));
+}
+
+/** Whether any playback of this player is still running */
+function isPlaying(entry: HowlEntry): boolean {
+  try {
+    return entry.instance.playing();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Unload a player and release the object URL it was loaded from. Safe to call more than once.
+ */
+function disposeEntry(entry: HowlEntry): void {
+  if (entry.disposed) return;
+  entry.disposed = true;
+
+  if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
+  entry.instance.unload();
+}
+
+/**
+ * Dispose retired players of a cache key that no longer have subscribers and are done playing.
+ */
+function releaseRetiredSounds(key: string): void {
+  const retired = retiredHowlInstances[key];
+  if (!retired) return;
+
+  const remaining = retired.filter((entry) => {
+    if (entry.disposed) return false;
+    if (entry.subscriptions > 0 || isPlaying(entry)) return true;
+    disposeEntry(entry);
+    return false;
+  });
+
+  if (remaining.length > 0) retiredHowlInstances[key] = remaining;
+  else delete retiredHowlInstances[key];
 }
 
 /**
@@ -170,45 +330,60 @@ export function resolveSoundUrl(name: SoundName): string {
  */
 async function createOrGetHowlInstance(name: SoundName, options?: PlayerOptions): Promise<HowlEntry> {
   const key = cacheKey(name, options);
-  // Return existing instance if available
-  if (howlInstanceCache[key]) {
-    return howlInstanceCache[key];
+
+  for (;;) {
+    // Return existing instance if available
+    const cached = howlInstanceCache[key];
+    if (cached) return cached;
+
+    // Capture the version before loading: a pack re-registration bumps it, and a blob fetched for
+    // the old URL must never end up as this sound's player.
+    const version = soundVersions[name] ?? 0;
+
+    // Fetch the blob if not already in progress. The promise is shared by every waiter.
+    if (!soundBlobCache[name]) soundBlobCache[name] = fetchSoundBlob(name);
+    const blobPromise = soundBlobCache[name];
+
+    let blob: Blob;
+    try {
+      blob = await blobPromise;
+    } catch (error) {
+      // A failed load for the outdated URL must not fail a play that now targets the new URL
+      if ((soundVersions[name] ?? 0) === version) throw error;
+      if (soundBlobCache[name] === blobPromise) delete soundBlobCache[name];
+      continue;
+    }
+
+    // Another call may have created the player while the blob was loading
+    const raced = howlInstanceCache[key];
+    if (raced) return raced;
+
+    // The sound's URL changed while its blob was loading: drop the outdated data and start over
+    if ((soundVersions[name] ?? 0) !== version) {
+      if (soundBlobCache[name] === blobPromise) delete soundBlobCache[name];
+      continue;
+    }
+
+    // Create object URL from blob
+    const objectUrl = URL.createObjectURL(blob);
+
+    // Create new Howl instance
+    const howl = new Howl({
+      src: [objectUrl],
+      format: ["mp3"],
+      // <audio> streams and keeps memory low; Web Audio (for loops) decodes the whole sound, so it can
+      // repeat it without a gap
+      html5: !options?.loop,
+    });
+
+    const entry: HowlEntry = { instance: howl, subscriptions: 0, objectUrl };
+
+    // Store in cache
+    howlInstanceCache[key] = entry;
+    entryByHowl.set(howl, entry);
+
+    return entry;
   }
-
-  // Fetch the blob if not already in progress
-  if (!soundBlobCache[name]) {
-    soundBlobCache[name] = fetchSoundBlob(name);
-  }
-
-  // Wait for the blob to be fetched
-  const blob = await soundBlobCache[name];
-
-  // Create object URL from blob
-  const objectUrl = URL.createObjectURL(blob);
-
-  // Another call may have created it while the blob was loading
-  if (howlInstanceCache[key]) {
-    URL.revokeObjectURL(objectUrl);
-    return howlInstanceCache[key];
-  }
-
-  // Create new Howl instance
-  const howl = new Howl({
-    src: [objectUrl],
-    format: ["mp3"],
-    // <audio> streams and keeps memory low; Web Audio (for loops) decodes the whole sound, so it can
-    // repeat it without a gap
-    html5: !options?.loop,
-    onload: () => {
-      // Store object URL reference to revoke later
-      (howl as any)._objectUrl = objectUrl;
-    },
-  });
-
-  // Store in cache
-  howlInstanceCache[key] = { instance: howl, subscriptions: 0 };
-
-  return howlInstanceCache[key];
 }
 
 /**
@@ -244,7 +419,10 @@ export async function playSound(name: SoundName, options?: SoundOptions): Promis
 
   sound.on("end", () => {
     if (freed || options?.loop) return;
-    freeSound(name, player);
+    // Release the exact player this play holds: if a hot update invalidated it meanwhile, freeing it
+    // through the stale path keeps a newer player's claim intact
+    if (isSoundPlayerStale(sound)) abandonStaleSound(name, player);
+    else freeSound(name, player);
     freed = true;
   });
 
@@ -332,12 +510,13 @@ export async function getLocalSoundPath(name: SoundName): Promise<string | null>
  */
 export function cleanupUnusedSound(name: string): void {
   const entry = howlInstanceCache[name];
-  if (!entry || entry.instance.playing() || entry.subscriptions > 0) return;
+  if (!entry || entry.subscriptions > 0 || isPlaying(entry)) return;
 
-  const { instance } = entry;
-  if ((instance as any)._objectUrl) URL.revokeObjectURL((instance as any)._objectUrl);
-  instance.unload();
   delete howlInstanceCache[name];
+  disposeEntry(entry);
+
+  // A player that was retired by a hot update and never had subscribers is disposable too
+  releaseRetiredSounds(name);
 }
 
 /**
@@ -423,6 +602,10 @@ export function __resetForTesting(): void {
   audioUnlockInitialized = false;
   for (const key of Object.keys(soundBlobCache)) delete soundBlobCache[key];
   for (const key of Object.keys(howlInstanceCache)) delete howlInstanceCache[key];
+  for (const key of Object.keys(retiredHowlInstances)) delete retiredHowlInstances[key];
+  for (const key of Object.keys(pendingClaims)) delete pendingClaims[key];
+  for (const key of Object.keys(soundVersions)) delete soundVersions[key];
+  entryByHowl = new WeakMap();
   __resetPacksForTesting();
 }
 
