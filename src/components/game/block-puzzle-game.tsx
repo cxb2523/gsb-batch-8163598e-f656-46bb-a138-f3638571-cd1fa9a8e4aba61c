@@ -24,6 +24,10 @@ import {
 } from '@/components/game/game-board-view';
 import { GAME_COPY, type GameCopy } from '@/components/game/game-copy';
 import {
+  createSettlementScheduler,
+  type SettlementScheduler,
+} from '@/components/game/game-settlement';
+import {
   createGameRound,
   type GameRound,
   placeGamePiece,
@@ -104,6 +108,13 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   const dailyDateRef = useRef<string | null>(null);
   const clearEffectIdRef = useRef(0);
   const clearEffectTimerRef = useRef<number | null>(null);
+  const settlementSchedulerRef = useRef<SettlementScheduler | null>(null);
+  if (settlementSchedulerRef.current === null) {
+    settlementSchedulerRef.current = createSettlementScheduler({
+      clearTimeout: (handle) => window.clearTimeout(handle),
+      setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+    });
+  }
   const isResolvingRef = useRef(false);
   const isReturningHomeRef = useRef(false);
   const { board, pieces, score } = round;
@@ -147,6 +158,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       if (clearEffectTimerRef.current !== null) {
         window.clearTimeout(clearEffectTimerRef.current);
       }
+      settlementSchedulerRef.current?.cancel();
     },
     []
   );
@@ -208,21 +220,24 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       clearActiveGameSession();
       return;
     }
-    writeActiveGameSession({
-      board,
-      challengeComplete,
-      combo: round.combo,
-      dailyDate: dailyDateRef.current,
-      elapsedSeconds,
-      gameOver,
-      generation: round.generation,
-      mode,
-      movesWithoutClear: round.movesWithoutClear,
-      pieces,
-      score,
-      seed: round.seed,
-      version: 4,
-    });
+    writeActiveGameSession(
+      {
+        board,
+        challengeComplete,
+        combo: round.combo,
+        dailyDate: dailyDateRef.current,
+        elapsedSeconds,
+        gameOver,
+        generation: round.generation,
+        mode,
+        movesWithoutClear: round.movesWithoutClear,
+        pieces,
+        score,
+        seed: round.seed,
+        version: 4,
+      },
+      getLocalDateKey()
+    );
   }, [
     board,
     challengeComplete,
@@ -279,6 +294,20 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     isResolvingRef.current = false;
     setClearEffect(null);
   }, []);
+
+  const cancelPendingSettlement = useCallback(() => {
+    // Revoke any delayed challenge-complete / game-over callbacks so a
+    // settlement still waiting on the clear animation cannot mutate scores or
+    // session storage after the player leaves or restarts the run.
+    settlementSchedulerRef.current?.cancel();
+  }, []);
+
+  const scheduleSettlement = useCallback(
+    (callback: () => void, delay: number) => {
+      settlementSchedulerRef.current?.schedule(callback, delay);
+    },
+    []
+  );
 
   const recordScore = useCallback((finalScore: number, finalMode: GameMode) => {
     if (finalScore <= 0) return;
@@ -397,7 +426,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
           playSound('challengeComplete');
         };
         if (lineCount > 0 && !preferences.reducedMotion) {
-          window.setTimeout(completeChallenge, CLEAR_EFFECT_DURATION);
+          scheduleSettlement(completeChallenge, CLEAR_EFFECT_DURATION);
         } else {
           completeChallenge();
         }
@@ -405,7 +434,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       }
 
       if (nextGameOver) {
-        window.setTimeout(
+        scheduleSettlement(
           () => finishGame(nextRound.score),
           lineCount > 0 && !preferences.reducedMotion
             ? CLEAR_EFFECT_DURATION
@@ -423,6 +452,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       preferences.reducedMotion,
       recordScore,
       round,
+      scheduleSettlement,
       stopMusic,
       vibrate,
     ]
@@ -430,6 +460,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
 
   const restartGame = useCallback(() => {
     isReturningHomeRef.current = false;
+    cancelPendingSettlement();
     dismissClearEffect();
     const dailyDate = mode === 'daily' ? getLocalDateKey() : null;
     dailyDateRef.current = dailyDate;
@@ -440,10 +471,17 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     setExitConfirmationOpen(false);
     startMusic();
     playSound('gameStart');
-  }, [dismissClearEffect, mode, playSound, startMusic]);
+  }, [
+    cancelPendingSettlement,
+    dismissClearEffect,
+    mode,
+    playSound,
+    startMusic,
+  ]);
 
   const returnToMenu = useCallback(() => {
     isReturningHomeRef.current = true;
+    cancelPendingSettlement();
     dismissClearEffect();
     clearActiveGameSession();
     dailyDateRef.current = null;
@@ -457,7 +495,13 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       return;
     }
     void navigate({ to: '/', ignoreBlocker: true });
-  }, [dismissClearEffect, navigate, navigationBlocker, stopMusic]);
+  }, [
+    cancelPendingSettlement,
+    dismissClearEffect,
+    navigate,
+    navigationBlocker,
+    stopMusic,
+  ]);
 
   const keepPlaying = useCallback(() => {
     setExitConfirmationOpen(false);

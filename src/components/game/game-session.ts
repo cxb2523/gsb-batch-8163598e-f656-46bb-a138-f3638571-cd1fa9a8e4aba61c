@@ -113,8 +113,19 @@ export function readActiveGameSession(
   return null;
 }
 
-export function writeActiveGameSession(session: ActiveGameSession) {
+export function writeActiveGameSession(
+  session: ActiveGameSession,
+  currentDailyDate: string
+) {
   try {
+    // A daily run is bound to a single local calendar day. If the local date
+    // rolled over while the player kept playing, the expired run must not be
+    // persisted again (otherwise the next visit could restore yesterday's
+    // board under a stale session).
+    if (session.mode === 'daily' && session.dailyDate !== currentDailyDate) {
+      window.sessionStorage.removeItem(ACTIVE_GAME_SESSION_KEY);
+      return;
+    }
     window.sessionStorage.setItem(
       ACTIVE_GAME_SESSION_KEY,
       JSON.stringify(session)

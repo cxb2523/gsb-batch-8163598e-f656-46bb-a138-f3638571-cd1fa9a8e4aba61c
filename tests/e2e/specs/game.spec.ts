@@ -56,6 +56,72 @@ async function placePiece(
   await page.getByTestId(`board-cell-${row}-${column}`).click();
 }
 
+type StoredSession = {
+  board: Array<Array<string | null>>;
+  challengeComplete: boolean;
+  combo: number;
+  dailyDate: string | null;
+  elapsedSeconds: number;
+  gameOver: boolean;
+  generation: number;
+  mode: 'classic' | 'daily';
+  movesWithoutClear: number;
+  pieces: Array<{
+    cells: number[][];
+    color: string;
+    id: string;
+    key: string;
+  } | null>;
+  score: number;
+  seed: number;
+  version: 4;
+};
+
+/**
+ * Builds a version-4 session with an empty board and `pieceCount` single-cell
+ * pieces seeded over an all-empty board. Used to deterministically place
+ * pieces without depending on the random daily layout.
+ */
+function buildSeededSession(
+  mode: 'classic' | 'daily',
+  dailyDate: string | null,
+  score: number,
+  pieceCount: number
+): StoredSession {
+  return {
+    board: Array.from({ length: 8 }, () =>
+      Array.from({ length: 8 }, () => null)
+    ),
+    challengeComplete: false,
+    combo: 0,
+    dailyDate,
+    elapsedSeconds: 0,
+    gameOver: false,
+    generation: 1,
+    mode,
+    movesWithoutClear: 0,
+    pieces: [0, 1, 2].map((index) =>
+      index < pieceCount
+        ? {
+            cells: [[0, 0]],
+            color: 'red',
+            id: `seed-single-${index}`,
+            key: 'single',
+          }
+        : null
+    ),
+    score,
+    seed: 1,
+    version: 4,
+  };
+}
+
+async function seedActiveGame(page: Page, session: StoredSession) {
+  await page.evaluate((stored) => {
+    sessionStorage.setItem('block-blast-active-game', JSON.stringify(stored));
+  }, session);
+}
+
 test.describe('Super Blocks', () => {
   test('opens directly on the game menu', async ({ page }) => {
     const errors = await openHome(page);
@@ -284,6 +350,136 @@ test.describe('Super Blocks', () => {
     await page.goto('/play/not-a-mode');
     await expect(page).toHaveURL('/');
     await expect(page.getByTestId('start-classic')).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
+  test('binds the daily challenge to the current local day across midnight', async ({
+    page,
+  }) => {
+    // Pin the browser clock so the first local date key is deterministic.
+    await page.clock.setFixedTime(new Date(2026, 6, 17, 10, 0, 0));
+    const errors = await openHome(page);
+
+    // Load the app once (openHome clears storage on first load), then seed a
+    // daily session dated to the pinned day and open the daily route.
+    await seedActiveGame(page, buildSeededSession('daily', '2026-07-17', 0, 2));
+    await page.goto('/play/daily');
+    await expect(page).toHaveURL(/\/play\/daily$/);
+    await expect(page.getByTestId('game-score')).toHaveText('0');
+
+    // A placement now persists a session bound to today's local date.
+    await placePiece(page, 0, 0, 0);
+    await expect(page.getByTestId('game-score')).toHaveText('1');
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (key) => JSON.parse(sessionStorage.getItem(key) ?? 'null')?.dailyDate,
+          'block-blast-active-game'
+        )
+      )
+      .toBe('2026-07-17');
+
+    // Cross local midnight while the page stays open, then keep playing so a
+    // fresh session write is attempted for the already-expired daily run.
+    await page.clock.setFixedTime(new Date(2026, 6, 18, 0, 30, 0));
+    await placePiece(page, 1, 0, 1);
+    await expect(page.getByTestId('game-score')).toHaveText('2');
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (key) => sessionStorage.getItem(key),
+          'block-blast-active-game'
+        )
+      )
+      .toBeNull();
+
+    // Re-entering the daily mode must start a brand-new board for today rather
+    // than restore yesterday's expired session.
+    await page.reload();
+    await expect(page).toHaveURL(/\/play\/daily$/);
+    await expect(page.getByTestId('game-score')).toHaveText('0');
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (key) => sessionStorage.getItem(key),
+          'block-blast-active-game'
+        )
+      )
+      .toBeNull();
+
+    expect(errors).toEqual([]);
+  });
+
+  test('does not settle a run after the player confirms exit mid-animation', async ({
+    page,
+  }) => {
+    // Install a controllable clock so the clear-effect delay can be advanced
+    // manually later. The clock is only paused once the board is ready, so page
+    // load and navigation still run naturally.
+    await page.clock.install({ time: new Date(2026, 6, 18, 10, 0, 0) });
+    const errors = await openHome(page);
+
+    await page.evaluate(() => {
+      localStorage.setItem('block-blast-best-score', '500');
+      localStorage.setItem('block-blast-score-history', '[]');
+    });
+
+    // A complete top row (clear on the next placement) plus a score one clear
+    // short of the daily goal, so the next move schedules a delayed
+    // challenge-completion settlement behind the clear animation.
+    const seeded = buildSeededSession('daily', '2026-07-18', 997, 1);
+    seeded.board[0] = ['red', 'red', 'red', 'red', 'red', 'red', 'red', null];
+    await seedActiveGame(page, seeded);
+    await page.goto('/play/daily');
+    await expect(page.getByTestId('game-score')).toHaveText('997');
+    await expect(page.getByTestId('block-game')).toHaveAttribute(
+      'data-ready',
+      'true'
+    );
+    // Freeze time now: the delayed settlement cannot fire between the
+    // placement and the exit clicks below.
+    await page.clock.pauseAt(new Date(2026, 6, 18, 10, 0, 2));
+
+    // Place into the last empty cell of the top row. This clears a line and
+    // schedules the challenge-completion settlement behind the animation.
+    await placePiece(page, 0, 0, 7);
+    await expect(page.getByTestId('clear-effect')).toHaveAttribute(
+      'data-line-count',
+      '1'
+    );
+    await expect(page.getByTestId('game-score')).toHaveText('1008');
+
+    // Confirm exit while the settlement is still pending.
+    await page.getByRole('button', { name: 'Back to mode menu' }).click();
+    await page.getByRole('button', { name: 'Exit game' }).click();
+    await expect(page.getByTestId('start-classic')).toBeVisible();
+
+    // Snapshot everything the pending settlement could touch immediately after
+    // exit. The placement above already updated the best score in memory, which
+    // is expected; the point is that nothing in this snapshot changes once the
+    // settlement's deadline passes.
+    const atExit = await page.evaluate(() => ({
+      session: sessionStorage.getItem('block-blast-active-game'),
+      best: localStorage.getItem('block-blast-best-score'),
+      history: localStorage.getItem('block-blast-score-history'),
+    }));
+    expect(atExit.session).toBeNull();
+    expect(atExit.history).toBe('[]');
+
+    // Let the clear-effect deadline pass. The cancelled settlement must not
+    // complete the challenge, record a score, write a session, or show the
+    // completion modal.
+    await page.clock.fastForward(1000);
+    await expect(
+      page.getByRole('heading', { name: 'Challenge complete!' })
+    ).toHaveCount(0);
+    const settled = await page.evaluate(() => ({
+      session: sessionStorage.getItem('block-blast-active-game'),
+      best: localStorage.getItem('block-blast-best-score'),
+      history: localStorage.getItem('block-blast-score-history'),
+    }));
+    expect(settled).toEqual(atExit);
+
     expect(errors).toEqual([]);
   });
 });
