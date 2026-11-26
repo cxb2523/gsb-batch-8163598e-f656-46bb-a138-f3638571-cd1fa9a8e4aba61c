@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import queue
 import random
@@ -27,35 +28,92 @@ from .widgets import IconButton
 
 PATH_ROLE = Qt.UserRole
 DURATION_ROLE = Qt.UserRole + 1
+TOKEN_ROLE = Qt.UserRole + 2
 ROW_H = 22
 HEADER_H = 26
 FOOTER_H = 27
 
 
 class _DurationProber(threading.Thread):
-    """Fills in durations with ffprobe in the background (skipped when ffprobe is missing)."""
+    """Fills in durations with ffprobe in the background (skipped when ffprobe is missing).
 
-    def __init__(self, callback):
-        super().__init__(daemon=True)
+    Jobs are ``(token, path)`` pairs: the token identifies the concrete playlist entry that asked
+    for the probe, so a late result can never be attributed to a different entry. ``stop()`` makes
+    the worker drop anything still queued and abort a running ffprobe, so shutdown stays bounded.
+    """
+
+    def __init__(self, callback, probe=None, timeout=15):
+        super().__init__(daemon=True, name="playlist-duration-prober")
         self.jobs: queue.Queue = queue.Queue()
         self.callback = callback
+        self.probe = probe
+        self.timeout = timeout
         self.ffprobe = shutil.which("ffprobe")
+        self.available = probe is not None or bool(self.ffprobe)
+        self._halted = threading.Event()
+        self._lock = threading.Lock()
+        self._proc = None
 
     def run(self):
-        while True:
-            path = self.jobs.get()
-            if path is None:
+        while not self._halted.is_set():
+            job = self.jobs.get()
+            if job is None or self._halted.is_set():
                 return
+            token, path = job
             try:
-                out = subprocess.run(
-                    [self.ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                ).stdout.strip()
-                self.callback(path, float(out))
+                duration = self._measure(path)
+                if duration and not self._halted.is_set():
+                    self.callback(token, duration)
             except Exception:
                 continue
+
+    def _measure(self, path) -> float | None:
+        if self.probe is not None:
+            value = self.probe(path)
+            return float(value) if value else None
+        if not self.ffprobe:
+            return None
+        # Starting happens under the lock so stop() either sees the process (and kills it) or
+        # prevents it from being started at all.
+        with self._lock:
+            if self._halted.is_set():
+                return None
+            proc = subprocess.Popen(
+                [self.ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            self._proc = proc
+        if self._halted.is_set():
+            proc.kill()
+            return None
+        try:
+            out, _ = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return None
+        finally:
+            with self._lock:
+                self._proc = None
+        try:
+            return float(out.strip())
+        except ValueError:
+            return None
+
+    def stop(self, timeout=1.0):
+        self._halted.set()
+        self.jobs.put(None)  # wake the worker if it is waiting for a job
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()  # unblock communicate() so stop stays prompt
+            except OSError:
+                pass
+        if self.is_alive() and self is not threading.current_thread():
+            self.join(timeout)
 
 
 class _Delegate(QStyledItemDelegate):
@@ -129,7 +187,9 @@ class _List(QListWidget):
             event.ignore()  # everything else stays a global player shortcut
 
     def dropEvent(self, event):
-        super().dropEvent(event)
+        current_token = self.panel._token_of_current()
+        super().dropEvent(event)  # Qt's internal move rebuilds the items from mime data
+        self.panel._adopt_rebuilt_view(current_token)
         self.panel.changed.emit()
 
 
@@ -174,11 +234,16 @@ class PlaylistPanel(QWidget):
     repeatClicked = Signal()
     shuffleClicked = Signal()
     changed = Signal()
-    _durationReady = Signal(str, float)
+    _durationReady = Signal(int, float)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, probe=None):
         super().__init__(parent)
         self.current_item: QListWidgetItem | None = None
+        # Live entries by token: token -> item. A probe result is accepted only while its token is
+        # still here and still belongs to the very same item object.
+        self._entries: dict[int, QListWidgetItem] = {}
+        self._next_token = itertools.count(1)
+        self._closed = False
         self.view = _List(self)
         self.view.setItemDelegate(_Delegate(self))
         self.view.setFrameShape(QListWidget.NoFrame)
@@ -209,8 +274,8 @@ class PlaylistPanel(QWidget):
         self.shuffle_btn.clicked.connect(self.shuffleClicked)
         self.repeat_mode = "off"
         self._durationReady.connect(self._set_duration)
-        self._prober = _DurationProber(self._durationReady.emit)
-        if self._prober.ffprobe:
+        self._prober = _DurationProber(self._durationReady.emit, probe=probe)
+        if self._prober.available:
             self._prober.start()
 
     # -- layout / paint --------------------------------------------------------------------------
@@ -271,13 +336,45 @@ class PlaylistPanel(QWidget):
 
     def _make_item(self, path: str) -> QListWidgetItem:
         item = QListWidgetItem(title_of(path))
+        token = next(self._next_token)
         item.setData(PATH_ROLE, path)
+        item.setData(TOKEN_ROLE, token)
         item.setToolTip(path)
-        if self._prober.ffprobe and not is_url(path):
-            self._prober.jobs.put(path)
+        self._entries[token] = item
+        if self._prober.available and not self._closed and not is_url(path):
+            self._prober.jobs.put((token, path))
         return item
 
+    def _forget(self, token: int):
+        """Drop a token so any in-flight probe result for it is ignored from now on."""
+        self._entries.pop(token, None)
+
+    def _discard_all(self):
+        """Invalidate every pending probe: the list these tokens belonged to no longer exists."""
+        self._entries.clear()
+
+    def _reindex(self):
+        """Rebuild token -> item from the view (Qt re-creates items on internal drag/drop)."""
+        live: dict[int, QListWidgetItem] = {}
+        for i in range(self.view.count()):
+            item = self.view.item(i)
+            token = item.data(TOKEN_ROLE)
+            if token is not None:
+                live[token] = item
+        self._entries = live
+
+    def _token_of_current(self) -> int | None:
+        try:
+            return self.current_item.data(TOKEN_ROLE) if self.current_item is not None else None
+        except RuntimeError:  # the C++ item may already be gone
+            return None
+
+    def _adopt_rebuilt_view(self, current_token: int | None):
+        self._reindex()
+        self.current_item = self._entries.get(current_token) if current_token is not None else None
+
     def set_items(self, paths: list[str]):
+        self._discard_all()
         self.view.clear()
         self.current_item = None
         for path in paths:
@@ -297,55 +394,79 @@ class PlaylistPanel(QWidget):
             self.view.scrollToItem(self.current_item)
         self.view.viewport().update()
 
-    def _set_duration(self, path: str, duration: float):
+    def _set_duration(self, token: int, duration: float):
+        if self._closed:
+            return
+        item = self._entries.get(token)
+        if item is None:
+            return  # the entry was removed or the list was rebuilt: late result is stale
+        try:
+            if item.data(TOKEN_ROLE) != token:
+                return
+            if self.view.row(item) < 0:
+                self._forget(token)  # dropped from the view by Qt without notice
+                return
+            if not item.data(DURATION_ROLE):
+                item.setData(DURATION_ROLE, duration)
+                self.view.viewport().update()
+                self.update()
+        except RuntimeError:
+            # The underlying C++ item is already gone (Qt destroyed it during a drag/drop move).
+            self._forget(token)
+
+    def set_duration(self, path: str, duration: float):
+        """Apply a real (mpv) duration to every live entry with this path that has none yet."""
+        if not duration or self._closed:
+            return
+        duration = float(duration)
+        changed = False
         for i in range(self.view.count()):
             item = self.view.item(i)
             if item.data(PATH_ROLE) == path and not item.data(DURATION_ROLE):
                 item.setData(DURATION_ROLE, duration)
-        self.update()
-
-    def set_duration(self, path: str, duration: float):
-        if duration:
-            self._set_duration(path, float(duration))
+                changed = True
+        if changed:
+            self.view.viewport().update()
+            self.update()
 
     def remove_selected(self):
         for item in self.view.selectedItems():
             if item is self.current_item:
                 self.current_item = None
+            self._forget(item.data(TOKEN_ROLE))
             self.view.takeItem(self.view.row(item))
         self._refresh()
 
     def clear(self):
+        self._discard_all()
         self.view.clear()
         self.current_item = None
         self._refresh()
 
     def sort_by(self, key: str):
-        entries = [
-            (self.view.item(i).data(PATH_ROLE), self.view.item(i).data(DURATION_ROLE)) for i in range(self.view.count())
-        ]
-        current = self.current_item.data(PATH_ROLE) if self.current_item is not None else None
+        entries = []
+        while self.view.count():
+            item = self.view.takeItem(0)  # detach without deleting: entries keep their tokens
+            entries.append(item)
+        current = self.current_item.data(TOKEN_ROLE) if self.current_item is not None else None
         if key == "name":
-            entries.sort(key=lambda e: natural_key(title_of(e[0])))
+            entries.sort(key=lambda e: natural_key(title_of(e.data(PATH_ROLE))))
         elif key == "path":
-            entries.sort(key=lambda e: natural_key(e[0]))
+            entries.sort(key=lambda e: natural_key(e.data(PATH_ROLE)))
         elif key == "duration":
-            entries.sort(key=lambda e: e[1] or 0)
+            entries.sort(key=lambda e: e.data(DURATION_ROLE) or 0)
         elif key == "reverse":
             entries.reverse()
         elif key == "random":
             random.shuffle(entries)
-        self.view.clear()
+        # The same item objects are re-inserted, so tokens stay valid and in-flight probes still land
+        # on the entry that asked for them, wherever the sort moved it.
         self.current_item = None
-        for path, duration in entries:
-            item = QListWidgetItem(title_of(path))
-            item.setData(PATH_ROLE, path)
-            item.setToolTip(path)
-            if duration:
-                item.setData(DURATION_ROLE, duration)
+        for item in entries:
             self.view.addItem(item)
-            if path == current and self.current_item is None:
+            if item.data(TOKEN_ROLE) == current:
                 self.current_item = item
+        self._reindex()
         self._refresh()
 
     def step(self, direction: int, repeat: str, shuffle: bool) -> int:
@@ -411,10 +532,12 @@ class PlaylistPanel(QWidget):
 
     def _remove_missing(self):
         for i in reversed(range(self.view.count())):
-            path = self.view.item(i).data(PATH_ROLE)
+            item = self.view.item(i)
+            path = item.data(PATH_ROLE)
             if not is_url(path) and not os.path.exists(path):
-                if self.view.item(i) is self.current_item:
+                if item is self.current_item:
                     self.current_item = None
+                self._forget(item.data(TOKEN_ROLE))
                 self.view.takeItem(i)
         self._refresh()
 
@@ -422,10 +545,12 @@ class PlaylistPanel(QWidget):
         seen = set()
         i = 0
         while i < self.view.count():
-            path = self.view.item(i).data(PATH_ROLE)
+            item = self.view.item(i)
+            path = item.data(PATH_ROLE)
             if path in seen:
-                if self.view.item(i) is self.current_item:
+                if item is self.current_item:
                     self.current_item = None
+                self._forget(item.data(TOKEN_ROLE))
                 self.view.takeItem(i)
             else:
                 seen.add(path)
@@ -476,6 +601,14 @@ class PlaylistPanel(QWidget):
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
-    def shutdown(self):
-        if self._prober.is_alive():
-            self._prober.jobs.put(None)
+    def shutdown(self, timeout=1.0):
+        """Stop the prober and make sure no queued/late result can touch the list again."""
+        if self._closed:
+            return
+        self._closed = True
+        self._prober.stop(timeout=timeout)
+        self._entries.clear()
+        try:
+            self._durationReady.disconnect(self._set_duration)  # drop any queued emission
+        except RuntimeError:
+            pass

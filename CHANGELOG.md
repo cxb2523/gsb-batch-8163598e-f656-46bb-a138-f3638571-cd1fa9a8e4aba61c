@@ -6,6 +6,14 @@ All notable changes to Samovar Lite are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Playlist duration probing is now bound to each entry, not to the file path: a late ffprobe result
+  for a removed, cleared or re-sorted entry is discarded, and entries that share a path each get
+  their own duration, so row durations and the header total stay correct.
+- Closing the player now stops the probing thread promptly and drops results still queued when the
+  playlist is torn down.
+
 ## [1.0.0] - 2026-10-09
 
 First public release.
