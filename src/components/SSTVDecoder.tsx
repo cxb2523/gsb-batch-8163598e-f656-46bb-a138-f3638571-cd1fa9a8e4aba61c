@@ -23,16 +23,18 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
     startRecording,
     stopRecording,
     resetDecoder,
+    switchMode,
     getImageData,
     getDimensions,
     getAnalyser,
   } = useAudioProcessor(selectedMode);
 
   const handleModeChange = (newMode: SSTVMode) => {
-    // Stop recording if active
-    if (state.isRecording) {
-      stopRecording();
-    }
+    // Switch the current session in place: while recording the microphone /
+    // AudioContext chain stays alive and only the decoder session is rebuilt
+    // for the new mode. Never stop the recording here.
+    switchMode(newMode);
+    // Keep the controlled parent / header badge in sync.
     onModeChange(newMode);
   };
 
@@ -317,72 +319,98 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
     offscreenCtx.fillRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
 
     let lastRenderedLine = -1;
+    let cancelled = false;
+    let frameId: number | null = null;
 
     const updateCanvas = () => {
-      const imageData = getImageData();
-      const currentLine = state.stats?.currentLine ?? 0;
+      if (cancelled) return;
 
-      // Always update to see the progressive image (even when paused)
-      if (imageData && offscreenCtx) {
-        // Debug: Check if we have any non-black pixels
-        if (state.isRecording && currentLine > lastRenderedLine && currentLine % 10 === 0) {
-          let nonBlackPixels = 0;
-          for (let i = 0; i < imageData.length; i += 4) {
-            if (imageData[i] > 0 || imageData[i+1] > 0 || imageData[i+2] > 0) {
-              nonBlackPixels++;
+      try {
+        const imageData = getImageData();
+        const currentLine = state.stats?.currentLine ?? 0;
+
+        // Always update to see the progressive image (even when paused)
+        if (imageData && offscreenCtx) {
+          // Debug: Check if we have any non-black pixels
+          if (state.isRecording && currentLine > lastRenderedLine && currentLine % 10 === 0) {
+            let nonBlackPixels = 0;
+            for (let i = 0; i < imageData.length; i += 4) {
+              if (imageData[i] > 0 || imageData[i+1] > 0 || imageData[i+2] > 0) {
+                nonBlackPixels++;
+              }
+            }
+            console.log(`Line ${currentLine}: ${nonBlackPixels} non-black pixels in imageData`);
+          }
+
+          // Create ImageData from a copy of the decoder's buffer
+          const imgData = new ImageData(
+            new Uint8ClampedArray(imageData),
+            dimensions.width,
+            dimensions.height
+          );
+
+          // Put the complete image data on the offscreen canvas
+          offscreenCtx.putImageData(imgData, 0, 0);
+
+          // Draw to main canvas without clearing (preserve all previous lines)
+          ctx.drawImage(offscreenCanvas, 0, 0, canvas.width, canvas.height);
+
+          lastRenderedLine = currentLine;
+        }
+
+        // Draw spectrum, spectrogram, and waveform only when recording
+        if (state.isRecording) {
+          const spectrumCanvas = spectrumCanvasRef.current;
+          const spectrogramCanvas = spectrogramCanvasRef.current;
+          const waveformCanvas = waveformCanvasRef.current;
+
+          if (spectrumCanvas) {
+            const frequencyData = drawSpectrum(spectrumCanvas);
+
+            // Update spectrogram with the frequency data
+            if (spectrogramCanvas && frequencyData) {
+              drawSpectrogram(spectrogramCanvas, frequencyData);
             }
           }
-          console.log(`Line ${currentLine}: ${nonBlackPixels} non-black pixels in imageData`);
-        }
 
-        // Create ImageData from a copy of the decoder's buffer
-        const imgData = new ImageData(
-          new Uint8ClampedArray(imageData),
-          dimensions.width,
-          dimensions.height
-        );
-
-        // Put the complete image data on the offscreen canvas
-        offscreenCtx.putImageData(imgData, 0, 0);
-
-        // Draw to main canvas without clearing (preserve all previous lines)
-        ctx.drawImage(offscreenCanvas, 0, 0, canvas.width, canvas.height);
-
-        lastRenderedLine = currentLine;
-      }
-
-      // Draw spectrum, spectrogram, and waveform only when recording
-      if (state.isRecording) {
-        const spectrumCanvas = spectrumCanvasRef.current;
-        const spectrogramCanvas = spectrogramCanvasRef.current;
-        const waveformCanvas = waveformCanvasRef.current;
-
-        if (spectrumCanvas) {
-          const frequencyData = drawSpectrum(spectrumCanvas);
-
-          // Update spectrogram with the frequency data
-          if (spectrogramCanvas && frequencyData) {
-            drawSpectrogram(spectrogramCanvas, frequencyData);
+          // Update waveform timeline
+          if (waveformCanvas) {
+            drawWaveform(waveformCanvas);
           }
         }
-
-        // Update waveform timeline
-        if (waveformCanvas) {
-          drawWaveform(waveformCanvas);
+      } catch (frameError) {
+        // A single failed visualization frame must not kill the loop or crash
+        // the component (e.g. partially mocked canvas contexts in tests).
+        console.warn('SSTV canvas frame render failed:', frameError);
+      } finally {
+        // Keep the frame loop alive only while recording. When stopped this is
+        // the final frame and no new animation frame gets queued, so Stop
+        // leaves no pending callbacks behind.
+        if (!cancelled && state.isRecording) {
+          frameId = requestAnimationFrame(updateCanvas);
+          animationFrameRef.current = frameId;
         }
       }
-
-      animationFrameRef.current = requestAnimationFrame(updateCanvas);
     };
 
-    animationFrameRef.current = requestAnimationFrame(updateCanvas);
+    // Render the first frame immediately; while recording updateCanvas keeps
+    // re-scheduling itself via requestAnimationFrame.
+    updateCanvas();
 
     return () => {
-      if (animationFrameRef.current) {
+      // Cancel the pending frame and prevent an in-flight callback from
+      // re-scheduling itself. Runs on stop, mode/dimension change and unmount.
+      cancelled = true;
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId);
+        frameId = null;
+      }
+      if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
       }
     };
-  }, [state.isRecording, state.stats?.currentLine, getImageData, getDimensions, drawSpectrum, drawSpectrogram, drawWaveform, getAnalyser]);
+  }, [state.isRecording, state.stats?.currentLine, selectedMode, getImageData, getDimensions, drawSpectrum, drawSpectrogram, drawWaveform, getAnalyser]);
 
   const handleStart = async () => {
     await startRecording();
@@ -432,11 +460,12 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
 
   return (
     <div className="space-y-4 sm:space-y-6">
-      {/* Settings Panel - floating cog icon */}
+      {/* Settings Panel - floating cog icon.
+          Mode switching stays available while recording: the session is
+          rebuilt in place without interrupting the audio chain. */}
       <SettingsPanel
         currentMode={selectedMode}
         onModeChange={handleModeChange}
-        disabled={state.isRecording}
       />
 
       {/* Controls */}

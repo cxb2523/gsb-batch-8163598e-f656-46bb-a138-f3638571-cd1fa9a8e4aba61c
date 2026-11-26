@@ -87,6 +87,9 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
         >
           {/* Modal content */}
           <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="SSTV settings"
             className="bg-[#161b22] border border-[#30363d] rounded-lg max-w-lg w-full shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >

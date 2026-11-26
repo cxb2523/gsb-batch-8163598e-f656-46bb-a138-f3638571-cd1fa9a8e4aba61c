@@ -247,5 +247,10 @@ export class SyncDetector {
     this.syncPulseTrigger.reset();
     this.syncPulseValueDelay.reset();
     this.syncPulseCounter = 0;
+
+    // Reset bookkeeping/debug state as well so no session carry-over remains.
+    this.debugSampleCount = 0;
+    this.debugMaxCounter = 0;
+    this.debugLastLogTime = 0;
   }
 }
