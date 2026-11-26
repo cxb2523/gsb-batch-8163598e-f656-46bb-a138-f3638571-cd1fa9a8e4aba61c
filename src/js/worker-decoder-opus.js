@@ -6,18 +6,34 @@ const playbackBuffer = new DecodedAudioPlaybackBuffer({ onFlush });
 let sessionId, flushTimeoutId;
 
 function evalSessionId(newSessionId) {
-  // detect new session and reset decoder
+  // detect new session and reset decoder/buffer state
   if (sessionId && sessionId === newSessionId) {
     return;
   }
 
   sessionId = newSessionId;
+
+  // a pending end-of-stream flush belongs to the old session; cancel it so
+  // its buffers are never posted (or re-tagged) under the new session
+  if (flushTimeoutId) {
+    clearTimeout(flushTimeoutId);
+    flushTimeoutId = null;
+  }
+
   playbackBuffer.reset();
 }
 
 self.onmessage = async (evt) => {
-  evalSessionId(evt.data.sessionId);
+  const messageSessionId = evt.data.sessionId;
+  evalSessionId(messageSessionId);
   await decoder.ready;
+
+  // another session may have started while decoder.ready was pending;
+  // decoding these bytes now would feed stale data into the current decoder
+  if (sessionId !== messageSessionId) {
+    return;
+  }
+
   decoder.decode(new Uint8Array(evt.data.decode));
 };
 
@@ -53,6 +69,7 @@ function onFlush({ left, right }) {
 function scheduleLastFlush() {
   clearTimeout(flushTimeoutId);
   flushTimeoutId = setTimeout(_ => {
+    flushTimeoutId = null;
     playbackBuffer.flush();
   }, 100);
 }

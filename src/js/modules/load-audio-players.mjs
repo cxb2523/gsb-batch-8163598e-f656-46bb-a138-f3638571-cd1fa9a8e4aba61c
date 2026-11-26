@@ -28,7 +28,7 @@ const playerData = [
   },
 ];
 
-export default (wrapper) => {
+export default function loadAudioPlayers(wrapper) {
   const players = [];
 
   playerData.forEach(({ url, mime, codec, readBufferSize, decoder }) => {
@@ -38,7 +38,7 @@ export default (wrapper) => {
       onStateChange,
       url, mime, codec, readBufferSize, decoder
     });
-  
+
     wrapper.append(el);
     players.push(player);
 
@@ -52,4 +52,4 @@ export default (wrapper) => {
       }
     }
   });
-};
+}

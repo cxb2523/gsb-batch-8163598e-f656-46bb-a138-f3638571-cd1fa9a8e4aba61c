@@ -48,7 +48,10 @@ export class BufferedStreamReader {
   }
 
   async _start() {
-    this.abortController = ('AbortController' in window)? new AbortController() : null;
+    const AbortControllerCtor = (typeof AbortController !== 'undefined')? AbortController
+      : (typeof window !== 'undefined' && 'AbortController' in window)? window.AbortController
+      : null;
+    this.abortController = AbortControllerCtor? new AbortControllerCtor() : null;
     const signal = this.abortController? this.abortController.signal : null;
 
     const response = await fetch(this.request, { signal });
@@ -89,7 +92,7 @@ export class BufferedStreamReader {
 
   _flushBuffer({ end, done, request }) {
     if (this._requestIsAborted({ request })) {
-      return
+      return;
     }
 
     this.onBufferFull({ bytes: this.buffer.slice(0, end), done });
@@ -98,7 +101,7 @@ export class BufferedStreamReader {
   /* read value into buffer and call onBufferFull when reached */
   _readIntoBuffer ({ value, done, request }) {
     if (this._requestIsAborted({ request })) {
-      return
+      return;
     }
 
     if (done) {
