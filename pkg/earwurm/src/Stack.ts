@@ -36,6 +36,13 @@ export class Stack extends EmittenCommon<StackEventMap> {
   #totalSoundsCreated = 0;
   #queue: Sound[] = [];
 
+  // Bumped every time `stop()` is called (which includes `teardown()`).
+  // Any in-flight `prepare()` captures the value at launch and becomes
+  // stale once the token changes, so its resolved Sound can never be
+  // inserted back into a Stack that has since been stopped/replaced.
+  #prepareToken = 0;
+  #disposed = false;
+
   constructor(
     readonly id: StackId,
     readonly path: string,
@@ -141,6 +148,12 @@ export class Stack extends EmittenCommon<StackEventMap> {
   }
 
   stop() {
+    // Invalidate every `prepare()` that is still awaiting its
+    // network load, so a late resolution cannot repopulate a
+    // Stack that has already been stopped.
+    this.#prepareToken++;
+    this.#setState('idle');
+
     this.#queue.forEach((sound) => sound.stop());
     return this;
   }
@@ -148,11 +161,26 @@ export class Stack extends EmittenCommon<StackEventMap> {
   teardown() {
     this.stop();
     this.empty();
+
+    this.#disposed = true;
+    this.#gainNode.disconnect();
+
     return this;
   }
 
-  async prepare(id?: SoundId) {
-    const buffer = await this.#load();
+  async prepare(id?: SoundId): Promise<Sound | undefined> {
+    // A torn-down Stack can never accept new Sounds.
+    if (this.#disposed) return undefined;
+
+    // Capture the lifecycle token before the async work begins.
+    // If `stop()`/`teardown()` runs while we are awaiting the load,
+    // the captured value will no longer match and we bail out
+    // without touching the queue or emitting any events.
+    const prepareToken = this.#prepareToken;
+
+    const buffer = await this.#load(prepareToken);
+
+    if (this.#isStale(prepareToken)) return undefined;
 
     this.#totalSoundsCreated++;
     const newId = id?.length ? id : `${this.id}-${this.#totalSoundsCreated}`;
@@ -160,7 +188,7 @@ export class Stack extends EmittenCommon<StackEventMap> {
     return this.#create(newId, buffer);
   }
 
-  async #load() {
+  async #load(prepareToken: number) {
     this.#setState('loading');
 
     const result = await fetchAudioBuffer(
@@ -168,6 +196,9 @@ export class Stack extends EmittenCommon<StackEventMap> {
       this.context,
       this.#request,
     ).catch((error) => {
+      // The `error` event is still emitted for failed loads, even when
+      // the Stack is later stopped/removed: it reports the load attempt
+      // itself rather than a queue/state mutation.
       this.emit(
         'error',
         Stack.#loadError(this.id, this.path, error),
@@ -176,9 +207,17 @@ export class Stack extends EmittenCommon<StackEventMap> {
       return scratchBuffer(this.context);
     });
 
-    this.#handleStateFromQueue();
+    // A `stop()`/`teardown()` (or a same-id replacement via
+    // `Earwurm.add()`) may have occurred while we were awaiting.
+    // In that case, the Stack must not emit any further `state`
+    // events on behalf of this dead load.
+    if (!this.#isStale(prepareToken)) this.#handleStateFromQueue();
 
     return result;
+  }
+
+  #isStale(prepareToken: number) {
+    return this.#disposed || prepareToken !== this.#prepareToken;
   }
 
   #create(id: SoundId, buffer: AudioBuffer) {

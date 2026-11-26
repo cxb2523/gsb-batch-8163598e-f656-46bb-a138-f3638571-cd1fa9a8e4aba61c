@@ -12,7 +12,7 @@ import type {
   StackId,
 } from '../types';
 
-import {managerSetup, mockEntries, mockInitialKeys} from './helpers';
+import {managerSetup, mockEntries, mockInitialKeys, stubDeferredFetch} from './helpers';
 
 describe('Earwurm component', () => {
   let mockManager = new Earwurm();
@@ -313,6 +313,63 @@ describe('Earwurm component', () => {
       );
     });
 
+    it('stops and releases the old Stack when replacing the same id mid-load', async () => {
+      const sharedId = 'Replaceable';
+      const oldEntry: LibraryEntry = {id: sharedId, path: 'old/path/audio.mp3'};
+      const newEntry: LibraryEntry = {id: sharedId, path: 'new/path/audio.mp3'};
+
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      mockManager.add(oldEntry);
+
+      const oldStack = mockManager.get(sharedId);
+      expect(oldStack).toBeInstanceOf(Stack);
+
+      const spyOldQueue = vi.fn();
+      oldStack?.on('queue', spyOldQueue);
+
+      // Start a load on the Stack that is about to be replaced.
+      const staleSound = oldStack?.prepare('Ghost');
+
+      await vi.waitFor(() => {
+        expect(controls).toHaveLength(1);
+      });
+      expect(oldStack?.state).toBe('loading');
+
+      const spyTeardown = vi.spyOn(oldStack as Stack, 'teardown');
+
+      // Same `id`, different `path`: the old Stack must be torn down
+      // and a fresh Stack must take over the id.
+      const replacedKeys = mockManager.add(newEntry);
+      const newStack = mockManager.get(sharedId);
+
+      expect(replacedKeys).toStrictEqual([sharedId]);
+      expect(spyTeardown).toBeCalledTimes(1);
+      expect(newStack).not.toBe(oldStack);
+      expect(newStack?.path).toBe(newEntry.path);
+      expect(mockManager.keys).toStrictEqual([sharedId]);
+      expect(oldStack?.activeEvents).toHaveLength(0);
+      expect(oldStack?.keys).toStrictEqual([]);
+
+      // Flush the old Stack's in-flight load: it must not produce
+      // a ghost Sound or emit a `queue` event on the dead Stack.
+      controls[0]?.resolve();
+      await expect(staleSound).resolves.toBe(undefined);
+
+      expect(oldStack?.keys).toStrictEqual([]);
+      expect(spyOldQueue).not.toBeCalled();
+
+      // Restore real fetch so the replacement Stack can load.
+      fetchSpy.mockRestore();
+
+      // The replacement Stack takes over normally.
+      const takeoverSound = await newStack?.prepare();
+
+      expect(takeoverSound).toBeDefined();
+      expect(newStack?.keys).toHaveLength(1);
+      expect(mockManager.get(sharedId)).toBe(newStack);
+    });
+
     // TODO: Figure out how best to read `transitions` and `request` from Stack.
     it.skip('passes `transitions` and `request` to Stack', async () => {
       const mockConfig: ManagerConfig = {
@@ -401,14 +458,14 @@ describe('Earwurm component', () => {
 
       const stack1 = mockManager.get(mockEntries[1].id);
       stack1?.on('state', spyStack1State);
-      await stack1?.prepare().then((sound) => sound.play());
+      await stack1?.prepare().then((sound) => sound!.play());
 
       expect(spyStack1State).toBeCalledTimes(3);
       expect(stack1?.state).toBe('playing');
 
       const stack2 = mockManager.get(mockEntries[2].id);
       stack2?.on('state', spyStack2State);
-      await stack2?.prepare().then((sound) => sound.play());
+      await stack2?.prepare().then((sound) => sound!.play());
 
       expect(spyStack2State).toBeCalledTimes(3);
       expect(stack2?.state).toBe('playing');
@@ -544,7 +601,7 @@ describe('Earwurm component', () => {
       const stacks: Stack[] = [];
       const stackCount = mockEntries.length;
 
-      const sounds: Array<Promise<Sound>> = [];
+      const sounds: Array<Promise<Sound | undefined>> = [];
       const soundsPerStack = 4;
 
       mockManager.add(...mockEntries);
@@ -563,7 +620,7 @@ describe('Earwurm component', () => {
       const readySounds = await Promise.all(sounds);
 
       for (const sound of readySounds) {
-        sound.play();
+        sound?.play();
       }
 
       /*

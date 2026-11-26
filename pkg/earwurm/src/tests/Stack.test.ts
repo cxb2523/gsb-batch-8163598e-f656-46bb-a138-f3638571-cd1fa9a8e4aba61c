@@ -7,6 +7,8 @@ import {Sound} from '../Sound';
 import {tokens} from '../tokens';
 import type {SoundEventMap, StackEventMap} from '../types';
 
+import {stubDeferredFetch} from './helpers';
+
 type StackConstructor = ConstructorParameters<typeof Stack>;
 
 describe('Stack component', () => {
@@ -87,11 +89,11 @@ describe('Stack component', () => {
       const sound2 = await mockStack.prepare('Two');
       const sound3 = await mockStack.prepare('Three');
 
-      sound1.play();
+      sound1!.play();
       vi.advanceTimersByTime(mockDurationQuarter);
-      sound2.play();
+      sound2!.play();
       vi.advanceTimersByTime(mockDurationQuarter);
-      sound3.play();
+      sound3!.play();
 
       expect(mockStack.keys).toStrictEqual(['One', 'Two', 'Three']);
       vi.advanceTimersByTime(mockDurationHalf);
@@ -115,7 +117,7 @@ describe('Stack component', () => {
       const soundFoo = mockStack.prepare('Foo');
 
       expect(spyState).toBeCalledWith('loading');
-      await soundFoo.then((sound) => sound.play());
+      await soundFoo.then((sound) => sound!.play());
 
       expect(spyState).toBeCalledWith('playing');
       vi.advanceTimersToNextTimer();
@@ -133,7 +135,7 @@ describe('Stack component', () => {
       expect(mockStack.state).toBe('idle');
       expect(mockStack.playing).toBe(false);
 
-      sound.play();
+      sound!.play();
 
       expect(mockStack.state).toBe('playing');
       expect(mockStack.playing).toBe(true);
@@ -184,16 +186,16 @@ describe('Stack component', () => {
       const sound2 = await mockStack.prepare('Two');
       const sound3 = await mockStack.prepare('Three');
 
-      const spySound1Pause = vi.spyOn(sound1, 'pause');
-      const spySound2Pause = vi.spyOn(sound2, 'pause');
-      const spySound3Pause = vi.spyOn(sound3, 'pause');
+      const spySound1Pause = vi.spyOn(sound1!, 'pause');
+      const spySound2Pause = vi.spyOn(sound2!, 'pause');
+      const spySound3Pause = vi.spyOn(sound3!, 'pause');
 
       expect(mockStack.state).toBe('idle');
       expect(mockStack.keys).toHaveLength(3);
 
-      sound1.play();
-      sound2.play();
-      sound3.play();
+      sound1!.play();
+      sound2!.play();
+      sound3!.play();
 
       expect(mockStack.state).toBe('playing');
       mockStack.pause();
@@ -219,16 +221,16 @@ describe('Stack component', () => {
       const sound2 = await mockStack.prepare('Two');
       const sound3 = await mockStack.prepare('Three');
 
-      const spySound1Stop = vi.spyOn(sound1, 'stop');
-      const spySound2Stop = vi.spyOn(sound2, 'stop');
-      const spySound3Stop = vi.spyOn(sound3, 'stop');
+      const spySound1Stop = vi.spyOn(sound1!, 'stop');
+      const spySound2Stop = vi.spyOn(sound2!, 'stop');
+      const spySound3Stop = vi.spyOn(sound3!, 'stop');
 
       expect(mockStack.state).toBe('idle');
       expect(mockStack.keys).toHaveLength(3);
 
-      sound1.play();
-      sound2.play();
-      sound3.play();
+      sound1!.play();
+      sound2!.play();
+      sound3!.play();
 
       expect(mockStack.state).toBe('playing');
       mockStack.stop();
@@ -383,7 +385,7 @@ describe('Stack component', () => {
 
     it('returns state to `playing` if a Sound was already playing', async () => {
       expect(mockStack.state).toBe('idle');
-      await mockStack.prepare().then((sound) => sound.play());
+      await mockStack.prepare().then((sound) => sound!.play());
       expect(mockStack.state).toBe('playing');
 
       const unplayedSound = mockStack.prepare();
@@ -429,7 +431,7 @@ describe('Stack component', () => {
       );
 
       const scratchSound = await testStack.prepare();
-      const scratchBuffer = scratchSound.buffer;
+      const scratchBuffer = scratchSound!.buffer;
 
       expect(scratchBuffer).toBeInstanceOf(AudioBuffer);
       expect({...scratchBuffer}).toStrictEqual({
@@ -484,17 +486,17 @@ describe('Stack component', () => {
     it('registers `state` multi-listener on Sound', async () => {
       const sound = await mockStack.prepare();
 
-      sound.play().pause();
-      expect(sound.activeEvents).toContain('state');
+      sound!.play().pause();
+      expect(sound!.activeEvents).toContain('state');
     });
 
     it('registers `ended` single-listener on Sound', async () => {
       const sound = await mockStack.prepare();
 
-      sound.play();
+      sound!.play();
       // No way to really check that the event is removed,
       // since the Sound is removed from the Stack upon `ended`.
-      expect(sound.activeEvents).toContain('ended');
+      expect(sound!.activeEvents).toContain('ended');
     });
 
     it('expires old sounds that fall outside of the `maxStackSize`', async () => {
@@ -512,8 +514,8 @@ describe('Stack component', () => {
       sounds.forEach((sound) => {
         // We won't know what the exactly order of Sounds will be,
         // so we will apply the `ended` listener to everything.
-        sound.once('ended', spyEnded);
-        sound.play();
+        sound!.once('ended', spyEnded);
+        sound!.play();
       });
 
       // Order will be different because of `async` Sound creation,
@@ -539,6 +541,235 @@ describe('Stack component', () => {
 
       expect(testStack.keys).toHaveLength(tokens.maxStackSize);
       expect(spyEnded).toBeCalledTimes(additionalSoundsCount);
+    });
+  });
+
+  describe('prepare() lifecycle', () => {
+    const lifecyclePath = 'lifecycle/mock-audio.mp3';
+
+    function lifecycleStack() {
+      return new Stack(
+        'LifecycleStack',
+        lifecyclePath,
+        defaultContext,
+        defaultAudioNode,
+      );
+    }
+
+    // Waits until `fetch` has been hit `count` times, meaning that
+    // many `prepare()` calls are parked at the in-flight load step.
+    async function waitForRequests(
+      controls: ReturnType<typeof stubDeferredFetch>['controls'],
+      count: number,
+    ) {
+      await vi.waitFor(() => {
+        expect(controls).toHaveLength(count);
+      });
+    }
+
+    it('does not add a Sound or emit events when stop() runs mid-load', async () => {
+      const testStack = lifecycleStack();
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      const spyQueue: StackEventMap['queue'] = vi.fn((_n, _o) => {});
+      const spyState: StackEventMap['state'] = vi.fn((_c) => {});
+
+      testStack.on('queue', spyQueue);
+      testStack.on('state', spyState);
+
+      const pendingSound = testStack.prepare('Ghost');
+
+      await waitForRequests(controls, 1);
+      expect(testStack.state).toBe('loading');
+
+      testStack.stop();
+
+      expect(testStack.state).toBe('idle');
+      expect(testStack.keys).toStrictEqual([]);
+      expect(spyQueue).not.toBeCalled();
+
+      // Flush the now-dead load.
+      controls[0]?.resolve();
+      await expect(pendingSound).resolves.toBe(undefined);
+
+      // The late resolution must not resurrect anything.
+      expect(testStack.keys).toStrictEqual([]);
+      expect(testStack.get('Ghost')).toBe(undefined);
+      expect(testStack.state).toBe('idle');
+      expect(spyQueue).not.toBeCalled();
+
+      // Restore real fetch so the recovery load can resolve.
+      fetchSpy.mockRestore();
+
+      // The Stack remains reusable after being stopped.
+      const recoveredSound = await testStack.prepare('Recovered');
+
+      expect(recoveredSound).toBeInstanceOf(Sound);
+      expect(testStack.keys).toStrictEqual(['Recovered']);
+      expect(spyQueue).toBeCalledTimes(1);
+      expect(spyQueue).toBeCalledWith(['Recovered'], []);
+
+      testStack.teardown();
+    });
+
+    it('does not add a Sound or emit events when teardown() runs mid-load', async () => {
+      const testStack = lifecycleStack();
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      const spyQueue: StackEventMap['queue'] = vi.fn((_n, _o) => {});
+      const spyState: StackEventMap['state'] = vi.fn((_c) => {});
+
+      testStack.on('queue', spyQueue);
+      testStack.on('state', spyState);
+
+      const pendingSound = testStack.prepare('Ghost');
+
+      await waitForRequests(controls, 1);
+      expect(testStack.state).toBe('loading');
+
+      const spyDisconnect = vi.spyOn(AudioNode.prototype, 'disconnect');
+
+      testStack.teardown();
+
+      expect(testStack.activeEvents).toHaveLength(0);
+      expect(testStack.keys).toStrictEqual([]);
+      expect(spyQueue).not.toBeCalled();
+      // The internal gain node is released on teardown.
+      expect(spyDisconnect).toBeCalled();
+
+      controls[0]?.resolve();
+      await expect(pendingSound).resolves.toBe(undefined);
+
+      expect(testStack.keys).toStrictEqual([]);
+      expect(testStack.state).toBe('idle');
+      expect(spyQueue).not.toBeCalled();
+
+      // A torn-down Stack can never accept new Sounds,
+      // and should not even start another network load.
+      const postTeardown = testStack.prepare('Never');
+
+      expect(controls).toHaveLength(1);
+      await expect(postTeardown).resolves.toBe(undefined);
+      expect(testStack.keys).toStrictEqual([]);
+
+      fetchSpy.mockRestore();
+    });
+
+    it('falls back to a scratch buffer and emits error when a live load fails', async () => {
+      const testStack = lifecycleStack();
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      const spyError: StackEventMap['error'] = vi.fn((_m) => {});
+      const spyQueue: StackEventMap['queue'] = vi.fn((_n, _o) => {});
+
+      testStack.on('error', spyError);
+      testStack.on('queue', spyQueue);
+
+      const pendingSound = testStack.prepare('Scratch');
+
+      await waitForRequests(controls, 1);
+      controls[0]?.reject(new Error('Network failure'));
+
+      const sound = await pendingSound;
+
+      expect(spyError).toBeCalledTimes(1);
+      expect(spyError).toBeCalledWith({
+        id: 'LifecycleStack',
+        message: [
+          `Failed to load: ${lifecyclePath}`,
+          expect.stringContaining('Network failure'),
+        ],
+      });
+
+      // Existing behaviour preserved: failed loads still enqueue
+      // a playable Sound backed by the silent scratch buffer.
+      expect(sound).toBeInstanceOf(Sound);
+      expect(sound!.buffer).toBeInstanceOf(AudioBuffer);
+      expect({...sound!.buffer}).toStrictEqual({
+        duration: 0,
+        length: 1,
+        numberOfChannels: 1,
+        sampleRate: 22050,
+      });
+      expect(testStack.keys).toStrictEqual(['Scratch']);
+      expect(spyQueue).toBeCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      testStack.teardown();
+    });
+
+    it('resolves concurrent prepare() calls into the queue in completion order without clobbering', async () => {
+      const testStack = lifecycleStack();
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      const first = testStack.prepare('First');
+      const second = testStack.prepare('Second');
+      const third = testStack.prepare('Third');
+
+      await waitForRequests(controls, 3);
+      expect(testStack.state).toBe('loading');
+
+      // Resolve in a different order than the calls were made.
+      // Each continuation reads the current queue at completion time,
+      // so no result may overwrite or lose another.
+      controls[1]?.resolve();
+      const secondSound = await second;
+      expect(testStack.keys).toStrictEqual(['Second']);
+
+      controls[2]?.resolve();
+      const thirdSound = await third;
+      expect(testStack.keys).toStrictEqual(['Second', 'Third']);
+
+      controls[0]?.resolve();
+      const firstSound = await first;
+      expect(testStack.keys).toStrictEqual(['Second', 'Third', 'First']);
+
+      expect(firstSound).toBeInstanceOf(Sound);
+      expect(secondSound).toBeInstanceOf(Sound);
+      expect(thirdSound).toBeInstanceOf(Sound);
+      expect(new Set([firstSound, secondSound, thirdSound]).size).toBe(3);
+
+      expect(testStack.get('First')).toBe(firstSound);
+      expect(testStack.get('Second')).toBe(secondSound);
+      expect(testStack.get('Third')).toBe(thirdSound);
+
+      fetchSpy.mockRestore();
+      testStack.teardown();
+    });
+
+    it('discards only the in-flight prepare() that predates a stop()', async () => {
+      const testStack = lifecycleStack();
+      const {fetchSpy, controls} = stubDeferredFetch();
+
+      const spyQueue: StackEventMap['queue'] = vi.fn((_n, _o) => {});
+      testStack.on('queue', spyQueue);
+
+      const stale = testStack.prepare('Stale');
+
+      await waitForRequests(controls, 1);
+
+      // Bumping the lifecycle token invalidates `stale`...
+      testStack.stop();
+
+      // ...but a prepare started afterwards belongs to the new token.
+      const fresh = testStack.prepare('Fresh');
+
+      await waitForRequests(controls, 2);
+
+      controls[0]?.resolve();
+      await expect(stale).resolves.toBe(undefined);
+      expect(testStack.keys).toStrictEqual([]);
+
+      controls[1]?.resolve();
+      const freshSound = await fresh;
+
+      expect(freshSound).toBeInstanceOf(Sound);
+      expect(testStack.keys).toStrictEqual(['Fresh']);
+      expect(spyQueue).toBeCalledTimes(1);
+      expect(spyQueue).toBeCalledWith(['Fresh'], []);
+
+      fetchSpy.mockRestore();
+      testStack.teardown();
     });
   });
 
