@@ -1,5 +1,5 @@
 import { Box, PanelRightClose } from 'lucide-react';
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
 import type { ViewerApp } from '../app/useViewerApp';
 import { useCompactViewerLayout } from '../app/viewer-layout';
 import { AxisViewportGrid } from '../components/AxisViewportGrid';

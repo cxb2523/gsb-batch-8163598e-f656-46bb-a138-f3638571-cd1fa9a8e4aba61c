@@ -6,7 +6,7 @@ import {
   Ratio,
   RotateCcw,
 } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
+import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from '../i18n';
 import {
   createThreePreview,
@@ -42,19 +42,21 @@ export function VolumeViewport3D({
   const instructionsId = useId();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<ThreePreviewInstance | null>(null);
+  // Mirror the latest props during render so an asynchronous mount always
+  // reads the current values instead of values captured by an old effect.
   const cursorRef = useRef<VolumeCursor | null>(cursor);
+  cursorRef.current = cursor;
   const [error, setError] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
   const [planesVisible, setPlanesVisible] = useState(true);
   const planesVisibleRef = useRef(planesVisible);
+  planesVisibleRef.current = planesVisible;
 
   useEffect(() => {
-    cursorRef.current = cursor;
     instanceRef.current?.focusCursor(cursor);
   }, [cursor]);
 
   useEffect(() => {
-    planesVisibleRef.current = planesVisible;
     instanceRef.current?.setPlanesVisible(planesVisible);
   }, [planesVisible]);
 
@@ -70,50 +72,98 @@ export function VolumeViewport3D({
       return undefined;
     }
 
-    let cleanup: () => void = () => {};
+    const MIN_HOST_SIZE = 32;
+    const MAX_RETRIES = 4;
+
+    // `cancelled` is the single generation guard for this effect run. The
+    // cleanup flips it before anything else so an in-flight dynamic-import
+    // creation is cancelled first, then all other resources are torn down.
     let cancelled = false;
-    let mounted = false;
-    let frame = 0;
+    let instance: ThreePreviewInstance | null = null;
+    let createInFlight = false;
+    let initialFrame = 0;
     let retryTimer = 0;
     let retryCount = 0;
-    let resizeObserver: ResizeObserver | null = null;
+    let sizeObserver: ResizeObserver | null = null;
+
     setError(false);
     setPreviewReady(false);
 
+    const clearRetryTimer = () => {
+      if (retryTimer !== 0) {
+        window.clearTimeout(retryTimer);
+        retryTimer = 0;
+      }
+    };
+
+    const disconnectSizeObserver = () => {
+      sizeObserver?.disconnect();
+      sizeObserver = null;
+    };
+
     const scheduleRetry = () => {
-      if (cancelled || mounted || retryCount >= 4) return;
+      if (cancelled || instance || createInFlight) return;
+      if (retryCount >= MAX_RETRIES) return;
       retryCount += 1;
-      window.clearTimeout(retryTimer);
+      clearRetryTimer();
       retryTimer = window.setTimeout(() => {
-        mount();
-        if (!mounted) scheduleRetry();
+        retryTimer = 0;
+        attemptMount();
+        // Still below the size threshold (or the attempt could not start):
+        // keep the bounded retry chain going until the cap is reached.
+        if (!cancelled && !instance && !createInFlight) {
+          scheduleRetry();
+        }
       }, 120 * retryCount);
     };
 
-    const mount = () => {
-      if (cancelled || mounted) return;
-      if (host.clientWidth < 32 || host.clientHeight < 32) return;
-      mounted = true;
-      resizeObserver?.disconnect();
-      resizeObserver = null;
+    const attemptMount = () => {
+      if (cancelled || instance || createInFlight) return;
+      if (
+        host.clientWidth < MIN_HOST_SIZE ||
+        host.clientHeight < MIN_HOST_SIZE
+      ) {
+        return;
+      }
 
-      void createThreePreview(host, volume)
-        .then((instance) => {
+      createInFlight = true;
+      // A real mount attempt makes the size-watch/retry drivers obsolete;
+      // clear them so an old timer/observer can never trigger a duplicate.
+      clearRetryTimer();
+      disconnectSizeObserver();
+
+      void createThreePreview(host, volume, {
+        isCancelled: () => cancelled,
+      })
+        .then((created) => {
+          // A switch/unmount won while modules were loading. The creation
+          // bails before building when it observes cancellation; if an
+          // instance still arrived, dispose it immediately and never expose
+          // it through instanceRef or attach it as the active preview.
           if (cancelled) {
-            instance.dispose();
+            created.dispose();
             return;
           }
 
-          instanceRef.current = instance;
-          instance.focusCursor(cursorRef.current);
-          instance.setPlanesVisible(planesVisibleRef.current);
-          cleanup = instance.dispose;
+          instance = created;
+          instanceRef.current = created;
+          // Resynchronize from the latest refs: cursor/visibility may have
+          // changed repeatedly while the asynchronous creation was pending.
+          created.focusCursor(cursorRef.current);
+          created.setPlanesVisible(planesVisibleRef.current);
           setPreviewReady(true);
         })
-        .catch((_renderError: unknown) => {
+        .catch((creationError: unknown) => {
+          createInFlight = false;
           if (cancelled) return;
-          mounted = false;
-          if (retryCount < 4) {
+          // Cancellation rejections are expected and must not show the error UI.
+          if (
+            creationError instanceof Error &&
+            creationError.name === 'AbortError'
+          ) {
+            return;
+          }
+          if (retryCount < MAX_RETRIES) {
             scheduleRetry();
             return;
           }
@@ -122,24 +172,35 @@ export function VolumeViewport3D({
         });
     };
 
-    frame = window.requestAnimationFrame(() => {
-      mount();
-      if (mounted || cancelled) return;
+    initialFrame = window.requestAnimationFrame(() => {
+      if (cancelled) return;
+      attemptMount();
+      if (cancelled || createInFlight || instance) return;
 
-      resizeObserver = new ResizeObserver(() => {
-        mount();
+      // Host is still below the size threshold: keep watching for layout and
+      // keep the bounded retry chain. Both handles are owned by this effect
+      // and released in its cleanup.
+      sizeObserver = new ResizeObserver(() => {
+        attemptMount();
       });
-      resizeObserver.observe(host);
+      sizeObserver.observe(host);
       scheduleRetry();
     });
 
     return () => {
+      // 1. Cancel the not-yet-finished asynchronous creation first.
       cancelled = true;
-      window.cancelAnimationFrame(frame);
-      window.clearTimeout(retryTimer);
-      resizeObserver?.disconnect();
-      instanceRef.current = null;
-      cleanup();
+      // 2. Release scheduling/layout handles.
+      window.cancelAnimationFrame(initialFrame);
+      clearRetryTimer();
+      disconnectSizeObserver();
+      // 3. Detach the shared ref only if it still points at our instance.
+      if (instanceRef.current === instance) {
+        instanceRef.current = null;
+      }
+      // 4. Dispose the live instance (idempotent in the preview module).
+      instance?.dispose();
+      instance = null;
     };
   }, [volume]);
 
