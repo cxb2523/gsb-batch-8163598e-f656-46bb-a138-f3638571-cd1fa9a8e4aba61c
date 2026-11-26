@@ -307,7 +307,10 @@
     return {
       onDown() { fire(); },
       update(f) {
-        if ((state.shots || 0) !== lastShots) { lastShots = state.shots || 0; fire(); }
+        // Only an *increase* in the shared counter means a new shot. If a previous gunshot
+        // click layer was destroyed, the core rolls the counter back, which must not fire the gun.
+        const shots = state.shots || 0;
+        if (shots > lastShots) { lastShots = shots; fire(); } else if (shots < lastShots) lastShots = shots;
         kick *= Math.pow(0.78, f);
         const target = util.clamp(state.vx * 0.012, -0.25, 0.25);
         sway += (target - sway) * Math.min(1, 0.15 * f);

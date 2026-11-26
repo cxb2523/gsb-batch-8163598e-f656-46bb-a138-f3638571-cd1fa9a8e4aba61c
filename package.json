@@ -9,6 +9,8 @@
   "files": ["dist", "src", "README.md", "LICENSE"],
   "scripts": {
     "build": "sh build.sh",
+    "test": "node test/lifecycle-test.js",
+    "test:browser": "node test/run-browser.js",
     "start": "python3 -m http.server 8765"
   },
   "keywords": ["cursor", "custom-cursor", "cursor-effects", "mouse-trail", "click-effect", "particles", "canvas", "butterflies", "fireworks", "f1"],

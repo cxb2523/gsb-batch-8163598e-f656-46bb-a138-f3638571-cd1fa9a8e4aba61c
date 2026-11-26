@@ -239,7 +239,13 @@
     cursorScale: 1,           // scales any cursor model around the pointer (0.5 = half size)
   };
   const active = { cursor: null, trail: null, click: null };
+  // Keys the core itself owns. Anything else a plugin writes onto `state` is plugin-owned
+  // (e.g. f1car's `meta`, gunshot's `shots`, gun cursors' `gunEjects`) and must be rolled
+  // back when that instance dies, so the next plugin never inherits it.
+  const coreStateKeys = new Set(Object.keys(state).concat(['cursorScale']));
+  const instanceState = new Map();   // instance -> { kind, extras } snapshot of plugin-owned state keys
   let canvas = null, g = null, styleEl = null, rafId = 0, last = 0, bound = false, started = false;
+  const KINDS = ['cursor', 'trail', 'click'];
 
   // Redrawing a full-screen overlay sixty times a second costs the same whether or not
   // anything is happening. Once the pointer has been still for a moment, the loop eases
@@ -256,17 +262,42 @@
     const def = registry[kind].get(name);
     if (!def) { console.warn('CursorFX: no ' + kind + ' plugin named "' + name + '"'); return null; }
     const opts = Object.assign({}, def.defaults || {}, config.options[name] || {});
+    // Snapshot every plugin-owned field already on `state` before this instance runs, so the
+    // field can be restored to that exact value (or removed if it did not exist) on destroy.
+    const extras = {};
+    Object.keys(state).forEach((k) => {
+      if (!coreStateKeys.has(k)) extras[k] = { had: true, value: state[k] };
+    });
     const inst = def.create(opts, api(def, opts)) || {};
     inst.__def = def;
     inst.__name = name;
     inst.__opts = opts;
+    inst.__destroyed = false;
+    instanceState.set(inst, { extras });
     return inst;
   }
 
   function destroyInstance(kind) {
     const inst = active[kind];
-    if (inst && inst.destroy) { try { inst.destroy(); } catch (e) { console.error(e); } }
+    if (!inst) return;
     active[kind] = null;
+    // A second destroy (e.g. an error in frame() racing with a set()) must be a no-op and
+    // must never call update/render again through a stale reference.
+    if (inst.__destroyed) { instanceState.delete(inst); return; }
+    inst.__destroyed = true;
+    if (inst.destroy) { try { inst.destroy(); } catch (e) { console.error(e); } }
+    const snap = instanceState.get(inst);
+    if (snap) {
+      // Roll back every shared field a plugin may have written, including ones the plugin
+      // itself cleaned up and ones a different (now gone) plugin left behind earlier.
+      Object.keys(state).forEach((k) => {
+        if (coreStateKeys.has(k)) return;
+        const before = snap.extras[k];
+        if (before && before.had) state[k] = before.value;
+        else delete state[k];
+      });
+      instanceState.delete(inst);
+    }
   }
 
   function applyNativeCursor() {
@@ -283,10 +314,21 @@
     }
   }
 
+  // Only the layers whose resolved plugin (name + effective options) actually changed are
+  // torn down. Re-applying the same configuration is therefore a no-op: no duplicate
+  // instances, no duplicate DOM nodes, no audio nodes piling up between delayed timeouts.
   function apply() {
-    ['cursor', 'trail', 'click'].forEach((kind) => {
+    KINDS.forEach((kind) => {
+      const want = config[kind] || null;
+      const cur = active[kind];
+      const wantOpts = want
+        ? Object.assign({}, (registry[kind].get(want) || {}).defaults || {}, config.options[want] || {})
+        : null;
+      const unchanged = cur && cur.__name === want &&
+        JSON.stringify(cur.__opts || {}) === JSON.stringify(wantOpts || {});
+      if (unchanged) return;
       destroyInstance(kind);
-      if (config[kind]) active[kind] = makeInstance(kind, config[kind]);
+      if (want) active[kind] = makeInstance(kind, want);
     });
     applyNativeCursor();
     if (config.sound) audio.unlock(); else audio.mute();
@@ -423,8 +465,9 @@
 
     g.clearRect(0, 0, state.w, state.h);
     for (let k = 0; k < 3; k++) {
-      const i = active[k === 0 ? 'trail' : k === 1 ? 'click' : 'cursor'];
-      if (!i) continue;
+      const kind = k === 0 ? 'trail' : k === 1 ? 'click' : 'cursor';
+      const i = active[kind];
+      if (!i || i.__destroyed) continue;   // a set() between frames may have retired this instance
       try {
         if (i.update) i.update(f, dt);
         if (i.render) {
@@ -437,7 +480,7 @@
         }
       } catch (err) {
         console.error('CursorFX plugin error in ' + i.__name, err);
-        destroyInstance(k === 0 ? 'trail' : k === 1 ? 'click' : 'cursor');
+        destroyInstance(kind);
       }
     }
   }
@@ -518,8 +561,8 @@
     },
     destroy() {
       if (rafId) global.cancelAnimationFrame(rafId);
-      rafId = 0; started = false;
-      ['cursor', 'trail', 'click'].forEach(destroyInstance);
+      rafId = 0; started = false; last = 0; lastDraw = 0;
+      KINDS.forEach(destroyInstance);
       unbind();
       if (canvas) { canvas.remove(); canvas = null; g = null; }
       if (styleEl) { styleEl.remove(); styleEl = null; }
@@ -1370,7 +1413,10 @@ CursorFX.registerCursor('ghost', {
     return {
       onDown() { fire(); },
       update(f) {
-        if ((state.shots || 0) !== lastShots) { lastShots = state.shots || 0; fire(); }
+        // Only an *increase* in the shared counter means a new shot. If a previous gunshot
+        // click layer was destroyed, the core rolls the counter back, which must not fire the gun.
+        const shots = state.shots || 0;
+        if (shots > lastShots) { lastShots = shots; fire(); } else if (shots < lastShots) lastShots = shots;
         kick *= Math.pow(0.78, f);
         const target = util.clamp(state.vx * 0.012, -0.25, 0.25);
         sway += (target - sway) * Math.min(1, 0.15 * f);

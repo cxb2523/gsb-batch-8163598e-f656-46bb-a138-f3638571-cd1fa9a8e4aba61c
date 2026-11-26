@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>CursorFX lifecycle browser check (dump-dom build)</title></head>
+<body>
+<h1 id="status">running…</h1>
+<pre id="log"></pre>
+<a href="#">interactive</a>
+<script src="../dist/cursorfx.js"></script>
+<script>
+/* Runs without requestAnimationFrame so it completes under headless --dump-dom's virtual
+ * time budget. The core's own frame loop is rAF-driven and stays parked; instead we exercise
+ * the public lifecycle API (init/set/destroy/trigger) and the DOM/state it owns directly. */
+(function () {
+  'use strict';
+  const results = [];
+  const check = (name, cond) => results.push({ name, ok: !!cond });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const cursorfxNodes = () => Array.from(document.querySelectorAll('canvas[data-cursorfx],[data-spy],div[data-cursorfx]'));
+  const overlayCanvases = () => Array.from(document.querySelectorAll('canvas[data-cursorfx]'));
+  const waveRoots = () => Array.from(document.querySelectorAll('div[data-cursorfx]'));
+
+  const calls = {};
+  function spy(kind, field, withDefaults) {
+    calls[kind] = { create: 0, destroy: 0 };
+    const reg = kind === 'cursor' ? 'registerCursor' : kind === 'trail' ? 'registerTrail' : 'registerClick';
+    const def = {
+      create(_o, api) {
+        calls[kind].create++;
+        const node = document.createElement('div');
+        node.setAttribute('data-spy', kind);
+        document.body.appendChild(node);
+        return {
+          update() { api.state[field] = (api.state[field] || 0) + 1; },
+          render() {},
+          destroy() { calls[kind].destroy++; node.remove(); },
+        };
+      },
+    };
+    if (withDefaults) def.defaults = { color: '0,0,0' };
+    CursorFX[reg]('spy-' + kind, def);
+  }
+  spy('cursor', 'spyCurField');
+  spy('trail', 'spyTrailField');
+  spy('click', 'spyClickField', true);
+
+  (async function main() {
+    try {
+      CursorFX.init({ cursor: 'spy-cursor', trail: 'spy-trail', click: 'spy-click' });
+      check('init: one overlay canvas + three plugin nodes', cursorfxNodes().length === 4);
+      check('init: one instance per layer', calls.cursor.create === 1 && calls.trail.create === 1 && calls.click.create === 1);
+
+      const snap = JSON.stringify(calls);
+      for (let i = 0; i < 5; i++) CursorFX.set({ cursor: 'spy-cursor', trail: 'spy-trail', click: 'spy-click' });
+      check('repeated identical set recreates nothing', JSON.stringify(calls) === snap);
+
+      CursorFX.set({ sound: true });
+      CursorFX.set({ sound: false });
+      check('partial set (sound only) leaves layers alone', JSON.stringify(calls) === snap);
+
+      CursorFX.set({ cursor: 'f1car', sound: true });
+      check('switching cursor destroys the old one', calls.cursor.destroy === 1);
+      check('plugin state field rolled back', !('spyCurField' in CursorFX.state));
+      check('sibling layers untouched', calls.trail.create === 1 && calls.click.create === 1);
+      CursorFX.trigger(10, 10); // exercises the live click layer, not the destroyed one
+
+      CursorFX.set({ cursor: 'ring' });
+      check('f1car telemetry removed on destroy', !('meta' in CursorFX.state));
+      await sleep(300); // f1car/rocket-style delayed audio node cleanup
+
+      CursorFX.set({ cursor: 'gun-rifle', click: 'gunshot' });
+      CursorFX.trigger(50, 50);
+      CursorFX.trigger(51, 51);
+      check('gunshot publishes shared shot counter', CursorFX.state.shots === 2);
+      CursorFX.set({ click: 'ripple' });
+      check('shot counter rolled back on click switch', !('shots' in CursorFX.state));
+      check('gun cursor still alive after click swap', CursorFX.getConfig().cursor === 'gun-rifle');
+
+      CursorFX.set({ click: 'waves' });
+      CursorFX.trigger(70, 70);
+      CursorFX.trigger(90, 90);
+      check('waves keeps a single filter container', waveRoots().length === 1);
+      CursorFX.set({ click: 'ripple' });
+      check('waves filter container removed on destroy', waveRoots().length === 0);
+
+      CursorFX.set({ trail: null });
+      check('null layer destroys the instance', calls.trail.destroy === 1);
+      check('null layer rolls state back', !('spyTrailField' in CursorFX.state));
+
+      // Option lifecycle on a layer we actually own: bring the spy click back, then tweak its option.
+      CursorFX.set({ click: 'spy-click' });
+      const clickCreates = calls.click.create;
+      const cursorCreates = calls.cursor.create;
+      CursorFX.set({ options: { 'spy-click': { color: '1,2,3' } } });
+      check('option change recreates only that layer once', calls.click.create === clickCreates + 1 && calls.cursor.create === cursorCreates && calls.trail.create === 1);
+      CursorFX.set({ options: { 'spy-click': { color: '1,2,3' } } });
+      check('same effective options do not recreate again', calls.click.create === clickCreates + 1);
+
+      CursorFX.destroy();
+      check('destroy removes the overlay canvas', overlayCanvases().length === 0);
+      check('destroy removes every plugin node', document.querySelectorAll('[data-spy]').length === 0);
+      check('destroy clears plugin-owned state', !('spyClickField' in CursorFX.state) && !('shots' in CursorFX.state) && !('meta' in CursorFX.state));
+      check('destroy leaves no CursorFX DOM behind', cursorfxNodes().length === 0);
+      CursorFX.destroy(); // idempotent
+
+      CursorFX.init({ cursor: 'spy-cursor', trail: null, click: null });
+      check('init after destroy works with a fresh instance', calls.cursor.create === 2 && overlayCanvases().length === 1);
+      CursorFX.destroy();
+      check('final destroy leaves a clean DOM', cursorfxNodes().length === 0);
+    } catch (e) {
+      results.push({ name: 'UNCAUGHT ' + e.message, ok: false });
+    }
+    const failed = results.filter((r) => !r.ok);
+    document.getElementById('status').textContent = failed.length ? 'FAILED ' + failed.length + '/' + results.length : 'PASSED ' + results.length + '/' + results.length;
+    document.getElementById('log').textContent = results.map((r) => (r.ok ? 'ok   ' : 'FAIL ') + r.name).join('\n');
+  })();
+})();
+</script>
+</body>
+</html>

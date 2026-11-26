@@ -172,6 +172,26 @@ CursorFX.set({ click: 'smiley' });
 - Frame values are in per-frame units at 60 fps; scale motion by `f` so it looks the same at 120 Hz.
 - Cursors use `update/render` plus optional `onEnter`, `onDown`, `onUp`. Trails use `update/render`. Click effects add `trigger(x, y, event)`.
 
+### Plugin lifecycle
+
+`CursorFX.set()` (and switching a layer off with `null`) destroys the previous instance before creating the new one. After `destroy()` returns the instance is never called again — not `update`, `render`, `trigger`, nor any event hook — so a plugin must release everything it acquired:
+
+- return a `destroy()` that stops and disconnects any Web Audio nodes you connected to `audio.bus()`, and removes any DOM nodes you appended (the core only owns the overlay canvas and the `cursor: none` style element);
+- treat every extra field you write onto the shared `state` object (anything beyond the documented pointer fields, e.g. `state.meta`, `state.shots`) as rented: the core snapshots it on creation and restores or deletes it on destroy, so state can never leak into the next plugin;
+- re-applying an unchanged configuration is a no-op — instances are only recreated when the plugin name or its effective options change.
+
+```js
+create(opts, api) {
+  const root = document.createElement('div');           // page-level DOM the canvas cannot draw
+  document.body.appendChild(root);
+  return {
+    update(f) { /* ... */ },
+    render(g) { /* ... */ },
+    destroy() { root.remove(); },                        // runs on every switch/set/destroy
+  };
+}
+```
+
 Optional metadata: `credits: { requestedBy: 'u/name', builtBy: 'you' }` is shown on the plugin's card and returned by `CursorFX.list()`. `choices: { skin: [{ value, label, color }] }` turns an option into a picker: a dropdown in the studio and a row of swatches in both desktop widgets.
 
 Plugins live in `src/cursors`, `src/trails` and `src/clicks`. Run `npm run build` to rebundle `dist/cursorfx.js` and the extension zip.
@@ -223,11 +243,13 @@ The `extension/` folder is a Manifest V3 extension that runs CursorFX on every p
 ## Development
 
 ```bash
-npm run build      # bundle src/ into dist/cursorfx.js and copy it into extension/
-npm start          # serve the studio at http://localhost:8765
+npm run build         # bundle src/ into dist/cursorfx.js and copy it into extension/
+npm test              # dependency-free lifecycle checks under Node (shimmed DOM/Audio)
+npm run test:browser  # same lifecycle checks in a real headless Chrome/Edge
+npm start             # serve the studio at http://localhost:8765
 ```
 
-There is no build tooling to install. Plugins are plain scripts that register themselves, so you can also load `src/core.js` and individual plugin files directly.
+There is no build tooling to install. Plugins are plain scripts that register themselves, so you can also load `src/core.js` and individual plugin files directly. The tests need no packages either: `test/lifecycle-test.js` runs under plain Node with a tiny in-file DOM/canvas/Audio shim, and `test/run-browser.js` drives `test/browser-lifecycle-dump.html` against the freshly built bundle in whatever Chrome or Edge is installed.
 
 ## Accessibility and performance
 
