@@ -180,6 +180,8 @@ export class ImageEditorController {
 
 	private toolSession: ToolSession | null = null;
 	private pausedTool: string | null = null;
+	/** tool suspended by the first of overlapping restores (undo / loadState), resumed when the latest one finishes */
+	private restoreSuspendedTool: string | null = null;
 	private historySuspended = 0;
 	private nudgeCommitTimer: ReturnType<typeof setTimeout> | undefined;
 	private loadToken = 0;
@@ -458,6 +460,7 @@ export class ImageEditorController {
 		this.loadToken++;
 		this.deactivateTool('dispose');
 		this.stopPanHandlers();
+		this.restoreSuspendedTool = null;
 		this.detachGestures?.();
 		this.detachGestures = null;
 		window.removeEventListener('keydown', this.handleKeyDown);
@@ -471,7 +474,7 @@ export class ImageEditorController {
 		canvas.off();
 		this.canvas = null;
 		void canvas.dispose();
-		this.setState({ ready: false, loading: false, activeTool: null, panning: false, selection: [] });
+		this.setState({ ready: false, loading: false, activeTool: null, panning: false, restoring: false, selection: [] });
 	}
 
 	/** loads another image (and optionally a state), the history starts again */
@@ -490,7 +493,8 @@ export class ImageEditorController {
 		this.deactivateTool('dispose');
 		this.stopPanHandlers();
 		this.pausedTool = null;
-		this.setState({ ready: false, loading: true, zoom: MIN_ZOOM, panning: false });
+		this.restoreSuspendedTool = null;
+		this.setState({ ready: false, loading: true, zoom: MIN_ZOOM, panning: false, restoring: false });
 
 		this.historySuspended++;
 		try {
@@ -585,7 +589,7 @@ export class ImageEditorController {
 
 	/** records the current canvas as a new history entry (identical states are ignored) */
 	commit = (): void => {
-		if (!this.canvas || this.historySuspended > 0 || !this.state.ready) {
+		if (!this.canvas || this.historySuspended > 0 || this.state.restoring || !this.state.ready) {
 			return;
 		}
 
@@ -642,45 +646,72 @@ export class ImageEditorController {
 	/** restores the history entry with the given index */
 	async goToHistory(index: number) {
 		const { entries } = this.state.history;
-		if (!this.canvas || this.state.restoring || index < 0 || index >= entries.length) {
+		if (
+			!this.canvas ||
+			this.state.loading ||
+			index < 0 ||
+			index >= entries.length ||
+			index === this.state.history.index
+		) {
 			return;
 		}
-		if (index === this.state.history.index) {
-			return;
-		}
-
-		this.setState({ restoring: true });
-		const tool = this.suspendTool('restore');
-		try {
-			if (await this.restoreState(JSON.parse(entries[index]))) {
+		const entry = entries[index];
+		await this.runRestore(
+			(token) => this.restoreState(JSON.parse(entry), token),
+			() => {
 				const history: HistoryState = { entries, index };
 				this.setState({ history });
 				this.emit('historyChange', { history });
 				this.emitChange();
-			}
-		} catch (error) {
-			this.reportError(error);
-		} finally {
-			this.setState({ restoring: false });
-			this.resumeTool(tool);
-		}
+			},
+		);
 	}
 
 	/** replaces the canvas content with the given JSON and starts a new history */
 	async loadState(json: Record<string, any> | string) {
-		const canvas = this.canvas;
-		if (!canvas) {
+		if (!this.canvas || this.state.loading) {
 			return;
 		}
 		const data = typeof json === 'string' ? JSON.parse(json) : JSON.parse(JSON.stringify(json));
-		await this.withToolSuspended('restore', async () => {
-			if (await this.restoreState(data)) {
+		await this.runRestore(
+			(token) => this.restoreState(data, token),
+			() => {
 				const history: HistoryState = { entries: [this.serialize()], index: 0 };
 				this.setState({ history });
 				this.emit('historyChange', { history });
 				this.emitChange();
+			},
+		);
+	}
+
+	/**
+	 * Runs a canvas restore (undo / redo / loadState). Bumping the load token invalidates a previous restore (or
+	 * load) which is still reading asynchronously: it abandons its writes instead of overwriting the newer state.
+	 * Only the latest restore clears the `restoring` state and resumes the suspended tool. A failed restore keeps
+	 * the current (editable) state and reports the error.
+	 */
+	private async runRestore(restore: (token: number) => Promise<boolean>, apply: () => void) {
+		const token = ++this.loadToken;
+		if (!this.state.restoring) {
+			this.setState({ restoring: true });
+			this.restoreSuspendedTool = this.suspendTool('restore');
+		}
+		try {
+			if (await restore(token)) {
+				apply();
 			}
-		});
+		} catch (error) {
+			// a stale restore is abandoned silently, its target state is no longer wanted
+			if (token === this.loadToken) {
+				this.reportError(error);
+			}
+		} finally {
+			if (token === this.loadToken && this.state.restoring) {
+				this.setState({ restoring: false });
+				this.resumeTool(this.restoreSuspendedTool);
+				this.restoreSuspendedTool = null;
+			}
+		}
 	}
 
 	private async restoreState(json: any, token = this.loadToken): Promise<boolean> {
@@ -690,32 +721,38 @@ export class ImageEditorController {
 		}
 		const isStale = () => this.canvas !== canvas || token !== this.loadToken;
 
+		// loaded before anything is cleared: when the load fails the current state stays editable
+		const backgroundData = json.backgroundImage;
+		let loadedBackground: FabricImage | undefined;
+		if (!canvas.backgroundImage && backgroundData?.src) {
+			loadedBackground = await FabricImage.fromURL(backgroundData.src, {
+				crossOrigin: this.options.crossOrigin === undefined ? 'anonymous' : this.options.crossOrigin,
+			});
+			if (isStale()) {
+				return false;
+			}
+		}
+
 		this.historySuspended++;
 		try {
+			// history entries don't store the background source (it never changes), the current image is reused
 			const existingBackgroundImage = canvas.backgroundImage;
 			canvas.clear();
 
-			const backgroundData = json.backgroundImage;
 			if (existingBackgroundImage) {
 				canvas.backgroundImage = existingBackgroundImage;
 				if (backgroundData) {
 					this.applyBackgroundState(existingBackgroundImage as FabricImage, backgroundData);
 				}
-			} else if (backgroundData?.src) {
-				const image = await FabricImage.fromURL(backgroundData.src, {
-					crossOrigin: this.options.crossOrigin === undefined ? 'anonymous' : this.options.crossOrigin,
-				});
-				if (isStale()) {
-					return false;
-				}
-				image.set({
+			} else if (loadedBackground) {
+				loadedBackground.set({
 					width: backgroundData.width,
 					height: backgroundData.height,
 					scaleX: backgroundData.scaleX,
 					scaleY: backgroundData.scaleY,
 				});
-				canvas.backgroundImage = image;
-				this.applyBackgroundState(image, backgroundData);
+				canvas.backgroundImage = loadedBackground;
+				this.applyBackgroundState(loadedBackground, backgroundData);
 			}
 
 			canvas.clipPath = json.clipPath
@@ -736,6 +773,8 @@ export class ImageEditorController {
 				}
 			}
 
+			// blur areas show a blurred copy of the photo: re-render them with the restored filters
+			this.refreshBlurPatches();
 			this.applyViewport();
 			return true;
 		} finally {
