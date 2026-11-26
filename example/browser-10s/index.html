@@ -50,6 +50,7 @@ function rrect(x, y, w, h, r) { g.beginPath(); g.roundRect(x, y, w, h, r); }
 
 // ---------- editable elements: review/film-fix.html moves/scales these and rewrites only the TUNE line ----------
 const FMT = { '1920x1080': '16x9', '1080x1920': '9x16', '1080x1350': '4x5', '1080x1080': '1x1' }[`${W}x${H}`] || `${W}x${H}`;
+const SQUARE = FMT === '1x1';                        // square gets its own fitted tree and a 3+2 pipeline; 16:9/9:16/4:5 branches are separate
 const TUNE = /*TUNE*/{}/*END-TUNE*/;               // {format: {id: {dx, dy, s}}}, canvas px; per format because layouts differ
 const ELEMENTS = [];                                // [{id, box:[x,y,w,h]}] in canvas px, rebuilt by every seek
 function E(id, [x, y, w, h], draw) {
@@ -122,6 +123,11 @@ const TREE = [ // id, label, parent, depth, col (0..1 across its row)
 ];
 function treePos() {
   const top = portrait ? H * 0.33 : H * 0.30, gap = (portrait ? 300 : 210) * S, cx = W / 2;
+  if (SQUARE) { // 1:1: stacked rows like portrait, pulled inward/up so <head> and <img> clear the 6% safe margin
+    const t = H * 0.235, g = 265 * S;
+    return { html: [cx, t], head: [cx - W * 0.28, t + g], body: [cx + W * 0.20, t + g],
+      h1: [cx - W * 0.30, t + 2 * g], p: [cx, t + 2 * g], img: [cx + W * 0.30, t + 2 * g] };
+  }
   if (portrait) return { html: [cx, top], head: [cx - W * 0.25, top + gap], body: [cx + W * 0.18, top + gap],
     h1: [cx - W * 0.29, top + 2 * gap], p: [cx, top + 2 * gap], img: [cx + W * 0.29, top + 2 * gap] };
   const spread = 380 * S, cx2 = cx - spread * 0.3;
@@ -132,7 +138,7 @@ function scene2(t) {
   const lt = t;
   E('heading2', tbox('1. Parse HTML → DOM tree', W / 2, portrait ? H * 0.15 : H * 0.12, (portrait ? 70 : 64) * S), () =>
   text('1. Parse HTML → DOM tree', W / 2, portrait ? H * 0.15 : H * 0.12, (portrait ? 70 : 64) * S, C.ink, 'center', '700'));
-  const P = treePos(); const nw = (portrait ? 240 : 220) * S, nh = 92 * S;
+  const P = treePos(); const nw = ((portrait || SQUARE) ? 240 : 220) * S, nh = 92 * S;
   const PX = Object.values(P).map(q => q[0]), PY = Object.values(P).map(q => q[1]);
   E('tree', [Math.min(...PX) - nw / 2, Math.min(...PY) - nh / 2, Math.max(...PX) - Math.min(...PX) + nw, Math.max(...PY) - Math.min(...PY) + nh], () => {
   TREE.forEach(([id, , parent], i) => {         // edges first
@@ -158,9 +164,20 @@ function scene3(t) {
   const lt = t;
   E('heading3', tbox('2. The render pipeline', W / 2, portrait ? H * 0.12 : H * 0.12, (portrait ? 70 : 64) * S), () =>
   text('2. The render pipeline', W / 2, portrait ? H * 0.12 : H * 0.12, (portrait ? 70 : 64) * S, C.ink, 'center', '700'));
-  const n = STAGES.length; let pos;
-  if (portrait) { const bw = W - 2 * M - 220 * S, bh = 150 * S, gap = 48 * S, top = H * 0.2; pos = STAGES.map((_, i) => [W / 2, top + i * (bh + gap) + bh / 2, bw, bh]); }
-  else { const gap = 44 * S, bw = (W - 2 * M - 60 * S - gap * (n - 1)) / n, bh = 150 * S, y = H * 0.36; pos = STAGES.map((_, i) => [M + 30 * S + bw / 2 + i * (bw + gap), y, bw, bh]); }
+  const n = STAGES.length; let pos, stageSize;
+  if (FMT === '4x5') {
+    // shorter than 9:16: tighter centred rows leave vertical room for a real pixel block and the tagline
+    const bw = 820 * S, bh = 112 * S, gap = 30 * S, top = 222 * S; stageSize = 52;
+    pos = STAGES.map((_, i) => [W / 2, top + bh / 2 + i * (bh + gap), bw, bh]);
+  } else if (SQUARE) {
+    // 1:1: three boxes over two, centred. Five in a row auto-shrank "Composite" below the text floor.
+    const bw = 282 * S, bh = 130 * S, gx = 40 * S, gy = 34 * S; stageSize = 44;
+    const c1 = (W - (3 * bw + 2 * gx)) / 2, y1 = 252 * S;
+    const c2 = (W - (2 * bw + gx)) / 2, y2 = y1 + bh + gy;
+    pos = [[0, 1, 2].map(i => [c1 + bw / 2 + i * (bw + gx), y1, bw, bh]),
+           [0, 1].map(i => [c2 + bw / 2 + i * (bw + gx), y2, bw, bh])].flat();
+  } else if (portrait) { stageSize = 58; const bw = W - 2 * M - 220 * S, bh = 150 * S, gap = 48 * S, top = H * 0.2; pos = STAGES.map((_, i) => [W / 2, top + i * (bh + gap) + bh / 2, bw, bh]); }
+  else { stageSize = 44; const gap = 44 * S, bw = (W - 2 * M - 60 * S - gap * (n - 1)) / n, bh = 150 * S, y = H * 0.36; pos = STAGES.map((_, i) => [M + 30 * S + bw / 2 + i * (bw + gap), y, bw, bh]); }
   const active = TL.boxes.filter(b => b <= lt).length - 1;
   const PL = Math.min(...pos.map(q => q[0] - q[2] / 2)), PT = Math.min(...pos.map(q => q[1] - q[3] / 2));
   E('pipeline', [PL, PT, Math.max(...pos.map(q => q[0] + q[2] / 2)) - PL, Math.max(...pos.map(q => q[1] + q[3] / 2)) - PT], () => {
@@ -169,20 +186,38 @@ function scene3(t) {
     const [x, y, bw, bh] = pos[i]; const hot = i === active && lt < TL.grid[0] + 0.2;
     g.save(); g.translate(x, y); g.scale(k * (hot ? 1.04 : 1), k * (hot ? 1.04 : 1));
     rrect(-bw / 2, -bh / 2, bw, bh, 20 * S); g.fillStyle = hot ? col : C.panel; g.fill(); g.lineWidth = 4 * S; g.strokeStyle = col; g.stroke();
-    text(name, 0, 0, (portrait ? 58 : 44) * S, hot ? C.bg : C.ink, 'center', '700', bw - 24 * S);
+    text(name, 0, 0, stageSize * S, hot ? C.bg : C.ink, 'center', '700', bw - 24 * S);
     g.restore();
-    if (i > 0 && !portrait) { const [px, , pbw] = pos[i - 1]; g.globalAlpha *= k; text('›', (px + pbw / 2 + x - bw / 2) / 2, y, 44 * S, C.dim); g.globalAlpha = 1; }
+    if (i > 0 && !portrait && Math.abs(y - pos[i - 1][1]) < 1) { const [px, , pbw] = pos[i - 1]; g.globalAlpha *= k; text('›', (px + pbw / 2 + x - bw / 2) / 2, y, 44 * S, C.dim); g.globalAlpha = 1; }
   });
   });
   // pixel grid fill
   const gp = prog(lt, TL.grid[0], TL.grid[1]);
-  const gs = portrait ? Math.min(W - 2 * M, 620 * S) : 520 * S;
-  const gx = W / 2 - gs / 2, gy = portrait ? H * 0.2 + 5 * (150 + 48) * S + 30 * S : H * 0.52;
-  const cells = 12, cs = gs / cells; const r = rngFor('grid');
+  const cells = 12;
+  const pipeBottom = Math.max(...pos.map(q => q[1] + q[3] / 2));
+  const tagSize = (portrait ? 72 : 60) * S;
+  // tight formats nudge the rest line up and shorten the entrance slide so even the moving box stays inside M;
+  // 16:9/9:16 keep the exact original rest line and 30px slide (pixels unchanged there)
+  const tagRestY = (FMT === '4x5' || SQUARE) ? H - M - 56 * S : H - M - 50 * S;
+  const tagSlide = (FMT === '4x5' || SQUARE) ? 6 * S : 30 * S;
+  let gs, gy, rows;
+  if (FMT === '4x5') {
+    // flow under the compact pipeline; fit the row count so the block ends above the resting tagline, inside M
+    gs = 456 * S;
+    gy = pipeBottom + 26 * S;
+    const bottomMax = tagRestY - tagSize * 0.6 - 26 * S;
+    rows = Math.max(1, Math.min(7, Math.floor((bottomMax - gy) / (gs / cells))));
+  } else {
+    gs = portrait ? Math.min(W - 2 * M, 620 * S) : 520 * S;
+    gy = portrait ? H * 0.2 + 5 * (150 + 48) * S + 30 * S : H * 0.52;
+  }
+  const gx = W / 2 - gs / 2;
+  const cs = gs / cells; const r = rngFor('grid');
   const order = Array.from({ length: cells * cells }, (_, i) => [i, r()]).sort((a, b) => a[1] - b[1]).map(a => a[0]);
   const on = Math.floor(gp * cells * cells);
-  const gh = portrait ? Math.min(gs * 0.55, H - gy - 190 * S) : Math.min(gs * 0.5, H - gy - 170 * S);
-  const rows = Math.max(1, Math.floor(gh / cs));
+  let gh;
+  if (FMT === '4x5') gh = rows * cs;
+  else { gh = portrait ? Math.min(gs * 0.55, H - gy - 190 * S) : Math.min(gs * 0.5, H - gy - 170 * S); rows = Math.max(1, Math.floor(gh / cs)); }
   E('pixels', [gx, gy, gs, rows * cs], () => {
   if (gp > 0) for (let k = 0; k < on; k++) {
     const idx = order[k], cx = idx % cells, cy = Math.floor(idx / cells); if (cy >= rows) continue;
@@ -192,7 +227,12 @@ function scene3(t) {
   });
   // tagline (holds with live motion; no fade to black)
   const tg = eOutCubic(prog(lt, TL.tagline, TL.tagline + 0.5));
-  if (tg > 0) { const ga = g.globalAlpha; g.globalAlpha = ga * tg; E('tagline', tbox('Code in, pixels out.', W / 2, H - M - 50 * S, (portrait ? 72 : 60) * S), () => text('Code in, pixels out.', W / 2, H - M - 50 * S + (1 - tg) * 30 * S, (portrait ? 72 : 60) * S, C.amber, 'center', '700')); g.globalAlpha = ga; }
+  if (tg > 0) {
+    const ga = g.globalAlpha; g.globalAlpha = ga * tg;
+    const tagY = tagRestY + (1 - tg) * tagSlide;   // box follows the entrance slide, so it matches the pixels at every t
+    E('tagline', tbox('Code in, pixels out.', W / 2, tagY, tagSize), () => text('Code in, pixels out.', W / 2, tagY, tagSize, C.amber, 'center', '700'));
+    g.globalAlpha = ga;
+  }
 }
 
 // ---------- compositor: scenes + transitions, pure in t ----------

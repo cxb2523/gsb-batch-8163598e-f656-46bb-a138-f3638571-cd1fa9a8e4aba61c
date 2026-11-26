@@ -138,6 +138,7 @@ body.editing #view { cursor: move; touch-action: none; }
           <option value="16x9">16:9</option>
           <option value="9x16">9:16</option>
           <option value="4x5">4:5</option>
+          <option value="1x1">1:1</option>
         </select>
         <label class="btn">Audio file…<input id="inAudio" type="file" accept=".wav,.mp3,.m4a,audio/wav,audio/mpeg,audio/mp4" hidden></label>
         <button id="btnEdit" type="button" aria-pressed="false" disabled>Edit</button>
@@ -212,7 +213,7 @@ body.editing #view { cursor: move; touch-action: none; }
 /* ============ STATE ============ */
 const $ = id => document.getElementById(id);
 const PX_PER_SEC = 120;                                   // scroll distance per film second
-const FORMATS = { '16x9': [1920, 1080], '9x16': [1080, 1920], '4x5': [1080, 1350] };
+const FORMATS = { '16x9': [1920, 1080], '9x16': [1080, 1920], '4x5': [1080, 1350], '1x1': [1080, 1080] };
 const ACCENT = '#ff6b3d';
 const film = { name: '', label: '', size: 0, bytes: null, dir: null, format: '' };
 let A = null;             // the film's window.__anim

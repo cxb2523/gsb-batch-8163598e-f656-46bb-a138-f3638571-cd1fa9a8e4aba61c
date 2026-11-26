@@ -104,7 +104,7 @@ TTS first, then word-level timestamps (transcribe the WAV with any tool that ret
 
 - Same `TL`, same scenes, a different layout. Compute `portrait = H > W`, `S = min(W,H)/1080` (type and shape scale), `M = 0.06*min(W,H)` (safe margin). Lay out per aspect: rows in 16:9 become columns in 9:16, trees get narrower spreads, and so on.
 - Text: shrink-to-fit (`measureText` loop against `W-2M`) so nothing is ever cut at the edge. Sizes come from `S`. In portrait, use bigger type and fill the height.
-- Don't treat "portrait" as one case. 4:5 (1080x1350) is much shorter than 9:16. The example's 9:16 column layout run at 4:5 pushes the pixel grid and tagline off the bottom and on top of each other. Branch on the aspect ratio (`H/W`: about 0.56, 1.25, 1.78) or lay out from available height, and `shoot` every format you deliver.
+- Don't treat "portrait" as one case. 4:5 (1080x1350) is much shorter than 9:16: reusing the 9:16 column stack at 4:5 pushes the pixel grid and tagline off the bottom and into each other. Branch on the aspect ratio (`H/W`: about 0.56, 1, 1.25, 1.78) or lay out from available height - `browser-10s` now gives 4:5 a tighter stack and 1:1 a 3+2 grid - and `shoot` every format you deliver.
 - Remember pop overshoot (easeOutBack ~1.1x) and "hot" scale-ups when you check margins. Verify each format's densest frame with `shoot`.
 
 ## Procedural sound (OfflineAudioContext)
@@ -224,4 +224,4 @@ One 36-40 s film by one agent took about 0.3M tokens including three QA passes (
 
 - `harness/` - lib.mjs, render.mjs, verify.mjs, shoot.mjs, audio.mjs, lint.mjs, review.mjs, qa.sh, package.json
 - `example/browsers-40s/` - the 40 s, 7-board "How browsers work" explainer with a world camera, beat-grid score and STORYBOARD.md (16:9 + 9:16 QA'd).
-- `example/browser-10s/` - a working 10 s (layouts tuned and QA'd for 16:9 and 9:16 only; 4:5 is known-broken in scene 3), 3-scene piece ("How a browser draws a page") with STORYBOARD.md: contract, seeded RNG, easing, per-aspect layout, push transitions, OfflineAudioContext score. Start new works from it.
+- `example/browser-10s/` - a working 10 s piece with per-format layouts QA'd for 16:9, 9:16, 4:5 and 1:1 (the tight formats use a compact scene-3 stack/grid), 3 scenes ("How a browser draws a page") with STORYBOARD.md: contract, seeded RNG, easing, per-aspect layout, push transitions, OfflineAudioContext score. Start new works from it.

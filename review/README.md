@@ -11,7 +11,7 @@ Double-click `film-fix.html`. It opens in Chrome or Edge from file://, with no s
 
 Scroll the page to move through the film, and you hear the soundtrack while you scroll. ← → step one frame, Shift steps one second, Space plays, M mutes. Click the frame to add a note. Notes are kept in this browser per film file and size.
 
-The format menu (16:9 / 9:16 / 4:5) reloads the film at that size. Notes are kept separately for each format.
+The format menu (16:9 / 9:16 / 4:5 / 1:1) reloads the film at that size. Notes are kept separately for each format.
 
 **Edit (key E):** in films with a `/*TUNE*/` block and `E()` elements (see SKILL.md), drag an element to move it or drag a corner to scale it. Arrows nudge it and + − change its size. **Save to index.html** rewrites only the TUNE line and keeps a dated backup the first time. In any other film, drag a box around what should move, then move or scale the copy. Enter turns the result into a note with exact numbers.
 
