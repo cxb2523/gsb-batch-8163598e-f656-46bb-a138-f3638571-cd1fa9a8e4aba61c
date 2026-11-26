@@ -28,7 +28,11 @@ export const VOICINGS = ["tap", "click", "crackle", "brush", "flick", "rustle"] 
 export type Voicing = (typeof VOICINGS)[number];
 
 export interface SoundParams {
-  /* Ms. Open is turn then sweep; close is sweep then turn. */
+  /* Ms. Each call scores one beat of the motion, and is handed that beat's
+     actual window — already scaled by the close ratio when closing — so the
+     sound can never be a beat ahead of the animation. A "turn" call scores
+     the lock at the end of a turn; an "open"/"close" call scores the cards
+     across a sweep. */
   turn: number;
   sweep: number;
   /* Cards in the deck — one event per card. */
@@ -139,6 +143,9 @@ export interface Voice {
   src: AudioBufferSourceNode;
   gain: GainNode;
   at: number;
+  /* Set by hush, so a second hush in the same interrupt (or the cleanup that
+     follows it) cannot re-ramp a voice that is already on its way out. */
+  hushed?: boolean;
 }
 
 /* One noise buffer per context, shared by every voice. White noise through a
@@ -281,7 +288,11 @@ export function schedule(
 
   const n = Math.max(3, Math.round(p.blades));
   const opening = gesture === "open";
-  const sweep = (p.sweep / 1000) * (opening ? 1 : 0.78);
+  /* The caller hands over the window this beat actually runs for — already
+     shortened by the close ratio on the way in — so nothing here rescales it.
+     A sound scheduled against a ratio of its own would land a fraction of a
+     beat off whenever the motion panel and the ratio disagreed. */
+  const sweep = p.sweep / 1000;
   const G = GRAINS[p.voice] ?? GRAINS.crackle;
   const bright = p.bright || 1;
   const length = p.length || 1;
@@ -360,11 +371,8 @@ export function schedule(
     }
   }
 
-  if (!opening) {
-    /* And the same lock when the stack comes upright again at the end of
-       the close turn. */
-    lock(ctx, bus, t0 + sweep + (p.turn / 1000) * 0.78 * 0.5, live);
-  }
+  /* Closing, the lock when the stack comes back upright is its own "turn"
+     beat, scheduled by the caller at the moment that turn actually starts. */
 }
 
 /* The deck locking into position: very low, very short, almost numb. */
@@ -389,17 +397,36 @@ function lock(ctx: BaseAudioContext, bus: AudioNode, at: number, live: Voice[]) 
 /* Interrupting a gesture mid-flight. Voices that haven't started yet are
    simply told to stop at their own start time, so they never play; voices in
    flight are held where they are and ramped out over a few milliseconds. No
-   instant value assignment anywhere, so no pop. */
+   instant value assignment anywhere, so no pop.
+
+   Idempotent: a voice already hushed keeps its scheduled ramp, and a voice
+   whose start is behind the clock is not given a second one. This matters
+   because an interrupt hushes twice — once when the new gesture starts and
+   again from the cleanup of whatever was already in flight — and re-ramping
+   a gain that is still stepping would either pop or cancel the fade that was
+   already stopping it. */
 export function hush(ctx: BaseAudioContext, live: Voice[]) {
   const now = ctx.currentTime;
   for (const v of live) {
+    if (v.hushed) continue;
+    v.hushed = true;
     if (v.at > now) {
-      v.src.stop(v.at);
+      /* A pending grain. Stopping it at its own start means it never sounds,
+         but the source still ends and cleans itself up. */
+      try {
+        v.src.stop(v.at);
+      } catch {
+        /* already stopped by a previous pass */
+      }
     } else {
       v.gain.gain.cancelScheduledValues(now);
       v.gain.gain.setValueAtTime(v.gain.gain.value, now);
       v.gain.gain.linearRampToValueAtTime(0, now + 0.03);
-      v.src.stop(now + 0.05);
+      try {
+        v.src.stop(now + 0.05);
+      } catch {
+        /* already stopped */
+      }
     }
   }
 }

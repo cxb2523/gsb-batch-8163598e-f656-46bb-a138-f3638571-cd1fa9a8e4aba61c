@@ -47,6 +47,12 @@ export function subscribeSwitch(onChange: () => void): () => void {
   };
 }
 
+/* Which card is under a point right now. `elementsFromPoint` already walks
+   the painted, transformed boxes — a card mid-swing is hit where it is drawn,
+   not where its untransformed layout box was — so the only thing the old code
+   got wrong was *when* it asked. The component now asks again on every frame
+   the cards move under a resting pointer (see the hover loop in FanDeck), so
+   the hit is never resolved against a stale angle. */
 export function cardAt(x: number, y: number): { id: number; el: HTMLElement } | null {
   const stack = document.elementsFromPoint(x, y);
   for (const node of stack) {
@@ -115,9 +121,24 @@ export interface Haptics {
   /** Swallow the click that ends a drag across the open fan. */
   consumeClick(open: boolean): "tap" | "drag";
   stop(): void;
+  /** Point the hover at a hit, or clear it. The caller resolves the hit from
+      the current transforms; this only tracks which node carries data-hot. */
   focus(hit: { id: number; el: HTMLElement } | null): void;
+  /** Drop data-hot and the remembered card and point. Used when a close
+      finishes under a resting cursor, so nothing is left highlighted. */
+  clearHot(): void;
+  /** Remember where a hovering pointer is, so the hit can be re-resolved
+      after the cards swing under it without the pointer moving. */
+  remember(x: number, y: number): void;
+  /** Forget that point — the pointer left, or it was a finger. */
+  forget(): void;
+  /** The remembered hovering point, if there is one. */
+  where(): { x: number; y: number } | null;
 }
 
+/* `onMove` is a small mutable box the deck fills with its latest pointer
+   handler on every render. It is not state: it is read only inside an event
+   listener, never during render. */
 export function createHaptics(onMove: { readonly current: (event: PointerEvent) => void }): Haptics {
   let input: HTMLInputElement | null = null;
   let ticker: Ticker | null = null;
@@ -133,6 +154,11 @@ export function createHaptics(onMove: { readonly current: (event: PointerEvent) 
      and some browsers cancel the pointer first — `moved` would already be
      gone, and the fan would shut. Cleared once that click has had its turn. */
   let pendingDrag = false;
+  /* Where a hovering pointer last was. `elementsFromPoint` is asked again
+     with this point whenever the deck's angles change, so the card under a
+     resting cursor follows the cards rather than the layout they used to
+     have. Null on a finger or once the pointer leaves. */
+  let pointer: { x: number; y: number } | null = null;
   const haptics: Haptics = {
     card: null,
     moved: false,
@@ -236,6 +262,26 @@ export function createHaptics(onMove: { readonly current: (event: PointerEvent) 
       if (el && el !== hot) el.dataset.hot = "true";
       hot = el;
       haptics.card = hit?.id ?? null;
+    },
+
+    clearHot() {
+      if (hot) delete hot.dataset.hot;
+      hot = null;
+      haptics.card = null;
+      /* A resting cursor is still somewhere; the next re-target should be
+         able to light a card again. The point itself is kept. */
+    },
+
+    remember(x, y) {
+      pointer = { x, y };
+    },
+
+    forget() {
+      pointer = null;
+    },
+
+    where() {
+      return pointer;
     },
 
     stop() {

@@ -206,10 +206,21 @@ const DEV = process.env.NODE_ENV !== "production";
    out it slides across while the copy fades, and only then turns; on the way
    back it turns upright first and slides home last. */
 type Stage = "shut" | "align" | "flat" | "open";
+type Intent = "open" | "shut";
+
+/* The two directions, written once, as which stage follows which. A closing
+   is not a separate animation: it is the opening walked with this map, so
+   every reversal is the same code path starting from wherever the deck got
+   to. `undefined` means the deck is already where it is going. */
+const NEXT: Record<Intent, Partial<Record<Stage, Stage>>> = {
+  open: { shut: "align", align: "flat", flat: "open" },
+  shut: { open: "flat", flat: "align", align: "shut" },
+};
 
 /* Shutting runs quicker than opening — a deck falls closed, it doesn't unfold
    closed. Held as a ratio of the dialled durations so the relationship survives
-   whatever the motion panel is set to. */
+   whatever the motion panel is set to. Both the timers below and the sound
+   above multiply by this same number, so the two can't drift apart. */
 const CLOSE = 0.78;
 
 /* The switch attribute is what makes WebKit play a haptic. React has no
@@ -284,7 +295,10 @@ export function FanDeck() {
   /* A real switch on each card: the iPhone haptic, and on a Mac the
      trackpad tick. False on the server so the markup matches. */
   const switchTick = useSyncExternalStore(subscribeSwitch, wantsSwitch, () => false);
+  /* The pointer handler is swapped every render through this box, never read
+     during render — createHaptics only touches it from an event listener. */
   const onFinger = useRef<(event: PointerEvent) => void>(() => {});
+  // eslint-disable-next-line react-hooks/refs
   const [feel] = useState(() => createHaptics(onFinger));
 
   /* The deck arrives shut tight and only then eases into its resting splay,
@@ -312,31 +326,7 @@ export function FanDeck() {
     return () => clearInterval(id);
   }, [driftRate]);
   const [swing, setSwing] = useState(TURN);
-  const beat = useRef<ReturnType<typeof setTimeout> | null>(null);
   const open = stage === "open";
-
-  function fingerMeets(x: number, y: number) {
-    const hit = cardAt(x, y);
-    const next = hit?.id ?? null;
-    if (next === feel.card) return;
-    feel.focus(hit);
-    if (next == null) return;
-    /* Shut, the stack splays under the cursor and each edge is a card.
-       Open, the same crossing is the slide across the fan. */
-    if (open || stage === "shut") play("hover");
-    feel.meet("touch");
-  }
-  useLayoutEffect(() => {
-    onFinger.current = (event) => fingerMeets(event.clientX, event.clientY);
-  });
-  useEffect(() => {
-    const move = (event: PointerEvent) => {
-      if (isContact(event.pointerType) || event.buttons > 0) return;
-      onFinger.current(event);
-    };
-    window.addEventListener("pointermove", move, { passive: true });
-    return () => window.removeEventListener("pointermove", move);
-  }, []);
 
   /* ── Sound ─────────────────────────────────────────────
      The context is created on the first gesture that can legitimately make
@@ -361,7 +351,12 @@ export function FanDeck() {
     return { ctx, bus };
   }
 
-  function play(gesture: Gesture) {
+  /* `spanMs` is the beat's actual length, already scaled for direction by the
+     chain. Passing it instead of the dialled TURN/SPREAD means the audio
+     clock and the CSS transition consume one shared number: a close whose
+     cards take 0.78 of the dial gets its grains scored across 0.78 of it too,
+     never across the full one. */
+  function play(gesture: Gesture, spanMs = gesture === "turn" ? TURN : SPREAD) {
     const out = speaker();
     if (!out) return;
     schedule(
@@ -370,8 +365,8 @@ export function FanDeck() {
       gesture,
       out.ctx.currentTime + 0.015,
       {
-        turn: TURN,
-        sweep: SPREAD,
+        turn: gesture === "turn" ? spanMs : TURN,
+        sweep: gesture === "turn" ? SPREAD : spanMs,
         blades: count,
         voice: sound.voice as Voicing,
         bright: sound.bright,
@@ -385,6 +380,134 @@ export function FanDeck() {
     if (audio.current) hush(audio.current.ctx, live.current);
   }
 
+  /* ── The phase chain ──────────────────────────────────
+     Opening and closing are one chain of beats, not two hand-written runs. A
+     stage says what the deck is doing; NEXT says where each stage goes when
+     heading one way or the other. Walking it one beat at a time means a
+     reversal is not a special case — it is the same walk, aimed the other
+     way, from wherever the deck already is. A deck caught mid-sweep closes
+     from that angle, never by snapping back to flat first.
+
+     Each run is a generation. Starting one bumps the token and cancels every
+     timer the previous run held, so nothing from the old run can fire late,
+     and the voices it had already put on the audio clock are hushed at the
+     same moment. That is the whole interruption story. */
+  const run = useRef({
+    token: 0,
+    timers: [] as ReturnType<typeof setTimeout>[],
+  });
+  /* Where the deck is heading overall, not just this frame. A click during a
+     run asks for the opposite of this, which is what makes two quick clicks
+     leave the second one's intent in charge. */
+  const heading = useRef<Intent>("shut");
+  /* The stage the last beat actually set. Read on a timer and on the hover
+     re-target frame rather than a render, so neither acts on an angle React
+     hasn't painted yet. */
+  const stageRef = useRef<Stage>("shut");
+  /* Always this render's beat handler. Timer callbacks hold the generation
+     they were scheduled in, so a cancelled run is one whose token no longer
+     matches. */
+  const advance = useRef<(token: number) => void>(() => {});
+
+  function cancelRun() {
+    run.current.token += 1;
+    for (const id of run.current.timers) clearTimeout(id);
+    run.current.timers.length = 0;
+  }
+
+  /* How long each beat runs, in ms, already scaled for direction. The CSS
+     transition, the chain's timer and the sound all read this one function,
+     so a close beat is shortened on all three or on none of them. Only the
+     sweep and the turn take the CLOSE ratio; the last slide home keeps its
+     own duration. */
+  function beatLength(from: Stage, to: Stage, closing: boolean): number {
+    if (to === "open") return SPREAD;
+    if (to === "flat") return (from === "open" ? SPREAD : TURN) * (closing ? CLOSE : 1);
+    if (to === "align") return from === "shut" ? ALIGN : TURN * (closing ? CLOSE : 1);
+    return 0;
+  }
+
+  /* One beat: enter the next stage, score the sound that belongs to that
+     stage, and schedule the beat after it. Called both when a run starts and
+     by the timer that ends the previous beat, so there is exactly one place
+     the deck decides what happens next. */
+  function step(intent: Intent, token: number) {
+    const from = stageRef.current;
+    const to = NEXT[intent][from];
+
+    if (!to) {
+      /* Already at the target — the chain has nowhere left to go. */
+      if (intent === "open") setSwing(SETTLE);
+      else feel.clearHot();
+      return;
+    }
+
+    const closing = intent === "shut";
+    const after = beatLength(from, to, closing);
+
+    stageRef.current = to;
+    setStage(to);
+    /* `--swing` is the duration of the rotation this beat starts, so the CSS
+       transition runs for exactly the window the timer and sound assume. */
+    if (after > 0) setSwing(after);
+
+    /* Closing finishes by entering "shut". There is no beat after it, so
+       this is where the hover highlight the cards wore while they moved is
+       dropped — the deck at rest must not keep a stale data-hot. */
+    if (to === "shut") feel.clearHot();
+
+    /* The sound belongs to the beat that is actually starting — a riffle at
+       the sweep, a lock at the turn, nothing for the slide — and is scored
+       across that beat's window, so it can be neither a beat early nor a
+       beat late. */
+    if (to === "open") play("open", SPREAD);
+    else if (to === "flat" && closing) play("close", SPREAD * CLOSE);
+    else if (to === "flat") play("turn", TURN);
+    else if (to === "align" && closing) play("turn", TURN * CLOSE);
+
+    if (after > 0) {
+      run.current.timers.push(
+        setTimeout(() => {
+          if (token === run.current.token) advance.current(token);
+        }, after)
+      );
+    }
+  }
+
+  function walk(intent: Intent, token: number) {
+    if (token !== run.current.token) return;
+    step(intent, token);
+  }
+  useEffect(() => {
+    advance.current = (token) => walk(heading.current, token);
+  });
+
+  function begin(intent: Intent) {
+    /* Before anything new is scheduled: cancel the old run's timers and hush
+       the voices it had already put on the audio clock. This is the line
+       that keeps a cancelled riffle from sounding after its cards stopped. */
+    cancelRun();
+    quiet();
+    /* A hidden tab neither schedules nor moves. The click is dropped whole —
+       not queued — so the deck stays exactly as it was left and comes back
+       with its heading, stage and label still agreeing with one another. */
+    if (document.hidden) return;
+    heading.current = intent;
+    walk(intent, run.current.token);
+  }
+
+  function toggle() {
+    /* A click during a run asks for the opposite of where the deck is
+       heading overall — so two quick clicks leave the second intent in
+       charge, with the first walk's timers gone and its voices hushed. */
+    begin(heading.current === "open" ? "shut" : "open");
+  }
+
+  function fanShut() {
+    begin("shut");
+  }
+
+  /* Star count: one fetch, cached for an hour in the tab. */
   useEffect(() => {
     let alive = true;
     void fetchStars().then((n) => {
@@ -397,67 +520,120 @@ export function FanDeck() {
 
   useEffect(() => () => feel.stop(), [feel]);
 
+  /* Development only: lets the same scheduler be rendered into an
+     OfflineAudioContext from a test harness, so the sound can be measured
+     — peak level, click detection, timing — rather than guessed at. The
+     stage and heading getters make the chain observable from the console. */
   useEffect(() => {
-    /* Development only: lets the same scheduler be rendered into an
-       OfflineAudioContext from a test harness, so the sound can be measured
-       — peak level, click detection, timing — rather than guessed at. */
-    if (DEV) {
-      (window as unknown as { __fanDeckSound?: unknown }).__fanDeckSound = {
-        schedule,
-        hush,
-      };
-    }
+    if (!DEV) return;
+    (window as unknown as { __fanDeckSound?: unknown }).__fanDeckSound = {
+      schedule,
+      hush,
+      stage: () => stageRef.current,
+      heading: () => heading.current,
+    };
     return () => {
-      if (beat.current) clearTimeout(beat.current);
+      cancelRun();
       void audio.current?.ctx.close();
     };
   }, []);
 
-  function fanOpen() {
-    if (beat.current) clearTimeout(beat.current);
-    quiet();
-    /* First the deck slides into the open position while the copy fades —
-       still shut, still upright — so the swing that follows happens where the
-       fan is going to be. */
-    setStage("align");
-    beat.current = setTimeout(() => {
-      play("turn");
-      setSwing(TURN);
-      setStage("flat");
-      beat.current = setTimeout(() => {
-        /* The riffle is scheduled here, at the moment the sweep actually
-           starts, rather than at the click with a pre-delay — React's timer
-           and the audio clock would drift apart across the turn. */
-        play("open");
-        setSwing(SPREAD);
-        setStage("open");
-        /* Once the sweep has landed, shorten the swing so the dials feel
-           direct rather than dragging a one-second transition behind them. */
-        beat.current = setTimeout(() => setSwing(SETTLE), SPREAD);
-      }, TURN);
-    }, ALIGN);
-  }
+  /* ── Hover follows the cards ──────────────────────────
+     `elementsFromPoint` reads painted transforms, so it always answers for
+     the card as drawn — the old code's problem was when it asked: only on a
+     pointer event, never while the cards swung underneath a resting pointer.
+     While a run is in flight this re-resolves the hit each frame against the
+     current transform, so data-hot follows the card as it moves. The loop
+     stops the moment the chain lands, and a close clears the highlight on its
+     final beat, so nothing is left hot once the deck is home. */
+  const rehover = useRef(0);
+  useEffect(() => {
+    const tick = () => {
+      if (NEXT[heading.current][stageRef.current] == null) {
+        rehover.current = 0;
+        return;
+      }
+      const at = feel.where();
+      if (at) {
+        const hit = cardAt(at.x, at.y);
+        if ((hit?.id ?? null) !== feel.card) feel.focus(hit);
+      }
+      rehover.current = requestAnimationFrame(tick);
+    };
+    rehover.current = requestAnimationFrame(tick);
+    return () => {
+      if (rehover.current) cancelAnimationFrame(rehover.current);
+      rehover.current = 0;
+    };
+  }, [stage, feel]);
 
-  function fanShut() {
-    if (beat.current) clearTimeout(beat.current);
-    quiet();
-    play("close");
-    const sweep = SPREAD * CLOSE;
-    const turn = TURN * CLOSE;
-    setSwing(sweep);
-    setStage("flat");
-    beat.current = setTimeout(() => {
-      setSwing(turn);
-      setStage("align");
-      /* Upright again; now slide home and let the copy back in. */
-      beat.current = setTimeout(() => setStage("shut"), turn);
-    }, sweep);
-  }
+  /* ── Background tabs ──────────────────────────────────
+     A hidden tab keeps its timers running in most browsers, and an audio
+     clock keeps running whatever the page does. Both are stopped here: the
+     run is cancelled so no beat is scheduled while hidden, and every voice
+     already on the clock is hushed so nothing plays from a tab you are not
+     looking at. Coming back does not replay anything — the deck is left
+     where it stood at the last painted beat, and the next click starts a
+     fresh run from that stage. */
+  useEffect(() => {
+    const onVisibility = () => {
+      if (!document.hidden) return;
+      cancelRun();
+      quiet();
+      feel.clearHot();
+      /* Nothing resumes on return, so the deck and its heading must agree.
+         A run cut off mid-flight leaves the deck at some half-way stage while
+         the heading still points at where it was going; that would make the
+         next click close from a deck the label calls shut. So whatever stage
+         was on screen when the tab went is taken as final: a deck left
+         mid-flight settles its heading back to "shut", a deck that had
+         finished opening keeps "open". The stage itself is not moved — the
+         deck stays exactly as you left it, only the direction the next click
+         will take is corrected. */
+      if (NEXT[heading.current][stageRef.current] != null) {
+        heading.current = stageRef.current === "open" ? "open" : "shut";
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  });
 
-  function toggle() {
-    if (stage === "shut") fanOpen();
-    else if (stage === "open") fanShut();
+  function fingerMeets(x: number, y: number, hovering = true) {
+    /* Remembered before the early return: even when the hit hasn't changed,
+       the point has, and the frame loop needs the current one. A finger is
+       not a hover, though — it has no resting position, so it never seeds the
+       point the loop re-targets from. */
+    if (hovering) feel.remember(x, y);
+    const hit = cardAt(x, y);
+    const next = hit?.id ?? null;
+    if (next === feel.card) return;
+    feel.focus(hit);
+    if (next == null) return;
+    /* Shut, the stack splays under the cursor and each edge is a card.
+       Open, the same crossing is the slide across the fan. */
+    if (open || stage === "shut") play("hover");
+    feel.meet("touch");
   }
+  useLayoutEffect(() => {
+    onFinger.current = (event) => fingerMeets(event.clientX, event.clientY);
+  });
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      if (isContact(event.pointerType) || event.buttons > 0) return;
+      onFinger.current(event);
+    };
+    /* Off the page, there is no point to re-target; drop the remembered one
+       so the frame loop doesn't keep highlighting the last card it saw. */
+    const out = (event: PointerEvent) => {
+      if (event.relatedTarget == null) feel.forget();
+    };
+    window.addEventListener("pointermove", move, { passive: true });
+    window.addEventListener("pointerout", out, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerout", out);
+    };
+  }, [feel]);
 
   const blades = useMemo(() => {
     /* Flat and open share a base angle — the first blade's — so the spread grows
@@ -653,7 +829,7 @@ export function FanDeck() {
             const thumb = input instanceof HTMLInputElement ? input : null;
             if (isContact(event.pointerType)) {
               feel.down(thumb, event.clientX, event.clientY);
-              fingerMeets(event.clientX, event.clientY);
+              fingerMeets(event.clientX, event.clientY, false);
               return;
             }
             /* Trackpad: Safari starts tracking on this press, and only then.
