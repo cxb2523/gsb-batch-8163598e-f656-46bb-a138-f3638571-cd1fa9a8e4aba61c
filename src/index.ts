@@ -121,9 +121,12 @@ export function createSeslen<TName extends string = string>(
   let analyser: AnalyserTap | null = null
   let stopReducedMotion: (() => void) | null = null
 
+  // `volume` is always the user's last explicitly set volume. Mute (manual
+  // or reduced-motion) is an independent flag layered on top in
+  // `applyVolume()` — it never overwrites `volume`, so `unmute()` restores
+  // the last user setting no matter how the mute states stacked.
   let volume = clamp01(persisted.volume ?? opts.volume ?? 1)
   let mutedFlag = persisted.muted ?? false
-  let preMuteVolume = volume
   let reducedMotionMute = false
   let lastState: "idle" | "running" | "suspended" | "closed" = "idle"
 
@@ -405,14 +408,12 @@ export function createSeslen<TName extends string = string>(
 
     setVolume(value) {
       volume = clamp01(value)
-      if (!mutedFlag) preMuteVolume = volume
       applyVolume()
       persistNow()
     },
 
     mute() {
       if (mutedFlag) return
-      preMuteVolume = volume
       mutedFlag = true
       applyVolume()
       persistNow()
@@ -421,7 +422,6 @@ export function createSeslen<TName extends string = string>(
     unmute() {
       if (!mutedFlag) return
       mutedFlag = false
-      volume = preMuteVolume
       applyVolume()
       persistNow()
     },

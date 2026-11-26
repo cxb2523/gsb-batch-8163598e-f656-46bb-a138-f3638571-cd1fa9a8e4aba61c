@@ -164,8 +164,12 @@ export interface BusHandle {
   mute(): void
   unmute(): void
   isMuted(): boolean
-  /** Temporarily attenuate this bus to `target` for `holdSeconds`, ramping in
-   *  `attackSeconds` and back to original in `releaseSeconds`. */
+  /** Temporarily attenuate this bus to `target` (a coefficient of the base
+   *  volume: `0.2` ⇒ 20% of the current volume) for `holdSeconds`, ramping in
+   *  `attackSeconds` and back to full in `releaseSeconds`. The duck envelope
+   *  runs on a separate gain stage, so `setVolume`/`mute`/`unmute` during a
+   *  duck neither interrupt it nor get overwritten by it — the effective gain
+   *  is always `base volume × duck coefficient`. */
   duck(opts: {
     target: number
     holdSeconds: number

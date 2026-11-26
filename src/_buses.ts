@@ -2,8 +2,16 @@
 import type { BusHandle } from "./_types.ts"
 
 /**
- * Tiny bus mixer. Each bus is a `GainNode` connected to `master`. Sounds
- * routed through `{ bus: name }` connect to the bus's gain instead of master.
+ * Tiny bus mixer. Each bus is a two-stage gain chain:
+ *
+ *   sound → baseGain (user volume / mute) → duckGain (duck envelope) → master
+ *
+ * The bus's *effective* gain is always `base × duckCoefficient`. Manual
+ * `setVolume` / `mute` / `unmute` only ever touch `baseGain`; `duck()` only
+ * ever schedules ramps on `duckGain`. The two layers therefore never clobber
+ * each other: changing the volume mid-duck leaves the envelope running, and
+ * when the envelope releases (back to coefficient 1) the bus settles on
+ * whatever the base gain is at that moment — 0 when muted.
  *
  * Buses are lazily created on first `get(name)` so the wiring cost is zero
  * for callers that never use them.
@@ -17,28 +25,39 @@ export function createBuses(
   resolve(name: string | undefined): GainNode
   /** Get or create a bus handle. */
   get(name: string): BusHandle
-  /** Underlying nodes (for testing). */
+  /** Underlying base-gain nodes (for testing). */
   nodes(): Map<string, GainNode>
 } {
+  /** A scheduled duck envelope: piecewise-linear control points over the
+   *  duck coefficient (1 = no attenuation), plus the time it fully releases. */
+  type Envelope = {
+    points: { t: number; v: number }[]
+    end: number
+  }
   type Bus = {
     name: string
-    node: GainNode
+    base: GainNode
+    duck: GainNode
+    /** Last user-set volume — mute never overwrites it. */
     volume: number
     muted: boolean
-    preMute: number
+    env: Envelope | null
   }
   const buses = new Map<string, Bus>()
 
   function ensure(name: string): Bus {
     let b = buses.get(name)
     if (b) return b
-    const node = ctx.createGain()
+    const base = ctx.createGain()
+    const duck = ctx.createGain()
     const init = initial?.[name]
     const vol = clamp01(init?.volume ?? 1)
     const muted = init?.muted ?? false
-    node.gain.value = muted ? 0 : vol
-    node.connect(master)
-    b = { name, node, volume: vol, muted, preMute: vol }
+    base.gain.value = muted ? 0 : vol
+    duck.gain.value = 1
+    base.connect(duck)
+    duck.connect(master)
+    b = { name, base, duck, volume: vol, muted, env: null }
     buses.set(name, b)
     return b
   }
@@ -46,6 +65,30 @@ export function createBuses(
   // Pre-create initial buses so they exist even if never referenced.
   if (initial) {
     for (const name of Object.keys(initial)) ensure(name)
+  }
+
+  /** Duck coefficient in effect at `now` — evaluates the active envelope so
+   *  a re-duck starts from the current attenuation instead of jumping. */
+  function currentCoefficient(b: Bus, now: number): number {
+    const env = b.env
+    if (!env) return 1
+    if (now >= env.end) {
+      b.env = null
+      return 1
+    }
+    const pts = env.points
+    const first = pts[0] as { t: number; v: number }
+    if (now <= first.t) return first.v
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1] as { t: number; v: number }
+      const c = pts[i] as { t: number; v: number }
+      if (now <= c.t) {
+        const span = c.t - a.t
+        if (span <= 0) return c.v
+        return a.v + ((c.v - a.v) * (now - a.t)) / span
+      }
+    }
+    return (pts[pts.length - 1] as { t: number; v: number }).v
   }
 
   function handle(b: Bus): BusHandle {
@@ -57,38 +100,50 @@ export function createBuses(
         return b.volume
       },
       setVolume(value) {
+        // Base layer only — a running duck envelope is left untouched and
+        // simply scales the new base gain.
         b.volume = clamp01(value)
-        if (!b.muted) b.preMute = b.volume
-        b.node.gain.value = b.muted ? 0 : b.volume
+        b.base.gain.value = b.muted ? 0 : b.volume
       },
       mute() {
         if (b.muted) return
-        b.preMute = b.volume
         b.muted = true
-        b.node.gain.value = 0
+        b.base.gain.value = 0
       },
       unmute() {
         if (!b.muted) return
         b.muted = false
-        b.volume = b.preMute
-        b.node.gain.value = b.volume
+        // Restore the last user-set volume, not a stale pre-mute snapshot.
+        b.base.gain.value = b.volume
       },
       isMuted() {
         return b.muted
       },
       duck({ target, holdSeconds, attackSeconds = 0.05, releaseSeconds = 0.2 }) {
         const now = ctx.currentTime
-        const start = b.muted ? 0 : b.volume
+        const attack = Math.max(0, attackSeconds)
+        const hold = Math.max(0, holdSeconds)
+        const release = Math.max(0, releaseSeconds)
+        // Re-ducking mid-envelope starts from the *current* coefficient so
+        // the new ramp is continuous instead of jumping.
+        const start = currentCoefficient(b, now)
         const goal = clamp01(target)
-        const param = b.node.gain
+        const end = now + attack + hold + release
+        b.env = {
+          points: [
+            { t: now, v: start },
+            { t: now + attack, v: goal },
+            { t: now + attack + hold, v: goal },
+            { t: end, v: 1 },
+          ],
+          end,
+        }
+        const param = b.duck.gain
         param.cancelScheduledValues(now)
         param.setValueAtTime(start, now)
-        param.linearRampToValueAtTime(goal, now + Math.max(0, attackSeconds))
-        param.setValueAtTime(goal, now + attackSeconds + Math.max(0, holdSeconds))
-        param.linearRampToValueAtTime(
-          start,
-          now + attackSeconds + holdSeconds + Math.max(0, releaseSeconds),
-        )
+        param.linearRampToValueAtTime(goal, now + attack)
+        param.setValueAtTime(goal, now + attack + hold)
+        param.linearRampToValueAtTime(1, end)
       },
     }
   }
@@ -96,14 +151,14 @@ export function createBuses(
   return {
     resolve(name) {
       if (!name) return master
-      return ensure(name).node
+      return ensure(name).base
     },
     get(name) {
       return handle(ensure(name))
     },
     nodes() {
       const map = new Map<string, GainNode>()
-      for (const [k, v] of buses) map.set(k, v.node)
+      for (const [k, v] of buses) map.set(k, v.base)
       return map
     },
   }
