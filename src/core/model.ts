@@ -86,9 +86,35 @@ export interface RotationAnimation {
     pivot: Vec3;
     keys: { time: number; degrees: Vec3; easing?: Easing }[];
 }
+/** Why a baked camera move can no longer be played as authored. */
+export type CameraMoveInvalidReason =
+    | 'subject-deleted'
+    | 'subject-hidden'
+    | 'foreground-deleted'
+    | 'foreground-hidden';
+
+/**
+ * Remembers the preset inputs behind a baked camera path so switching the follow subject can
+ * re-bake through `cameraPresetPath` with the original timing and focal length. The baked key
+ * frames stay the single playback/seek/export result; this is only the regeneration recipe.
+ */
+export interface CameraMoveBinding {
+    preset: string;
+    subjectId?: string;
+    foregroundId?: string;
+    from: number;
+    duration: number;
+    focal: number;
+    /** Camera position the bake started from; re-bakes keep it to avoid reframing jumps. */
+    start: Vec3;
+    /** Set when a referenced entity was deleted/hidden and the stale keys were detached. */
+    invalidReason?: CameraMoveInvalidReason;
+}
 export interface CameraConfig {
     targetPath?: CameraLookPath | null;
     focalKeys?: NumberKey[];
+    /** Recipe of the preset move currently baked into `entity.path` / `targetPath`. */
+    moveBinding?: CameraMoveBinding | null;
     aim: 'target' | 'manual';
     focal: number;
     target: Vec3;

@@ -24,6 +24,7 @@ const cameraFields: Record<keyof CameraConfig, FieldDoc> = {
     targetId: { type: 'string', note: "'' 表示固定空间目标，否则为看向的实体 ID" },
     targetHeight: { type: 'number', note: '米' },
     targetPath: { type: 'CameraLookPath | null', note: '视线关键帧路径' },
+    moveBinding: { type: 'CameraMoveBinding | null | undefined', note: '只读：已烘焙运镜预设的重生成配方，由 applyCameraPreset/rebindCameraMove 维护' },
     mode: { type: "'free' | 'follow' | 'pov'" },
     offset: { type: 'Vec3', note: 'follow/pov 相对目标的偏移' },
     inheritRotation: { type: 'boolean' },

@@ -3,6 +3,11 @@ import { numberAt } from '@/core/animation/channels.ts';
 import * as THREE from 'three';
 import { findAsset } from '@/core/asset-catalog.ts';
 import { CAMERA_PRESETS, cameraPresetPath, type CameraPresetId } from '@/core/cinematography/camera-presets.ts';
+import {
+    presetUsesForeground,
+    presetUsesSubject,
+    regenerateCameraMove,
+} from '@/core/cinematography/camera-move-binding.ts';
 import { compileCampath } from '@/core/cinematography/campath.ts';
 import { libraryPreferences } from '@/core/assets/library-preferences.ts';
 import { workingElevation } from '@/core/building/floors.ts';
@@ -739,12 +744,94 @@ export class SceneCommands {
             camera.camera!.focal = focal;
             if (motion.focalKeys) camera.camera!.focalKeys = motion.focalKeys;
             else delete camera.camera!.focalKeys;
+            // Remember the recipe so switching the follow subject re-bakes with identical timing.
+            camera.camera!.moveBinding = {
+                preset: id,
+                ...(subject ? { subjectId: subject.id } : {}),
+                ...(foreground ? { foregroundId: foreground.id } : {}),
+                from,
+                duration,
+                focal,
+                start: [...start],
+            };
             this.host.project.duration = Math.max(this.host.project.duration, from + duration);
         }, false);
         if (applied) {
             engine.previewId = camera.id;
             this.host.patch({ preview: camera.id, inspectorTab: 'camera' });
         }
+        return applied;
+    }
+
+    /**
+     * Re-bake the camera's existing preset move after its follow subject or foreground occluder
+     * changed. Timing, duration, focal length and start pose come from the stored binding. Runs as
+     * one history step, so a subject switch is a single undoable replacement.
+     */
+    rebindCameraMove(
+        cameraId: string,
+        options: { subjectId?: string | null; foregroundId?: string | null } = {},
+    ): boolean {
+        const project = this.host.project;
+        const camera = project.entities.find((entity) => entity.id === cameraId);
+        if (!camera?.camera || camera.kind !== 'camera') {
+            notifyError(`未找到可用的机位：${cameraId}`);
+            return false;
+        }
+        if (camera.locked) {
+            notifyError(`「${camera.name}」已锁定，解锁后可更新运镜`);
+            return false;
+        }
+        const binding = camera.camera.moveBinding;
+        if (!binding?.preset) {
+            notifyError('当前机位没有随主体联动的运镜预设，请直接应用一个预设');
+            return false;
+        }
+        const subjectId = options.subjectId === undefined ? binding.subjectId : (options.subjectId ?? undefined);
+        const foregroundId =
+            options.foregroundId === undefined ? binding.foregroundId : (options.foregroundId ?? undefined);
+        const subject = subjectId
+            ? project.entities.find((entity) => entity.id === subjectId && !entity.camera)
+            : undefined;
+        if (presetUsesSubject(binding.preset) && !subject) {
+            notifyError('请先选择跟拍主体');
+            return false;
+        }
+        const foreground = foregroundId
+            ? project.entities.find(
+                  (entity) =>
+                      entity.id === foregroundId &&
+                      !entity.camera &&
+                      entity.visible &&
+                      entity.id !== subject?.id,
+              )
+            : undefined;
+        if (presetUsesForeground(binding.preset) && !foreground) {
+            notifyError('请先选择前景遮挡物');
+            return false;
+        }
+        // Foreground presets need real world bounds; resolve before opening the transaction.
+        let foregroundContext: { center: Vec3; radius: number } | undefined;
+        if (foreground) {
+            const bounds = this.host.engine?.worldBounds(foreground.id) ?? null;
+            if (presetUsesForeground(binding.preset) && !bounds) {
+                notifyError('无法读取遮挡物的空间范围');
+                return false;
+            }
+            if (bounds)
+                foregroundContext = {
+                    center: bounds.getCenter(new THREE.Vector3()).toArray() as Vec3,
+                    radius: bounds.getSize(new THREE.Vector3()).length() / 2,
+                };
+        }
+        const applied = this.host.change(() => {
+            regenerateCameraMove(project, camera, {
+                ...(options.subjectId !== undefined ? { subjectId: options.subjectId } : {}),
+                ...(options.foregroundId !== undefined ? { foregroundId: options.foregroundId } : {}),
+                ...(foregroundContext ? { foreground: foregroundContext } : {}),
+            });
+        }, false);
+        if (applied) this.host.patch({ preview: camera.id });
         return applied;
     }
 

@@ -1115,6 +1115,11 @@ export class EditorSession {
         return this.scene.applyCameraPreset(id, cameraId, options);
     }
 
+    /** Re-bake the current camera move after switching its follow subject / occluder. */
+    rebindCameraMove(cameraId: string, options: { subjectId?: string | null; foregroundId?: string | null } = {}): boolean {
+        return this.scene.rebindCameraMove(cameraId, options);
+    }
+
     toggleGrid(): void {
         this.scene.toggleGrid();
     }

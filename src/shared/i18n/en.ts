@@ -1502,6 +1502,20 @@ Object.assign(english, {
     '当前机位已锁定，解锁后可应用运镜': 'Unlock this camera to apply a movement',
     '从当前时间开始，时长 4 秒': 'Starts at the current time and lasts 4 seconds',
     '应用预设会替换此机位的现有运镜': 'Applying a preset replaces this camera’s current movement',
+    '更换跟拍主体会按新主体重新生成路径，可撤销恢复':
+        'Changing the follow subject rebuilds the path around the new subject; undo restores it',
+    '跟拍主体已删除：旧运镜路径已停用，请重新选择主体':
+        'Follow subject deleted: the previous camera path is stopped. Choose a new subject',
+    '跟拍主体已隐藏：旧运镜路径已停用，恢复显示或重选主体':
+        'Follow subject hidden: the previous camera path is stopped. Show it again or choose another subject',
+    '前景遮挡物已删除：旧运镜路径已停用，请重新选择遮挡物':
+        'Foreground occluder deleted: the previous camera path is stopped. Choose another occluder',
+    '前景遮挡物已隐藏：旧运镜路径已停用，恢复显示或重选遮挡物':
+        'Foreground occluder hidden: the previous camera path is stopped. Show it again or choose another occluder',
+    '运镜引用的对象已失效，旧路径已停用':
+        'An object referenced by this camera move is unavailable; the old path is stopped',
+    重新生成: 'Regenerate',
+    '按当前主体重新生成运镜': 'Regenerate movement for the current subject',
     '拖动鼠标观察 · 点击布景启用键盘': 'Drag to orbit · Click scene for keyboard controls',
     转向: 'Turn',
     退出分屏: 'Exit split view',

@@ -4,6 +4,10 @@ import { freezeCamera } from '@/core/editor/camera-editing.ts';
 import { recordPositionKey } from '@/core/editor/position-keys.ts';
 import { rotationDegreesAt } from '@/core/animation/entity-rotation.ts';
 import { removeCameraVisibilityReference } from '@/core/scenes/camera-visibility.ts';
+import {
+    cameraMoveReferencesEntity,
+    invalidateCameraMovesForEntity,
+} from '@/core/cinematography/camera-move-binding.ts';
 import { clone, uid, type Entity, type Vec3 } from '@/core/model.ts';
 import { entityPosition, shiftPath } from '@/core/timeline.ts';
 import type { LightConfig } from '@/core/lighting/model.ts';
@@ -134,6 +138,13 @@ export class EntityCommands {
                 }
             }
             removeCameraVisibilityReference(project, target.id);
+            // Hold the last evaluated frame of unlocked cameras whose baked preset move follows
+            // this entity before their stale keys are detached below.
+            for (const camera of project.entities) {
+                if (camera.kind !== 'camera' || camera.locked || !camera.camera?.moveBinding) continue;
+                if (cameraMoveReferencesEntity(camera, target.id) && this.host.engine)
+                    freezeCamera(this.host.engine, camera);
+            }
             project.entities = project.entities.filter((entity) => entity.id !== target.id);
             if (cutsUseTarget) {
                 for (const cut of project.cuts) if (cut.cameraId === target.id) cut.cameraId = replacement!;
@@ -143,12 +154,16 @@ export class EntityCommands {
                     if (this.host.engine) freezeCamera(this.host.engine, entity);
                     entity.camera.targetId = '';
                     entity.camera.mode = 'free';
+                    // The baked look keys sampled the removed target; drop them with the id.
+                    entity.camera.targetPath = null;
                 }
                 if (entity.faceTarget === target.id) {
                     entity.faceTarget = '';
                     entity.face = 'fixed';
                 }
             }
+            // Marks the binding invalid, clears path/targetPath and records the visible warning.
+            invalidateCameraMovesForEntity(project, target.id, 'deleted');
             const next =
                 project.entities.find((entity) => entity.kind === 'actor')?.id ?? project.entities[0]?.id ?? '';
             this.host.patch({ selected: next, preview: 'program' });
@@ -187,8 +202,19 @@ export class EntityCommands {
         if (!e) return;
         if (e.locked && key === 'visible') return;
         this.host.change(() => {
-            if (key === 'visible') e.visible = value;
-            else e.locked = value;
+            if (key === 'visible') {
+                e.visible = value;
+                if (!value) {
+                    // A hidden subject/occluder must not keep driving baked camera keys. Freeze
+                    // unlocked cameras at their evaluated frame, then detach the stale bake.
+                    for (const camera of this.host.project.entities) {
+                        if (camera.kind !== 'camera' || camera.locked || !camera.camera?.moveBinding) continue;
+                        if (cameraMoveReferencesEntity(camera, e.id) && this.host.engine)
+                            freezeCamera(this.host.engine, camera);
+                    }
+                    invalidateCameraMovesForEntity(this.host.project, e.id, 'hidden');
+                }
+            } else e.locked = value;
         });
     }
 

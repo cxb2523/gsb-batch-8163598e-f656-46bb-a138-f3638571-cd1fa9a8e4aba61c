@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { english } from '../src/shared/i18n/en.ts';
 import { panelEnglish } from '../src/shared/i18n/en-panels.ts';
 import { assetEnglish } from '../src/shared/i18n/en-assets.ts';
@@ -15,10 +16,6 @@ import { assetEnglish } from '../src/shared/i18n/en-assets.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DICTIONARY: Record<string, string> = { ...english, ...panelEnglish, ...assetEnglish };
-
-function fileURLToPath(url: URL): string {
-    return decodeURIComponent(url.pathname);
-}
 
 function componentFiles(directory: string): string[] {
     const files: string[] = [];

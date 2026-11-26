@@ -2,6 +2,22 @@ import type { Engine } from '../engine.ts';
 import type { Entity, Vec3 } from '../model.ts';
 import { freezeEndingCamera } from '../cinematography/continuity.ts';
 
+export {
+    bakeCameraMove,
+    cameraMoveIssue,
+    cameraMoveReferencesEntity,
+    invalidateCameraMove,
+    invalidateCameraMovesForEntity,
+    isBoundCameraMove,
+    moveSubjectAt,
+    presetUsesForeground,
+    presetUsesSubject,
+    rebindCameraMove,
+    regenerateCameraMove,
+    resolveMovePanelSelection,
+    switchCameraSubject,
+} from '../cinematography/camera-move-binding.ts';
+
 /** Freeze the evaluated camera pose before removing its target or binding. */
 export function freezeCamera(engine: Engine, entity: Entity) {
     if (!entity.camera) return;

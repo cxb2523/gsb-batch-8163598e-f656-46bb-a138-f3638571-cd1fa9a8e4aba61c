@@ -3,6 +3,7 @@ import { assertEasing } from '@/core/animation/channels.ts';
 import { alignSurface, placeOnSurface } from '@/core/editor/directing-geometry.ts';
 import { findAsset } from '@/core/asset-catalog.ts';
 import { removeCameraVisibilityReference } from '@/core/scenes/camera-visibility.ts';
+import { invalidateCameraMovesForEntity } from '@/core/cinematography/camera-move-binding.ts';
 import {
     ACTIONS, ASPECTS, BUILDS, COLORS, FRAME_RATES, GENDERS, clip, entity,
     type CameraConfig, type Clip, type Entity, type Project, type Vec3,
@@ -273,6 +274,7 @@ export function applyBatchEdits(project: Project, edits: BatchEdit[]): BatchRece
                 if (patch.visible !== undefined) {
                     if (typeof patch.visible !== 'boolean') throw Error('visible 必须是布尔值');
                     e.visible = patch.visible;
+                    if (!patch.visible) invalidateCameraMovesForEntity(project, e.id, 'hidden');
                 }
                 if (patch.height !== undefined) {
                     if (typeof patch.height !== 'number' || !Number.isFinite(patch.height)) throw Error('height 必须是有限数值');
@@ -585,6 +587,7 @@ export function applyBatchEdits(project: Project, edits: BatchEdit[]): BatchRece
                     if (item.camera?.targetId === e.id) {
                         item.camera.targetId = '';
                         item.camera.mode = 'free';
+                        item.camera.targetPath = null;
                     }
                     if (item.faceTarget === e.id) {
                         item.faceTarget = '';
@@ -592,6 +595,8 @@ export function applyBatchEdits(project: Project, edits: BatchEdit[]): BatchRece
                     }
                     if (item.handBinding?.actorId === e.id) item.handBinding = null;
                 }
+                // Detach baked preset moves that sampled the deleted entity (unlocked cameras).
+                invalidateCameraMovesForEntity(project, e.id, 'deleted');
                 if (cutsUseTarget) for (const cut of project.cuts) if (cut.cameraId === e.id) cut.cameraId = replacement!;
                 project.entities = project.entities.filter(item => item.id !== e.id);
                 receipt.entityId = e.id;
