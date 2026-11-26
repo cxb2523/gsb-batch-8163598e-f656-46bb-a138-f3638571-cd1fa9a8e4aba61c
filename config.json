@@ -1,7 +1,32 @@
 {
-    "title": "",
-    "media": [],
-    "cover": "",
+    "title": "Scritch Lifecycle Samples",
+    "media": [
+        {
+            "file": "preview-track.wav",
+            "title": "Preview Demo",
+            "info": "A sample preview track with a 3 second highlighted range (0:02-0:05).",
+            "previewStart": "0:02",
+            "previewEnd": "0:05",
+            "originalDuration": "0:08",
+            "feature": true
+        },
+        {
+            "file": "normal-track.wav",
+            "title": "Plain Song"
+        },
+        {
+            "file": "loop-track.wav",
+            "title": "Loop Number",
+            "loopCount": 2
+        },
+        {
+            "file": "video-track.webm",
+            "title": "Video Clip",
+            "type": "video",
+            "cover": "cover.png"
+        }
+    ],
+    "cover": "cover.png",
     "theme": {
         "coverSize": 480,
         "layoutStyle": "vertical",
@@ -9,5 +34,5 @@
         "contentWidth": 400,
         "nativePlayer": false
     },
-    "description": ""
+    "description": "Local samples used to verify rapid track switching, Blob URL lifecycle, preview ranges and audio/video mutual exclusion."
 }

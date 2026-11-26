@@ -847,6 +847,17 @@
     let currentEntry = {};
     let media = [];
 
+    // --- track load lifecycle ---------------------------------------------
+    // Monotonic token incremented on every *different* loadEntry() switch.
+    // Async source assignments capture the token of the activation they belong
+    // to and are discarded once a newer loadEntry() has superseded them, so a
+    // late fetch()/metadata result can never point the media elements back at
+    // an old track.
+    let loadGeneration = 0;
+    // Blob object URL currently wired to playerEl / mediaVideoEl for the
+    // active generation (equals currentEntry.file while it is a blob: URL).
+    let activePlayUrl = null;
+
     let scrubPosition = 0;
 
     let volumeIcons = ['icon-volume-none', 'icon-volume-low', 'icon-volume-high'];
@@ -992,15 +1003,10 @@
 
         document.title = titleEl.textContent;
 
-        volume = parseFloat(localStorageGet('volume'));
-        muted = parseInt(localStorageGet('muted'));
-        if(volume && typeof volume === 'number'){
-            setVolume(volume, muted);
-        } else {
-            volume = 0.8;
-            muted = false;
-            localStorageSet('volume', volume);
-        }
+        let storedVolume = parseFloat(localStorageGet('volume'));
+        volume = (typeof storedVolume === 'number' && isFinite(storedVolume)) ? storedVolume : 0.8;
+        muted = parseInt(localStorageGet('muted'), 10) === 1;
+        setVolume(volume, muted);
     }
     
 
@@ -1099,6 +1105,7 @@
                 if(!entry.previewEnd){
                     entry.needsPreviewEnd = true;
                 }
+                entry.hasOriginalDuration = !!(entry.originalDuration && fromHMS(entry.originalDuration));
                 entry.originalDuration = (entry.originalDuration && fromHMS(entry.originalDuration)) || 1;
                 entry.previewStart = (entry.previewStart && fromHMS(entry.previewStart)) || 0;
                 entry.previewEnd = (entry.previewEnd && fromHMS(entry.previewEnd)) || entry.originalDuration;
@@ -1113,12 +1120,16 @@
                         e.target.addEventListener('timeupdate', function(event){
                             event.target.currentTime = 0;
                             updateDuration(entry, event.target.duration);
+                            releaseBackgroundPreloadUrl(entry);
                         }, {once: true});
                     } else {
                         updateDuration(entry, loaderEl.duration);
                     }
                 });
                 loaderEl.addEventListener('error', e => {
+                    if(entry.loaderDiscarded){
+                        return; // intentional release in releaseBackgroundPreloadUrl
+                    }
                     entry.error = true;
                     entry.errorMessage = e.target.error;
                     removeLoading(entry, true);
@@ -1128,24 +1139,165 @@
                 loaderEl.addEventListener('canplay', e => {
                     removeLoading(entry, true);
 
-                    if(entry.feature && entry.autoplay){
+                    if(entry.feature && entry.autoplay && entry === currentEntry){
                         playerEl.play();
                     }
+                    // A background preload has served its purpose (duration is
+                    // known); its blob URL can be released. The current entry
+                    // is kept alive by releaseBackgroundPreloadUrl's guard.
+                    releaseBackgroundPreloadUrl(entry);
                 });
                 loaderEl.volume = 0;
-                fetch(entry.file).then(r => r.blob()).then(blob => {
-                    entry.file = URL.createObjectURL(blob);
-                    loaderEl.src = entry.file;
-                    if(entry === currentEntry){
-                        playerEl.src = entry.file;
-                    }
-                });
+                entry.blob = null;
+                entry.rawFile = entry.file;
+                entry.fileRevoked = false;
                 entry.started = false;
                 entry.loading = true;
                 entry.loaderEl = loaderEl;
+                startEntryPreload(entry, buttonEl);
             }
         });
         loadEntry(media[mod(featureIndex, media.length)]);
+    }
+
+    // Fetches the entry once, caches the Blob and turns entry.file into the
+    // object URL shared by the detached metadata loader and, when selected,
+    // playerEl/mediaVideoEl (same convention as the original preloader).
+    // Switching tracks never cancels this shared preload (every row still
+    // shows its duration); activation-specific source assignment is
+    // invalidated with loadGeneration instead.
+    function startEntryPreload(entry, buttonEl){
+        entry.rawFile = entry.rawFile || entry.file;
+        entry.preloadPromise = fetch(entry.rawFile)
+            .then(r => r.blob())
+            .then(blob => {
+                entry.blob = blob;
+                // Reuse a live URL if resolveEntrySource minted one first
+                // (e.g. re-select after a previous revoke), otherwise match
+                // the original behaviour of replacing entry.file in place.
+                if(!isBlobUrl(entry.file) || entry.fileRevoked){
+                    entry.file = URL.createObjectURL(blob);
+                }
+                entry.fileRevoked = false;
+                if(entry.loaderEl){
+                    entry.loaderEl.src = entry.file;
+                }
+                return blob;
+            })
+            .catch(err => {
+                entry.error = true;
+                entry.errorMessage = err;
+                removeLoading(entry, true);
+                if(buttonEl){
+                    buttonEl.classList.add('error', 'icon-warning');
+                    buttonEl.setAttribute('title', 'error loading file');
+                }
+                return null;
+            });
+    }
+
+    function isBlobUrl(url){
+        return typeof url === 'string' && url.indexOf('blob:') === 0;
+    }
+
+    // Returns a usable source for the entry synchronously. Keeps entry.file
+    // as the single source of truth: a live blob URL when the Blob is cached,
+    // otherwise the original network URL. A blob URL revoked after a previous
+    // switch-away is re-minted from the cached Blob.
+    function resolveEntrySource(entry){
+        if(entry.blob && (!isBlobUrl(entry.file) || entry.fileRevoked)){
+            entry.file = URL.createObjectURL(entry.blob);
+            entry.fileRevoked = false;
+        }
+        if(isBlobUrl(entry.file)){
+            activePlayUrl = entry.file;
+        }
+        return entry.file;
+    }
+
+    function assignEntrySources(entry, source){
+        playerEl.src = source;
+        if(entry.type === 'video'){
+            mediaVideoEl.src = source;
+        }
+    }
+
+    // Wires the best available source now and upgrades to a Blob URL when the
+    // shared preload finishes. Late completions are thrown away unless `token`
+    // is still the active generation and `entry` is still selected, so a late
+    // fetch can never point the media elements back at a stale track.
+    function mountEntrySource(entry, token){
+        assignEntrySources(entry, resolveEntrySource(entry));
+        if(entry.blob || !entry.preloadPromise){
+            return;
+        }
+        entry.preloadPromise.then(blob => {
+            if(token !== loadGeneration || entry !== currentEntry){
+                // Superseded activation: never touch the media elements.
+                return;
+            }
+            if(!blob){
+                return;
+            }
+            let source = resolveEntrySource(entry);
+            if(isBlobUrl(source)){
+                activePlayUrl = source;
+            }
+            assignEntrySources(entry, source);
+        });
+    }
+
+    // Releases the blob URL previously used to play `entry`. Callers must
+    // have already detached it from playerEl/mediaVideoEl (new source assigned
+    // or the element cleared); that is asserted again here so the currently
+    // selected/playing URL can never be revoked. Afterwards entry.file is
+    // restored to the original network URL (always usable, never dangling).
+    function revokeEntryPlayUrl(entry){
+        if(!entry){
+            return;
+        }
+        const url = (isBlobUrl(entry.file) && !entry.fileRevoked) ? entry.file : null;
+        if(!url){
+            return;
+        }
+        const isCurrentUrl = entry === currentEntry || url === activePlayUrl;
+        if(isCurrentUrl || url === playerEl.src || url === mediaVideoEl.src){
+            return;
+        }
+        entry.fileRevoked = true;
+        if(activePlayUrl === url){
+            activePlayUrl = null;
+        }
+        try {
+            URL.revokeObjectURL(url);
+        } catch(e){
+            // already revoked / invalid
+        }
+        if(entry.rawFile){
+            entry.file = entry.rawFile;
+        }
+    }
+
+    // Once a non-selected entry has finished preloading/metadata probing, its
+    // shared blob URL is no longer needed by the visible player; release it so
+    // rapid switching cannot leak one URL per visited track. Re-selecting the
+    // entry transparently re-mints a URL from entry.blob. The current entry
+    // and entries still probing duration are left untouched.
+    function releaseBackgroundPreloadUrl(entry){
+        if(!entry || entry === currentEntry || entry.needsDuration){
+            return;
+        }
+        // The detached metadata loader is finished with the URL; clear its
+        // reference first so no media element keeps pointing at a URL we revoke.
+        entry.loaderDiscarded = true;
+        if(entry.loaderEl){
+            try {
+                entry.loaderEl.removeAttribute('src');
+                entry.loaderEl.load();
+            } catch(e){}
+            entry.loaderEl = null;
+        }
+        revokeEntryPlayUrl(entry);
     }
 
     function updateDuration(entry, duration){
@@ -1251,22 +1403,31 @@
         }
     });
     playerEl.addEventListener('volumechange', e => {
-        if(config.theme.nativePlayer){
+        let native = config.theme.nativePlayer;
+        let videoNative = !!(native && currentEntry && currentEntry.type === 'video');
+        // Ignore volumechange events caused by our own routing/preview fades.
+        // In native video mode playerEl is deliberately forced to volume 0 and
+        // hidden, so it never persists from this handler.
+        if(native && !videoNative && !isEchoVolumeEvent(e)){
             volume = e.target.volume;
+            muted = e.target.muted;
             localStorageSet('volume', volume);
+            localStorageSet('muted', muted ? 1 : 0);
+            updateVolumeUI(muted ? 0 : volume);
+            volumeEcho.set(e.target, e.target.volume);
         }
-        if(currentEntry.type === 'video'){
-            if(config.theme.nativePlayer){
-                mediaVideoEl.volume = e.target.volume;
-            } else {
-                mediaVideoEl.volume = 0;
-            }
+        if(currentEntry && currentEntry.type === 'video' && !native){
+            setMediaVolume(mediaVideoEl, 0);
         }
     });
     mediaVideoEl.addEventListener('volumechange', e => {
-        if(currentEntry.type === 'video' && config.theme.nativePlayer){
+        if(currentEntry && currentEntry.type === 'video' && config.theme.nativePlayer && !isEchoVolumeEvent(e)){
             volume = e.target.volume;
+            muted = e.target.muted;
             localStorageSet('volume', volume);
+            localStorageSet('muted', muted ? 1 : 0);
+            updateVolumeUI(muted ? 0 : volume);
+            volumeEcho.set(e.target, e.target.volume);
         }
     });
     playerEl.addEventListener('timeupdate', e => {
@@ -1356,22 +1517,70 @@
     
     function setVolume(vol, mute=false){
         volume = vol;
+        muted = !!mute;
         localStorageSet('volume', volume);
-        localStorageSet('muted', mute ? 1 : 0);
-        vol = mute ? 0 : vol;
-        if(currentEntry.type === 'video'){
-            if(config.theme.nativePlayer){
-                mediaVideoEl.volume = volume;
-                playerEl.volume = 0;
+        localStorageSet('muted', muted ? 1 : 0);
+        applyVolumeToElements();
+        updateVolumeUI(muted ? 0 : volume);
+    }
+
+    // Records the last volume *we* programmatically assigned to each media
+    // element. volumechange events whose target volume still matches this
+    // echo were caused by our own routing/fades (the event itself is dispatched
+    // by the UA and isTrusted even when triggered by script), so only
+    // non-matching changes are treated as genuine user input.
+    const volumeEcho = new WeakMap();
+    function setMediaVolume(el, v){
+        if(!el){
+            return;
+        }
+        try {
+            el.volume = v;
+        } catch(e){
+            return;
+        }
+        volumeEcho.set(el, el.volume);
+    }
+    function isEchoVolumeEvent(e){
+        let el = e.target;
+        return volumeEcho.has(el) && Math.abs(el.volume - volumeEcho.get(el)) < 1e-9;
+    }
+
+    // Routes the effective volume to the audible media element. With the
+    // custom controls playerEl is always the audible engine (mediaVideoEl is
+    // kept muted and only supplies the picture); with native controls a video
+    // element produces its own sound.
+    function baseAudibleVolume(){
+        return muted ? 0 : volume;
+    }
+
+    function applyVolumeToElements(){
+        let v = baseAudibleVolume();
+        let native = config.theme && config.theme.nativePlayer;
+        if(currentEntry && currentEntry.type === 'video'){
+            if(native){
+                setMediaVolume(mediaVideoEl, v);
+                setMediaVolume(playerEl, 0);
             } else {
-                mediaVideoEl.volume = 0;
-                playerEl.volume = vol;
+                setMediaVolume(mediaVideoEl, 0);
+                setMediaVolume(playerEl, v);
             }
         } else {
-            playerEl.volume = vol;
+            setMediaVolume(playerEl, v);
         }
+    }
+
+    function setAudibleVolume(v){
+        if(currentEntry && currentEntry.type === 'video' && config.theme && config.theme.nativePlayer){
+            setMediaVolume(mediaVideoEl, v);
+        } else {
+            setMediaVolume(playerEl, v);
+        }
+    }
+
+    function updateVolumeUI(vol){
         let scrubberWidth = 6;
-        let trackWidth = volumeTrackEl.clientWidth;
+        let trackWidth = volumeTrackEl.clientWidth || 80;
         volumeFillEl.style.left = ((1-vol) * (trackWidth - scrubberWidth)) + 'px';
         volumeIconEl.classList.remove(...volumeIcons);
         if(vol <= 0){
@@ -1425,14 +1634,16 @@
     });
 
     function updateTrackPreview(){
-        if(currentEntry.needsDuration){
-            return;
-        }
-        //reset to prevent compounding width calculation issues
+        // Always reset first so switching to an entry whose duration is not
+        // known yet can never leave the previous track's preview range,
+        // knob position or fill width on screen.
         scrubberTrackPreviewEl.style.removeProperty('margin-left');
         scrubberTrackPreviewEl.style.removeProperty('width');
         scrubberEl.style.removeProperty('left');
         scrubberFillEl.style.removeProperty('width');
+        if(!currentEntry || currentEntry.needsDuration || !currentEntry.originalDuration){
+            return;
+        }
         if(currentEntry.preview){
             let fullWidth = scrubberEl.parentElement.parentElement.clientWidth;
             scrubberTrackPreviewEl.style.marginLeft = ((currentEntry.previewStart) / currentEntry.originalDuration) * 100 + '%';
@@ -1440,10 +1651,39 @@
         }
     }
 
+    // Builds the "current / total" time label for an entry.
+    function formatEntryTimeText(entry, time){
+        let timeText = '';
+        if(entry && entry.preview){
+            timeText += '(preview)<br/>';
+        }
+        let total = (entry && entry.originalDuration && (!entry.needsDuration || entry.hasOriginalDuration))
+            ? entry.originalDuration
+            : 0;
+        timeText += `${toHMS(time)} / ${total ? toHMS(total) : '0:00'}`;
+        return timeText;
+    }
+
+    function renderTimeText(entry, time){
+        let timeEl = controlsEl.querySelector('.time');
+        if(timeEl){
+            timeEl.innerHTML = formatEntryTimeText(entry || currentEntry, time || 0);
+        }
+    }
+
+    // Time the UI should show immediately after selecting an entry, before
+    // any timeupdate / metadata has arrived.
+    function entryInitialDisplayTime(entry){
+        if(entry && entry.preview && isFinite(entry.previewStart)){
+            return entry.previewStart || 0;
+        }
+        return 0;
+    }
+
     function updatePreviewVolume(t){
-        if(currentEntry.preview && currentEntry.previewFade && !muted){
+        if(currentEntry && currentEntry.preview && currentEntry.previewFade && !muted){
             if(currentEntry.needsDuration){
-                playEntry.volume = 0;
+                setAudibleVolume(0);
             } else {
                 //rebase t to full (assumed) duration
                 t = currentEntry.audioStart + (t * currentEntry.duration);
@@ -1451,7 +1691,8 @@
                 t = Math.max(currentEntry.previewStart, Math.min(currentEntry.previewEnd, t));
                 let inTime = t - currentEntry.previewStart;
                 let outTime = currentEntry.previewEnd - t;
-                playerEl.volume = volume * Math.max(0, Math.min(1, inTime/1, outTime/1)); //1 second fade in/out
+                let fade = Math.max(0, Math.min(1, inTime/1, outTime/1)); //1 second fade in/out
+                setAudibleVolume(baseAudibleVolume() * fade);
             }
         }
     }
@@ -1477,13 +1718,7 @@
         scrubberEl.style.left = ((scrubberT * (trackWidth - scrubberWidth)) / trackWidth) * 100 + '%';
         scrubberFillEl.style.width = (scrubberT) * 100 + '%';
 
-        //let time = timePosition * currentEntry.duration;
-        let timeText = '';
-        if(currentEntry.preview){
-            timeText += '(preview)<br/>';
-        }
-        timeText += `${toHMS(time)} / ${currentEntry.originalDuration ? toHMS(currentEntry.originalDuration) : "0:00"}`
-        controlsEl.querySelector('.time').innerHTML = timeText;
+        controlsEl.querySelector('.time').innerHTML = formatEntryTimeText(currentEntry, time);
     }
 
     function scrub(x){
@@ -1590,7 +1825,12 @@
         }
         if(entry === currentEntry){
             bigButtonEl.classList.add('preloading');
+            let token = loadGeneration;
             setTimeout(() => {
+                // A newer track selection superseded this delayed spinner.
+                if(token !== loadGeneration){
+                    return;
+                }
                 if(bigButtonEl.classList.contains('preloading')){
                     bigButtonEl.classList.remove('preloading');
                     bigButtonEl.classList.add('loading');
@@ -1629,6 +1869,21 @@
         updateLoops(entry);
     }
 
+    // Synchronizes the big button loop badge/frame with exactly one entry, so
+    // switching tracks immediately shows the new count (or clears the old).
+    function syncLoopUI(entry){
+        if(entry && entry.loopCount > 0){
+            if(typeof entry.remainingLoops !== 'number' || !isFinite(entry.remainingLoops)){
+                entry.remainingLoops = entry.loopCount;
+            }
+            bigButtonEl.classList.add('looped');
+            bigButtonEl.setAttribute('loopcount', entry.remainingLoops);
+        } else {
+            bigButtonEl.classList.remove('looped');
+            bigButtonEl.removeAttribute('loopcount');
+        }
+    }
+
     
     function loadEntry(entry){
         if(entry.error){
@@ -1638,63 +1893,72 @@
             return;
         }
         if(entry === currentEntry){
+            // Re-selecting the current track restarts it. The active load
+            // generation stays valid so a pending Blob upgrade still lands.
             if(entry.type === 'video'){
-                mediaVideoEl.currentTime = 0;
-            } else {
+                try { mediaVideoEl.currentTime = 0; } catch(e){}
             }
-            playerEl.currentTime = 0;
-            playerEl.play();
+            try { playerEl.currentTime = 0; } catch(e){}
+            let playPromise = playerEl.play();
+            if(playPromise && typeof playPromise.catch === 'function'){
+                playPromise.catch(() => {});
+            }
             return;
         }
+
+        // Every real switch starts a new async generation.
+        const token = ++loadGeneration;
+        const previousEntry = (currentEntry && currentEntry !== entry) ? currentEntry : null;
         currentEntry = entry;
+        entry.started = false;
+
         media.forEach(thisEntry => {
-            thisEntry.trackEl.classList.remove('active');
-            thisEntry.trackEl.querySelector('button').classList.remove('pause');
+            if(thisEntry.trackEl){
+                thisEntry.trackEl.classList.remove('active');
+                let thisButtonEl = thisEntry.trackEl.querySelector('button');
+                if(thisButtonEl){
+                    thisButtonEl.classList.remove('pause');
+                }
+            }
             if(thisEntry !== entry){
                 resetLoops(thisEntry);
             }
-            updateLoops(entry);
         });
+
         if(!currentEntry.duration){
             currentEntry.duration = 999;
             currentEntry.needsDuration = true;
         }
-        updateTrackPreview();
-        if(entry.preview){
-            scrubberTrackContainerEl.classList.add('preview');
-            updatePreviewVolume(0);
+
+        // --- recompute all per-track UI immediately, before any async result
+        updateTrackPreview(); //clears stale preview geometry even while loading
+        scrubPosition = 0;
+        if(entry.needsDuration){
+            renderTimeText(entry, entryInitialDisplayTime(entry));
         } else {
-            scrubberTrackContainerEl.classList.remove('preview');
+            updateScrubPosition(0);
         }
-        if(entry.loopCount > 0){
-            bigButtonEl.classList.add('looped');
-        } else {
-            bigButtonEl.classList.remove('looped');
-        }
+        syncLoopUI(entry);
+
+        // --- cover / image / video element mutual exclusion
         Array.from(mediaContainerEl.children).forEach(el => {
             el.classList.remove('active');
         });
         if(entry.type === 'video'){
-            mediaVideoEl.src = entry.file;
             mediaVideoEl.classList.add('active');
             mediaImageEl.style.visibility = 'hidden';
             playerEl.classList.add('video');
-
-            if(config.theme.nativePlayer){
-                mediaVideoEl.volume = volume;
-                playerEl.volume = 0;
-            } else {
-                mediaVideoEl.volume = 0;
-                playerEl.volume = volume;
-            }
         } else {
-            mediaImageEl.classList.add('active');
             playerEl.classList.remove('video');
-
-            playerEl.volume = volume;
+            mediaImageEl.classList.add('active');
+            // Deactivate and fully unload the video element *before* any Blob
+            // URL it references is revoked.
             mediaVideoEl.pause();
+            mediaVideoEl.classList.remove('active');
             mediaVideoEl.removeAttribute('src');
-            mediaVideoEl.load();
+            try {
+                mediaVideoEl.load();
+            } catch(e){}
 
             if(entry.cover){
                 loadCover(entry.cover);
@@ -1702,10 +1966,30 @@
                 loadCover(config.cover);
             }
         }
-        playerEl.src = entry.file;
-        entry.started = false;
+
+        // --- attach the current source (sync best-effort, async Blob upgrade)
+        mountEntrySource(entry, token);
+
+        // --- volume/fade state belongs to the newly selected entry
+        applyVolumeToElements();
+        if(entry.preview){
+            scrubberTrackContainerEl.classList.add('preview');
+            updatePreviewVolume(0);
+        } else {
+            scrubberTrackContainerEl.classList.remove('preview');
+        }
+
+        // The new source is now wired into the live media elements, so the
+        // previous entry's playback-only Blob URL is no longer referenced and
+        // can safely be released. The current entry's URL is never revoked.
+        if(previousEntry){
+            revokeEntryPlayUrl(previousEntry);
+        }
+
         setLoading(currentEntry);
-        playerEl.currentTime = 1e101;
+        try {
+            playerEl.currentTime = 1e101;
+        } catch(e){}
         entry.trackEl.classList.add('active');
         controlsEl.querySelector('.title').innerHTML = entry.title;
         if(entry.info && (config.theme.infoStyle !== 'overlaid-toggle' || entry.infoToggled)){
@@ -1784,5 +2068,21 @@
     function mod(x, n){
         return (((x % n) + n) % n);
     }
+
+    // Read-only-ish lifecycle inspection surface (also useful for automated
+    // checks). All fields are live getters over the closures above.
+    window.scritch = {
+        get currentEntry(){ return currentEntry; },
+        get media(){ return media; },
+        get loadGeneration(){ return loadGeneration; },
+        get activePlayUrl(){ return activePlayUrl; },
+        get volume(){ return volume; },
+        get muted(){ return muted; },
+        loadEntry,
+        playEntry,
+        nextTrack,
+        prevTrack,
+        revokeEntryPlayUrl
+    };
 </script>
 </html>
