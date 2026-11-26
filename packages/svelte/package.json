@@ -1,0 +1,45 @@
+{
+  "name": "@manapotion/svelte",
+  "version": "1.1.4",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "dev": "svelte-package -i src -w",
+    "build": "svelte-package -i src",
+    "lint": "eslint . --ext ts,svelte",
+    "typecheck": "tsc",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "publint": "publint"
+  },
+  "dependencies": {
+    "@manapotion/core": "^1.1.4"
+  },
+  "peerDependencies": {
+    "svelte": ">=4.2.1"
+  },
+  "devDependencies": {
+    "@ianvs/prettier-plugin-sort-imports": "4.2.1",
+    "@sveltejs/package": "2.3.1",
+    "@tsconfig/svelte": "5.0.4",
+    "@typescript-eslint/eslint-plugin": "7.7.0",
+    "@typescript-eslint/parser": "7.7.0",
+    "eslint": "8.57.0",
+    "eslint-plugin-svelte": "2.37.0",
+    "prettier": "3.2.5",
+    "prettier-plugin-svelte": "3.2.3",
+    "publint": "0.2.7",
+    "typescript": "5.4.5"
+  }
+}

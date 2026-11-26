@@ -1,0 +1,12 @@
+{
+  "short_name": "Mana Potion",
+  "name": "Mana Potion",
+  "start_url": "/",
+  "background_color": "#2d65cd",
+  "theme_color": "#2d65cd",
+  "display": "standalone",
+  "icons": [
+    { "src": "/icon-192.png", "type": "image/png", "sizes": "192x192" },
+    { "src": "/icon-512.png", "type": "image/png", "sizes": "512x512" }
+  ]
+}
