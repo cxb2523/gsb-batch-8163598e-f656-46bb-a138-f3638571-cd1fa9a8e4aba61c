@@ -3,8 +3,15 @@
  * key 约定：
  *   tile:grass:3 / tile:sand:1 / tile:water:2:deep / tile:plot:wet
  *   crop:<cropId>:<stage>   animal:<defId>   beast:<defId>   pet:<defId>
- *   bld:<defId>             char:<avatarJson>:<walkFrame>
+ *   bld:<defId>             char:<avatarFingerprint>:<walkFrame>
  *   fish:<fishId>           icon:<itemId>    fx:<kind>       weed / hl:ok / hl:bad
+ *
+ * 缓存按"场景作用域"管理：
+ *   - 切换场景（自家岛 ↔ 邻居岛 ↔ 快照岛）→ 旧作用域的全部条目失效；
+ *   - 同一场景内重复绘制 → 直接命中，不重建；
+ *   - 角色外观变化会改变作用域与 charKey，旧外观条目不会再被命中；
+ *   - 返回标题 / 销毁 App → clearSpriteCache() 释放全部内存，
+ *     之后重新进入游戏时按需重建，不受影响。
  */
 import type { AvatarConfig, CropStage } from '../core/types';
 import { buildingDef, cropDef, fishDef } from '../core/registry';
@@ -17,6 +24,8 @@ import { paintCharacter } from './paint/chars';
 import { paintFishSide, paintItemIcon } from './paint/items';
 import { paintFx, type FxKind } from './paint/fx';
 import { TILE_W } from './iso';
+import { SpriteCache, type SpriteCacheStats } from './spriteCache';
+import { avatarFingerprint, avatarFromFingerprint, charKeyFingerprint } from './sceneScope';
 
 export interface Sprite {
   img: CanvasImageSource;
@@ -27,8 +36,6 @@ export interface Sprite {
   ax: number;
   ay: number;
 }
-
-const cache = new Map<string, Sprite>();
 
 function build(key: string): Sprite {
   const parts = key.split(':');
@@ -74,7 +81,7 @@ function build(key: string): Sprite {
       return make(size.w, size.h, size.ax, size.ay, (ctx) => paintBuilding(ctx, def));
     }
     case 'char': {
-      const avatar = JSON.parse(parts.slice(1, -1).join(':')) as AvatarConfig;
+      const avatar = avatarFromFingerprint(parts.slice(1, -1).join(':'));
       const walkFrame = Number(parts[parts.length - 1]);
       return make(48, 68, 24, 64, (ctx) =>
         paintCharacter(ctx, avatar, { walk: walkFrame < 0 ? undefined : walkFrame / 8 }),
@@ -91,17 +98,81 @@ function build(key: string): Sprite {
   }
 }
 
+/** dataURL 派生缓存（背包/HUD 图标）；随精灵缓存失效一起释放。 */
+const urlCache = new Map<string, string>();
+
+/**
+ * 场景精灵缓存：条目只在当前场景作用域内有效。
+ * 作用域切换时旧的离屏画布被整体丢弃，避免换岛后继续命中上一座岛的贴图，
+ * 也避免长时间游玩时无界增长。
+ */
+const cache = new SpriteCache<Sprite>(build);
+
 export function getSprite(key: string): Sprite {
-  let s = cache.get(key);
-  if (!s) {
-    s = build(key);
-    cache.set(key, s);
-  }
-  return s;
+  return cache.get(key);
 }
 
+export function hasSprite(key: string): boolean {
+  return cache.has(key);
+}
+
+/** 角色 key：外观指纹进 key，换装/快照主人变化后旧外观条目不再命中。 */
 export function charKey(avatar: AvatarConfig, walkFrame = -1): string {
-  return `char:${JSON.stringify(avatar)}:${walkFrame}`;
+  return `char:${avatarFingerprint(avatar)}:${walkFrame}`;
+}
+
+// ---------------------------------------------------------------- 场景生命周期
+
+/**
+ * 绑定/切换场景作用域。返回是否发生了变化（true = 旧场景精灵已失效）。
+ * 同一场景重复调用返回 false，缓存保持，逐帧绘制不会重建。
+ */
+export function enterSceneScope(scope: string): boolean {
+  const changed = cache.enterScope(scope);
+  if (changed) {
+    urlCache.clear();
+    lastKeptFingerprints = null;
+  }
+  return changed;
+}
+
+/** 当前作用域；null = 尚未绑定场景或已释放。 */
+export function currentSceneScope(): string | null {
+  return cache.scope;
+}
+
+export function spriteCacheStats(): SpriteCacheStats {
+  return cache.stats();
+}
+
+/** 释放缓存（返回标题 / 销毁 App）。之后重新进入游戏可按需重建。 */
+export function clearSpriteCache(): void {
+  cache.clear();
+  urlCache.clear();
+  lastKeptFingerprints = null;
+}
+
+/** 上一次同步时的外观指纹集合：集合未变就不必重复扫描缓存 */
+let lastKeptFingerprints: string | null = null;
+
+/**
+ * 角色外观变化后同步缓存：淘汰旧外观的 char 条目（含对应 dataURL），
+ * 保证旧外观不会被继续命中；当前外观的条目不受影响。
+ * 外观没变时直接返回（逐帧调用零开销）。
+ */
+export function syncCharacterSprites(avatars: AvatarConfig[]): void {
+  const fingerprints = avatars.map((a) => avatarFingerprint(a));
+  const signature = fingerprints.slice().sort().join('|');
+  if (signature === lastKeptFingerprints) return;
+  lastKeptFingerprints = signature;
+
+  const keep = new Set(fingerprints);
+  for (const key of cache.prune((k) => {
+    const fp = charKeyFingerprint(k);
+    return fp !== null && !keep.has(fp);
+  })) {
+    urlCache.delete(key);
+  }
 }
 
 /** 绘制精灵：把锚点对齐到 (x, y)，可选缩放 */
@@ -115,7 +186,6 @@ export function drawSprite(ctx: CanvasRenderingContext2D, key: string, x: number
 }
 
 /** 生成 dataURL 供 DOM UI 使用（背包图标等） */
-const urlCache = new Map<string, string>();
 export function spriteDataUrl(key: string): string {
   let url = urlCache.get(key);
   if (!url) {
@@ -125,9 +195,4 @@ export function spriteDataUrl(key: string): string {
     urlCache.set(key, url);
   }
   return url;
-}
-
-export function clearSpriteCache(): void {
-  cache.clear();
-  urlCache.clear();
 }

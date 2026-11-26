@@ -21,6 +21,7 @@ import { buildingDef, cropDef, itemDef, neighborDef, petDef, allCrops } from '..
 import { saveToSlot } from '../save/save';
 import type { IslandSnapshot } from '../social/friendcode';
 import { Renderer, sceneFromState, type RenderScene, type SceneActor } from '../render/renderer';
+import { clearSpriteCache, currentSceneScope, spriteCacheStats } from '../render/sprites';
 import { isoX, isoY } from '../render/iso';
 import { Hud } from '../ui/hud';
 import { hideActionMenu, isActionMenuOpen, showActionMenu, type MenuAction } from '../ui/actionMenu';
@@ -67,6 +68,8 @@ export class App {
   private running = true;
   private raf = 0;
   private onBackToTitle: () => void;
+  /** 构造时注册的全局监听；销毁时逐一移除，避免旧实例被闭包长期持有 */
+  private cleanups: (() => void)[] = [];
 
   constructor(canvas: HTMLCanvasElement, state: GameState, slot: number, onBackToTitle: () => void) {
     this.state = state;
@@ -89,23 +92,31 @@ export class App {
       onGoHome: () => this.goHome(),
     });
 
-    this.bindInput(canvas);
+    this.cleanups.push(this.bindInput(canvas));
     this.renderer.centerOnIsland(sceneFromState(state));
-    window.addEventListener('resize', () => this.renderer.resize());
-    window.addEventListener('beforeunload', () => this.save());
-    document.addEventListener('visibilitychange', () => {
+    const onResize = (): void => this.renderer.resize();
+    const onUnload = (): void => this.save();
+    const onVisibility = (): void => {
       if (document.hidden) this.save();
-    });
-    // 首次交互解锁音频
-    const unlock = (): void => {
-      startBgm();
-      window.removeEventListener('pointerdown', unlock);
     };
-    window.addEventListener('pointerdown', unlock);
+    const onPointerDown = (): void => {
+      startBgm();
+    };
+    window.addEventListener('resize', onResize);
+    window.addEventListener('beforeunload', onUnload);
+    document.addEventListener('visibilitychange', onVisibility);
+    // 首次交互解锁音频
+    window.addEventListener('pointerdown', onPointerDown);
+    this.cleanups.push(() => {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('beforeunload', onUnload);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pointerdown', onPointerDown);
+    });
 
     this.lastSave = Date.now();
     // 调试/自动化测试钩子（不影响正常游玩）
-    (window as unknown as Record<string, unknown>).__PI__ = {
+    const debugHook = {
       app: this,
       state: () => this.state,
       isFishable: (x: number, y: number) => isFishable(this.state, x, y),
@@ -114,13 +125,31 @@ export class App {
         this.renderer.camera.sx(isoX(x, y)),
         this.renderer.camera.sy(isoY(x, y)),
       ],
+      /** 精灵缓存诊断（场景作用域 / 条目数 / 构建与命中次数） */
+      spriteScope: () => currentSceneScope(),
+      spriteStats: () => spriteCacheStats(),
     };
+    (window as unknown as Record<string, unknown>).__PI__ = debugHook;
+    this.cleanups.push(() => {
+      const w = window as unknown as Record<string, unknown>;
+      if (w.__PI__ === debugHook) delete w.__PI__;
+    });
     this.loop();
   }
 
   destroy(): void {
+    if (!this.running) return;
     this.running = false;
     cancelAnimationFrame(this.raf);
+    const cleanups = this.cleanups;
+    this.cleanups = [];
+    for (const fn of cleanups) {
+      try { fn(); } catch { /* 监听已不存在时忽略 */ }
+    }
+    // 销毁 App（含返回标题）时释放整份精灵缓存，避免离屏画布随场景累积。
+    // 缓存是模块级、可按需重建的，之后重新进入游戏不受影响。
+    clearSpriteCache();
+    this.hud.destroy();
   }
 
   now(): number {
@@ -329,7 +358,8 @@ export class App {
 
   // ---------------------------------------------------------------- 输入
 
-  private bindInput(canvas: HTMLCanvasElement): void {
+  /** 绑定画布/键盘输入；返回解绑函数，避免重复进游戏时监听器与旧实例累积。 */
+  private bindInput(canvas: HTMLCanvasElement): () => void {
     let downX = 0;
     let downY = 0;
     let dragging = false;
@@ -343,7 +373,7 @@ export class App {
       return { d: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
     };
 
-    canvas.addEventListener('pointerdown', (ev) => {
+    const onPointerDown = (ev: PointerEvent): void => {
       pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (pointers.size === 2) {
         pinching = true;
@@ -354,12 +384,11 @@ export class App {
       downY = ev.clientY;
       dragging = true;
       panning = false;
-    });
+    };
     const dropPointer = (ev: PointerEvent): void => {
       pointers.delete(ev.pointerId);
     };
-    window.addEventListener('pointercancel', dropPointer);
-    canvas.addEventListener('pointermove', (ev) => {
+    const onPointerMove = (ev: PointerEvent): void => {
       const cam = this.renderer.camera;
       if (pointers.has(ev.pointerId)) pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (pinching) {
@@ -380,8 +409,8 @@ export class App {
       }
       const tile = cam.tileAt(ev.clientX, ev.clientY);
       this.hover = tile;
-    });
-    canvas.addEventListener('pointerup', (ev) => {
+    };
+    const onPointerUp = (ev: PointerEvent): void => {
       dropPointer(ev);
       dragging = false;
       if (pinching) {
@@ -395,23 +424,41 @@ export class App {
         return;
       }
       this.onClick(ev.clientX, ev.clientY);
-    });
-    canvas.addEventListener('pointerleave', (ev) => {
+    };
+    const onPointerLeave = (ev: PointerEvent): void => {
       if (ev.pointerType === 'mouse') dropPointer(ev);
       dragging = false;
       this.hover = null;
-    });
-    canvas.addEventListener('wheel', (ev) => {
+    };
+    const onWheel = (ev: WheelEvent): void => {
       ev.preventDefault();
       this.renderer.camera.zoomAt(ev.deltaY < 0 ? 1.12 : 0.9, ev.clientX, ev.clientY);
-    }, { passive: false });
-    window.addEventListener('keydown', (ev) => {
+    };
+    const onKeyDown = (ev: KeyboardEvent): void => {
       if (ev.key === 'Escape') {
         if (isActionMenuOpen()) hideActionMenu();
         else if (isPanelOpen()) closePanel();
         else if (this.edit.placing || this.edit.movingUid) this.cancelEdit();
       }
-    });
+    };
+
+    canvas.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointercancel', dropPointer);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    window.addEventListener('keydown', onKeyDown);
+
+    return () => {
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointercancel', dropPointer);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointerleave', onPointerLeave);
+      canvas.removeEventListener('wheel', onWheel);
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }
 
   // ---------------------------------------------------------------- 点击处理
@@ -728,6 +775,7 @@ export class App {
       const ns = this.mode.ns;
       const persona = neighborDef(ns.defId);
       return {
+        id: `npc:${ns.defId}`,
         seed: persona.islandSeed,
         islandTier: 1,
         plots: ns.plots,
@@ -748,6 +796,7 @@ export class App {
       const snap = this.mode.snap;
       const size = buildTerrain(snap.seed, snap.islandTier).length;
       return {
+        id: `snap:${snap.seed}:${snap.takenAt}`,
         seed: snap.seed,
         islandTier: snap.islandTier,
         plots: snap.plots,

@@ -12,7 +12,8 @@ import { animalPhase } from '../core/animals';
 import { WATER_COOLDOWN_MS } from '../core/balance';
 import { Camera } from './camera';
 import { isoX, isoY, TILE_H, TILE_W } from './iso';
-import { charKey, drawSprite } from './sprites';
+import { charKey, drawSprite, enterSceneScope, syncCharacterSprites } from './sprites';
+import { sceneScopeKey } from './sceneScope';
 
 export interface SceneActor {
   avatar: AvatarConfig;
@@ -24,6 +25,14 @@ export interface SceneActor {
 
 /** 渲染层看到的统一场景描述 */
 export interface RenderScene {
+  /**
+   * 场景身份（自家岛 / 某位邻居 / 某份快照）。
+   * 与种子、档位一起构成精灵缓存的作用域：
+   * 切换场景 → 旧场景的精灵失效；场景不变 → 继续命中缓存。
+   * 角色外观不进作用域（换装不该重建地形），由 charKey 与
+   * syncCharacterSprites 处理。
+   */
+  id?: string;
   seed: number;
   islandTier: number;
   plots: FarmPlot[];
@@ -41,6 +50,7 @@ export interface RenderScene {
 
 export function sceneFromState(state: GameState): RenderScene {
   return {
+    id: 'home',
     seed: state.seed,
     islandTier: state.islandTier,
     plots: state.plots,
@@ -96,6 +106,11 @@ export class Renderer {
 
   /** 主绘制入口 */
   render(scene: RenderScene, now: number): void {
+    // 场景切换时旧场景的精灵必须整体失效；同一场景内重复绘制仍命中缓存。
+    enterSceneScope(sceneScopeKey(scene));
+    // 角色外观变化后淘汰旧外观的 char 条目，保证旧外观不会再被命中。
+    syncCharacterSprites(scene.actors.map((a) => a.avatar));
+
     const { ctx, camera } = this;
     const zoom = camera.zoom;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
