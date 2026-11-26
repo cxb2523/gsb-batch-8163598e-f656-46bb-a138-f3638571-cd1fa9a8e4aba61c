@@ -28,6 +28,19 @@ const HINTS = [
 
 const KNOB_DRAG_STEP = 9;
 
+// The scale-change arpeggio. Its degrees are fixed by the instrument's feel;
+// the ids are derived so the cancel path and the play path can never drift.
+const AUDITION_DEGREES = [10, 12, 14];
+
+// The two kinds of transient UI note, and the voice ids each one owns. They are
+// fixed so a cancel can also reach a ringing voice whose own off-timer has
+// already fired: "no note of this kind is left" is a property of the sound, not
+// of which voices happened to be tracked when the swap landed.
+const TRANSIENTS = {
+  audition: AUDITION_DEGREES.map((_, i) => `aud${i}`),
+  preview: ['preview'],
+};
+
 class App {
   constructor() {
     this.canvas = document.getElementById('panel');
@@ -57,7 +70,13 @@ class App {
     this.shellCache = null;
     this.pixelScale = 3;
 
-    this.keyState = PADS.map(() => ({ down: false, glow: 0, tonic: false, midi: 0 }));
+    this.keyState = PADS.map(() => ({
+      down: false,
+      glow: 0,
+      tonic: false,
+      midi: 0,
+      velocity: 0,
+    }));
     this.knobState = [
       { index: 0, norm: 0, count: SCALES.length, glow: 0, press: 0, pop: 0, held: false },
       {
@@ -74,6 +93,13 @@ class App {
 
     this.held = new Set();
     this.mouseHeld = new Set();
+    // Transient UI notes that must never outlive a sound change. Each run owns
+    // its pending timers and the voice ids it has already started, so a new run
+    // can cancel the old one completely — scheduled starts included.
+    this.transients = {
+      audition: { timers: new Set(), ids: new Set() },
+      preview: { timers: new Set(), ids: new Set() },
+    };
     this.pointerDown = false;
     this.knobDrag = null;
     this.lastPetAt = -99;
@@ -117,6 +143,10 @@ class App {
 
     this.last = performance.now();
     requestAnimationFrame(this.frame);
+
+    // Exposed so the demo harness and a local CDP script can drive the same
+    // instance the UI runs, and inspect the engine after a sound switch.
+    window.__dsapp = this;
 
     const demo = new URLSearchParams(location.search).get('demo');
     if (demo) this.runDemo(demo);
@@ -437,6 +467,7 @@ class App {
     st.down = true;
     st.glow = 1;
     st.midi = midi;
+    st.velocity = vel;
     this.held.add(pad.index);
     if (fromMouse) this.mouseHeld.add(pad.index);
 
@@ -488,10 +519,12 @@ class App {
 
   panic() {
     this.releaseAll();
+    this.cancelAuditions();
     this.engine.panic();
     for (const st of this.keyState) {
       st.down = false;
       st.glow = 0;
+      st.velocity = 0;
     }
     this.held.clear();
     this.mouseHeld.clear();
@@ -556,33 +589,84 @@ class App {
   }
 
   applyPreset() {
-    this.engine.setPreset(this.preset);
+    // One atomic swap: kill any audition still queued or sounding, let go of
+    // everything the pedal latched under the departing sound, apply the new
+    // preset, then re-strike the keys the player is still holding so they
+    // change sound instead of being cut. They stay down until actually released.
+    this.cancelAuditions();
+    const held = [];
+    for (const index of [...this.held]) {
+      const st = this.keyState[index];
+      held.push({ id: `k${index}`, midi: st.midi, velocity: st.velocity });
+    }
+    this.engine.setPreset(this.preset, { held });
     this.state.theme = themeFor(this.preset.accent);
     this.shellDirty = true;
     this.pet.onPresetChange(this.preset);
     this.auditionNote();
   }
 
+  /** Cancel the pending start timers and sounding voices of a transient run. */
+  cancelTransient(name) {
+    const run = this.transients[name];
+    const ids = TRANSIENTS[name];
+    for (const timer of run.timers) clearTimeout(timer);
+    run.timers.clear();
+    // Reach every canonical id, not just the ones this run logged as started:
+    // a ringing voice can survive the off-timer that would have dropped it.
+    for (const id of ids) this.engine.endPreview(id, true);
+    run.ids.clear();
+  }
+
+  /** Audio previews belong to the sound being replaced, so every preset swap
+   *  drops both kinds — the scale arpeggio and the single preview note. */
+  cancelAuditions() {
+    this.cancelTransient('audition');
+    this.cancelTransient('preview');
+  }
+
   /** Little arpeggio that shows off the new scale and ripples across the keys. */
   audition() {
-    const degrees = [10, 12, 14];
-    degrees.forEach((degree, i) => {
-      setTimeout(() => {
+    this.cancelTransient('audition');
+    const run = { timers: new Set(), ids: new Set() };
+    this.transients.audition = run;
+    AUDITION_DEGREES.forEach((degree, i) => {
+      const id = `aud${i}`;
+      const timer = setTimeout(() => {
+        run.timers.delete(timer);
+        // A newer run has taken over; this start is no longer wanted.
+        if (this.transients.audition !== run) return;
         const midi = degreeToMidi(this.scale, degree);
-        const id = `aud${i}`;
+        run.ids.add(id);
         this.engine.noteOn(id, midi, 0.4);
-        setTimeout(() => this.engine.noteOff(id), 320);
+        const offTimer = setTimeout(() => {
+          run.timers.delete(offTimer);
+          if (this.engine.endPreview(id)) run.ids.delete(id);
+        }, 320);
+        run.timers.add(offTimer);
         const pad = PADS.find((q) => q.degree === degree);
         if (pad) this.keyState[pad.index].glow = 0.85;
         this.pet.gazeTarget.x = (degree / (PADS.length - 1) - 0.5) * 2;
       }, i * 95);
+      run.timers.add(timer);
     });
   }
 
   auditionNote() {
+    this.cancelTransient('preview');
+    const run = { timers: new Set(), ids: new Set() };
+    this.transients.preview = run;
+    const id = 'preview';
     const midi = degreeToMidi(this.scale, 12);
-    this.engine.noteOn('preview', midi, 0.45);
-    setTimeout(() => this.engine.noteOff('preview'), 420);
+    run.ids.add(id);
+    this.engine.noteOn(id, midi, 0.45);
+    const timer = setTimeout(() => {
+      run.timers.delete(timer);
+      // A ringing voice reports itself still alive and is left as tracked, so
+      // the next swap (or cancel) can still reach it.
+      if (this.engine.endPreview(id)) run.ids.delete(id);
+    }, 420);
+    run.timers.add(timer);
   }
 
   petTouch() {

@@ -56,10 +56,33 @@ voices because forty detuned oscillators are not worth the CPU. Voice stealing
 drops ringing voices before held ones.
 
 Sustain moves released ids into a `sustained` set instead of freeing them;
-turning sustain off releases the whole set.
+turning sustain off releases the whole set. A re-press (`noteOn`) with the same
+id takes it back out of the pedal's set, so the key owns it again rather than a
+stale latch.
 
 `pitchGain` rolls high notes off above MIDI 72 (about −6 dB per two octaves) so
 the top of a pentatonic keyboard doesn't bite.
+
+### Switching sounds mid-phrase
+
+`Engine.setPreset(preset, { held })` is the atomic swap the UI uses, and it runs
+in a fixed order:
+
+1. `releaseSustained()` frees every id the pedal latched, under the sound they
+   were played with. The pedal flag itself stays down — this is a sound change,
+   not the player lifting their foot.
+2. `applyPreset()` ramps the bus, sends and delay to the new preset.
+3. Each `{ id, midi, velocity }` in `held` — keys still physically down — is
+   re-struck through `noteOn`, so they change timbre instead of being cut, and
+   they stay down until actually released.
+
+Transient previews (`App.audition`, `App.auditionNote`) do not go through
+`sustained`: they end through `Engine.endPreview(id, immediate)`. A held preview
+releases now even with the pedal down, so a UI note can never stick; a ringing
+preview is normally left to finish its own tail, but on a sound change the app
+passes `immediate` and kills it, so the outgoing preset's arpeggio never sounds
+over the incoming one. `endPreview` returns whether the id actually left the
+voice map, which lets the caller keep a ringing voice tracked until it is gone.
 
 `voice.js` also carries the transient generators the percussive presets share:
 `click` (a filtered impulse), `burst` (a windowed slice of the noise buffer
@@ -179,3 +202,10 @@ lower than a detent: a button should feel heavier than a notch. Scale changes
 also trigger a
 three-note arpeggio of the new scale (`App.audition`), which doubles as a
 preview and lights up the corresponding keys.
+
+The arpeggio and the one-note sound preview (`App.auditionNote`) are the only
+places the app schedules its own `setTimeout`s into the voice map. Both record
+their timers and voice ids per run, so `App.applyPreset` can cancel the lot —
+pending starts included — before swapping. Their voice ids (`aud0..2`,
+`preview`) are fixed rather than run-specific, so a cancel reaches a voice that
+is already sounding even if its off-timer has fired.

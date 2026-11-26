@@ -65,6 +65,20 @@ follows physical key positions rather than the user's layout.
 5. Refresh the shared `state` object.
 6. Draw.
 
+## Changing a sound
+
+`App.applyPreset` is the one place a preset lands, and it is atomic. It cancels
+every pending or sounding audition first, collects the pads still physically
+held (with their velocity), asks `Engine.setPreset` to release pedal-latched
+notes and re-strike those held pads under the new sound, then repaints the theme.
+The arpeggio and the preview note own their timers through
+`App.transients`, so nothing from the old sound — queued or ringing — can outlive
+the swap.
+
+`window.__dsapp` points at the live `App`. It exists for the screenshot harness
+and for a local CDP script that needs to drive the same instance and inspect the
+engine after a switch; it is not read by anything in the renderer.
+
 ## State
 
 There is one mutable `state` object, rebuilt in place each frame and passed to

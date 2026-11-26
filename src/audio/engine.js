@@ -106,8 +106,55 @@ export class Engine {
     set(this.delay.delayTime, preset.delayTime ?? 0.27);
   }
 
-  setPreset(preset) {
-    this.applyPreset(preset);
+  /**
+   * Swap sounds in one atomic step. Anything the pedal was holding is released
+   * under the sound it was played with (the pedal itself stays down), the new
+   * preset takes over the bus, and every id in `held` — keys the player is
+   * still pressing — is re-struck with the new sound and left down. Releasing
+   * those keys later behaves like any other release.
+   */
+  setPreset(preset, { held = [], ramp = 0.08 } = {}) {
+    this.releaseSustained();
+    this.applyPreset(preset, ramp);
+    for (const h of held) this.noteOn(h.id, h.midi, h.velocity);
+  }
+
+  /**
+   * Release every note the sustain pedal is holding. The pedal flag is left
+   * alone: this is what a sound change does, not the player lifting their foot.
+   */
+  releaseSustained() {
+    if (!this.sustained.size) return 0;
+    const ids = [...this.sustained];
+    this.sustained.clear();
+    for (const id of ids) this.releaseVoice(id);
+    return ids.length;
+  }
+
+  /**
+   * End a transient preview note (`audition` / `auditionNote`).
+   *
+   * A held voice releases now even if the pedal is down, so a UI preview can
+   * never become a stuck note. A ringing voice is left to finish its own tail
+   * and reports itself as still alive, so the caller can keep tracking it.
+   *
+   * `immediate` is for a sound change: the preview belonged to the outgoing
+   * preset, so it is killed outright rather than allowed to ring over the new
+   * one.
+   *
+   * Returns true once the voice is no longer in the map.
+   */
+  endPreview(id, immediate = false) {
+    this.sustained.delete(id);
+    const entry = this.voices.get(id);
+    if (!entry) return true;
+    if (immediate) {
+      this.stopVoice(id, true);
+      return true;
+    }
+    if (entry.voice.ring) return false;
+    this.releaseVoice(id);
+    return true;
   }
 
   get maxVoices() {
@@ -117,6 +164,9 @@ export class Engine {
   noteOn(id, midi, velocity = 0.85) {
     this.resume();
     const ctx = this.ctx;
+    // A re-press takes the id back from the pedal: the new note is held by the
+    // key now, not latched by a sustain that was released earlier.
+    this.sustained.delete(id);
     if (this.voices.has(id)) this.stopVoice(id, true);
     while (this.voices.size >= this.maxVoices) {
       // Steal the oldest ringing voice, or just the oldest.
