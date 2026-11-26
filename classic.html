@@ -1,0 +1,985 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Foldables Classic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Gochi+Hand&display=swap" rel="stylesheet">
+<style>
+/* Layout: a cutting-mat stage fills the left; a paper "options sheet" sits on the right (below the stage on phones). */
+:root{
+  --mat:#2E5A4E; --mat-deep:#244A40; --mat-ink:#EAF1EC; --mark:#F2D04B;
+  --bg:#F5F6F2; --sheet:#FFFFFF; --ink:#1F2A26; --muted:#5F6C67; --line:#E1E5E0; --chip:#EEF1EC;
+  --accent:#2E5A4E; --accent-ink:#FFFFFF; --focus:#D9A520;
+  --display:"Gochi Hand","Bradley Hand","Comic Sans MS",cursive;
+  --ui:"Figtree",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#111815; --sheet:#17201C; --ink:#E5ECE8; --muted:#9AA9A2; --line:#283430; --chip:#202B27;
+  --accent:#F2D04B; --accent-ink:#1E1C0E; --focus:#F2D04B; color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#111815; --sheet:#17201C; --ink:#E5ECE8; --muted:#9AA9A2; --line:#283430; --chip:#202B27;
+  --accent:#F2D04B; --accent-ink:#1E1C0E; --focus:#F2D04B; color-scheme:dark }
+
+html,body{height:100%}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--ui);font-size:14px;
+  display:grid;grid-template-columns:minmax(0,1fr) 340px;overflow:hidden}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+
+/* Stage */
+#stage{position:relative;min-width:0;min-height:0;background:var(--mat);overflow:hidden;touch-action:none}
+#gl{display:block;width:100%;height:100%;cursor:grab}
+#gl:active{cursor:grabbing}
+.tag{position:absolute;left:20px;top:16px;color:var(--mat-ink);pointer-events:none}
+.tag h1{font-family:var(--display);font-weight:400;font-size:44px;line-height:1;margin:0}
+.tag p{margin:4px 0 0;font-size:13px;opacity:.8;font-variant-numeric:tabular-nums}
+
+.modes{position:absolute;right:16px;top:16px;display:flex;background:rgba(0,0,0,.22);border-radius:999px;padding:3px}
+.modes button{border:0;background:transparent;color:var(--mat-ink);padding:7px 14px;border-radius:999px;cursor:pointer;font-weight:600;font-size:13px}
+.modes button[aria-pressed="true"]{background:var(--mat-ink);color:var(--mat-deep)}
+
+.dock{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);width:min(520px,calc(100% - 32px));
+  display:flex;flex-direction:column;align-items:center;gap:10px}
+.go{border:0;background:var(--mark);color:#1E1C0E;font-weight:700;font-size:16px;padding:14px 30px;border-radius:999px;cursor:pointer;
+  box-shadow:0 6px 0 #B8961F;transition:transform .12s ease, box-shadow .12s ease}
+.go:hover{transform:translateY(-1px)}
+.go:active{transform:translateY(4px);box-shadow:0 2px 0 #B8961F}
+.hint{color:var(--mat-ink);opacity:.7;font-size:12.5px;text-align:center}
+.hint:empty{display:none}
+.autoui{display:flex;flex-direction:column;align-items:center;gap:10px}
+.dockbtns{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center}
+.go{display:inline-flex;align-items:center;gap:9px}
+.go .ico{width:15px;height:15px;flex:none}
+@keyframes invite{0%,100%{outline:0 solid transparent;outline-offset:0}45%{outline:3px solid color-mix(in srgb,var(--mark) 55%,transparent);outline-offset:6px}70%{outline:3px solid transparent;outline-offset:12px}}
+.alt{border:1px solid rgba(255,255,255,.32);background:rgba(0,0,0,.26);color:var(--mat-ink);font-weight:600;font-size:14px;padding:12px 20px;border-radius:999px;cursor:pointer;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.alt:hover{background:rgba(0,0,0,.42)}
+.stepcard .close{margin-left:auto;border:0;background:rgba(255,255,255,.14);color:var(--mat-ink);border-radius:999px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer}
+
+.stepcard{width:100%;background:rgba(20,40,34,.72);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  color:var(--mat-ink);border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.stepcard .row{display:flex;align-items:center;gap:12px}
+.stepcard .count{font-size:12px;opacity:.75;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stepcard .text{font-family:var(--display);font-size:22px;line-height:1.15;flex:1;min-width:0;text-wrap:balance}
+.stepcard .btns{display:flex;gap:8px}
+.stepcard .btns button{border:0;border-radius:999px;padding:8px 16px;cursor:pointer;font-weight:600;font-size:13px}
+.back{background:rgba(255,255,255,.14);color:var(--mat-ink)}
+.next{background:var(--mark);color:#1E1C0E}
+.stepcard button:disabled{opacity:.35;cursor:default}
+.pips{display:flex;gap:6px}
+.pips i{width:22px;height:4px;border-radius:2px;background:rgba(255,255,255,.22)}
+.pips i.on{background:var(--mark)}
+input[type=range]{width:100%;accent-color:var(--mark)}
+
+/* Options sheet */
+#sheet{background:var(--sheet);border-left:1px solid var(--line);overflow:auto;padding:24px 22px 28px;display:flex;flex-direction:column;gap:22px;min-width:0}
+#sheet header h2{font-family:var(--display);font-weight:400;font-size:30px;margin:0;line-height:1}
+#sheet header p{margin:6px 0 0;color:var(--muted);line-height:1.45;max-width:36ch}
+.group{display:flex;flex-direction:column;gap:9px}
+.group > label, .group > .label{font-weight:600;font-size:13px}
+.sw{display:flex;flex-wrap:wrap;gap:8px}
+.sw button{width:34px;height:34px;border-radius:50%;border:1px solid rgba(0,0,0,.12);cursor:pointer;padding:0;position:relative}
+.sw button[aria-checked="true"]{box-shadow:0 0 0 2px var(--sheet),0 0 0 4px var(--ink)}
+.sw button.match{background:conic-gradient(var(--fur) 0 50%, var(--chip) 0 100%)}
+.seg{display:flex;flex-wrap:wrap;gap:6px}
+.seg button{border:1px solid var(--line);background:var(--chip);border-radius:10px;padding:7px 12px;cursor:pointer;font-weight:500;font-size:13px}
+.seg button[aria-checked="true"]{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.tpls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.tpls button{display:flex;flex-direction:column;align-items:center;text-align:center;gap:4px;padding:8px 4px !important;border:1px solid var(--line);background:var(--chip);border-radius:12px;padding:8px 10px;cursor:pointer;min-width:0}
+.tpls svg{width:30px;height:32px;flex:none;color:var(--muted)}
+.tpls b{display:block;font-family:var(--display);font-weight:400;font-size:18px;line-height:1}
+.tpls small{display:block;color:var(--muted);font-size:11px;line-height:1.2}
+.tpls button[aria-checked="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);background:var(--sheet)}
+.tpls button[aria-checked="true"] svg{color:var(--accent)}
+.toggles{display:flex;flex-direction:column;gap:8px}
+.toggles label{display:flex;align-items:center;gap:10px;cursor:pointer}
+.toggles input{width:16px;height:16px;accent-color:var(--accent)}
+#name{border:1px solid var(--line);background:var(--chip);border-radius:10px;padding:9px 12px;width:100%;box-sizing:border-box}
+.row2{display:flex;gap:8px;flex-wrap:wrap}
+.ghost{border:1px solid var(--line);background:transparent;border-radius:999px;padding:8px 14px;cursor:pointer;font-weight:600;font-size:13px}
+.foot{color:var(--muted);font-size:12px;line-height:1.45;border-top:1px solid var(--line);padding-top:14px}
+
+@media (max-width:820px){
+  body{grid-template-columns:minmax(0,1fr);grid-template-rows:62vh auto;overflow:auto;height:auto;min-height:100%}
+  #stage{height:62vh}
+  #sheet{border-left:0;border-top:1px solid var(--line);overflow:visible;padding-inline:16px}
+  .tag{left:16px}
+  .tag h1{font-size:34px}
+  .modes{right:12px;top:12px}
+  .modes button{padding:6px 11px;font-size:12px}
+  .stepcard .text{font-size:19px}
+}
+@media (prefers-reduced-motion: reduce){ .go{transition:none} }
+</style>
+</head>
+<body>
+
+<main id="stage" aria-label="3D paper tray preview">
+  <canvas id="gl"></canvas>
+  <div class="tag"><h1 id="tName">Bubba</h1><p id="tDims">Bear tray, 9 × 6 × 4 cm folded</p></div>
+  <div class="dock">
+    <div id="autoUI" class="autoui">
+      <div class="dockbtns">
+        <button class="go" id="go"><svg class="ico" id="goIcon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg><span id="goLabel">Watch it fold</span></button>
+        <button class="alt" id="stepsBtn">Fold step by step</button>
+      </div>
+      <div class="hint" id="hint"></div>
+    </div>
+    <div id="stepUI" class="stepcard" hidden>
+      <div class="row">
+        <div class="pips" id="pips"></div>
+        <span class="count" id="count">Step 1 of 4</span>
+        <button class="close" id="closeSteps">Close</button>
+      </div>
+      <div class="row">
+        <div class="text" id="stepText"></div>
+        <div class="btns"><button class="back" id="back">Back</button><button class="next" id="next">Next</button></div>
+      </div>
+      <input type="range" id="scrub" min="0" max="4" step="0.01" value="0" aria-label="Scrub through the fold">
+    </div>
+  </div>
+</main>
+
+<aside id="sheet">
+  <header>
+    <h2>Make it yours</h2>
+    <p>Changes show up on the flat sheet and the folded model at the same time.</p>
+  </header>
+  <div class="group"><span class="label" id="l-tpl">Template</span><div class="tpls" id="tpls" role="radiogroup" aria-labelledby="l-tpl"></div></div>
+  <div class="group"><span class="label" id="l-fur">Fur</span><div class="sw" id="fur" role="radiogroup" aria-labelledby="l-fur"></div></div>
+  <div class="group"><span class="label" id="l-box">Accent</span><div class="sw" id="box" role="radiogroup" aria-labelledby="l-box"></div></div>
+  <div class="group"><span class="label" id="l-in">Inside</span><div class="sw" id="inside" role="radiogroup" aria-labelledby="l-in"></div></div>
+  <div class="group"><span class="label" id="l-ears">Ears</span><div class="seg" id="ears" role="radiogroup" aria-labelledby="l-ears"></div></div>
+  <div class="group"><span class="label" id="l-eyes">Eyes</span><div class="seg" id="eyes" role="radiogroup" aria-labelledby="l-eyes"></div></div>
+  <div class="group"><span class="label" id="l-mouth">Mouth</span><div class="seg" id="mouth" role="radiogroup" aria-labelledby="l-mouth"></div></div>
+  <div class="group toggles">
+    <label><input type="checkbox" id="cheeks" checked> Rosy cheeks</label>
+    <label><input type="checkbox" id="muzzle" checked> Muzzle patch</label>
+    <label id="bothRow"><input type="checkbox" id="both"> Face on both ends</label>
+  </div>
+  <div class="group"><label for="name" id="l-name">Name</label><input id="name" maxlength="12" placeholder="e.g. Snacks" autocomplete="off"></div>
+  <div class="row2"><button class="ghost" id="surprise">Surprise me</button><button class="ghost" id="reset">Reset</button></div>
+  <p class="foot">Foldables prototype, 8 templates across 4 box shapes. The fold, the flat sheet and (soon) the printable PDF all come from one template definition.</p>
+</aside>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+const $ = s => document.querySelector(s);
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const PX = 110, INK = "#2A211C";
+
+// ---------- Shared palettes and options ----------
+const FUR = [["Honey","#E2A95B"],["Ginger","#E8955A"],["Lemon","#F5D565"],["Berry","#D8604F"],["Cocoa","#8A5A44"],["Snow","#F1EDE6"],["Blush","#EDB4B0"],["Sage","#A9C3A0"],["Sky","#9DBFE0"]];
+const ACCENT = [["Match the fur","match"],["Kraft","#CDAA7D"],["Paper","#F6F4EF"],["Butter","#F2D98B"],["Sage","#A9C3A0"],["Sky","#9DBFE0"]];
+const INSIDE = [["White","#FBFAF7"],["Kraft","#D9BC93"],["Pink","#F6D3CF"]];
+const EYES = [["dots","Dots"],["shiny","Shiny"],["happy","Happy"],["sleepy","Sleepy"]];
+const MOUTH = [["w","ω"],["smile","Smile"],["oh","Oh"]];
+
+// ---------- Geometry helpers (cm, panel-local: x along the hinge, h away from it) ----------
+const rect = (x0,y0,x1,y1) => [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+const ellipse = (cx,cy,rx,ry,rot=0,n=72) => {
+  const c = Math.cos(rot), s = Math.sin(rot), p = [];
+  for (let i=0;i<n;i++){ const a = i/n*Math.PI*2, x = rx*Math.cos(a), y = ry*Math.sin(a); p.push([cx+x*c-y*s, cy+x*s+y*c]); }
+  return p;
+};
+// A band that flares from wBase at the hinge to wBand, runs to length L and ends in rounded corners of radius rc.
+function band(L, wBase, wBand, flare, rc){
+  const P = [], n = 20, sm = k => k*k*(3-2*k);
+  if (flare > 0) for (let i=0;i<=n;i++){ const k=i/n; P.push([wBase+(wBand-wBase)*sm(k), flare*k]); }
+  else P.push([wBand,0]);
+  for (let i=0;i<=n;i++){ const a = Math.PI/2*i/n; P.push([wBand-rc+rc*Math.cos(a), L-rc+rc*Math.sin(a)]); }
+  for (let i=0;i<=n;i++){ const a = Math.PI/2+Math.PI/2*i/n; P.push([-(wBand-rc)+rc*Math.cos(a), L-rc+rc*Math.sin(a)]); }
+  if (flare > 0) for (let i=n;i>=0;i--){ const k=i/n; P.push([-(wBase+(wBand-wBase)*sm(k)), flare*k]); }
+  else P.push([-wBand,0]);
+  return dedupe(P);
+}
+function dedupe(P){ return P.filter((p,i) => { const q = P[(i+P.length-1)%P.length]; return Math.hypot(p[0]-q[0],p[1]-q[1]) > 1e-5; }); }
+function clipSlab(poly, a, b){
+  const clip = (pts, keep, at) => { const out = []; for (let i=0;i<pts.length;i++){ const P = pts[i], Q = pts[(i+1)%pts.length], pi = keep(P), qi = keep(Q); if (pi) out.push(P); if (pi !== qi) out.push(at(P,Q)); } return out; };
+  const cut = y => (P,Q) => { const t = (y-P[1])/(Q[1]-P[1]); return [P[0]+(Q[0]-P[0])*t, y]; };
+  return dedupe(clip(clip(poly, p => p[1] >= a, cut(a)), p => p[1] <= b, cut(b)));
+}
+// Split a curling flap into strips: a straight run, an arc of k chords (radius R, 90°), then the rest.
+function curlFlap({poly, tex, uv, straight, R, k=9, crease, curl}){
+  const chord = 2*R*Math.sin(Math.PI/(4*k)), cuts = [0, straight];
+  for (let i=1;i<=k;i++) cuts.push(straight + i*chord);
+  cuts.push(1e3);
+  let root = null, parent = null, prevStart = 0;
+  for (let i=0;i<cuts.length-1;i++){
+    const h0 = cuts[i], part = clipSlab(poly, h0, cuts[i+1]);
+    if (part.length < 3) break;
+    const turn = i === 0 ? null : (i === 1 || i === cuts.length-2) ? Math.PI/(4*k) : Math.PI/(2*k);
+    const node = { polys:[part.map(([x,h]) => [x,h-h0])], tex, uv:[uv[0],uv[1],uv[2]-h0,uv[3]-h0], dash: i === 0,
+      fold: i === 0 ? crease : T => turn*curl(T), children: [] };
+    if (!root) root = node; else parent.children.push({at:[0, h0-prevStart], rot:0, node});
+    parent = node; prevStart = h0;
+  }
+  return root;
+}
+
+// ---------- Easing and the step clock ----------
+const clamp = (x,a=0,b=1) => Math.min(b, Math.max(a, x));
+const inOut = x => x<.5 ? 4*x*x*x : 1 - Math.pow(-2*x+2,3)/2;
+const springy = x => { const c2 = .7*1.525; return x<.5 ? (Math.pow(2*x,2)*((c2+1)*2*x-c2))/2 : (Math.pow(2*x-2,2)*((c2+1)*(x*2-2)+c2)+2)/2; };
+const seg = (t,i,len=.82) => clamp((t-i)/len);
+const Q = Math.PI/2;
+
+// ---------- Face painting (shared by characters) ----------
+const faceInk = S => { const [r,g,b] = hex(S.fur); return (.299*r+.587*g+.114*b)/255 < .42 ? "#F7F3EC" : INK; };
+function paintFace(g, X, Y, s, S, f){
+  const ink = faceInk(S);
+  if (S.muzzle && !f.noMuzzle){ g.fillStyle = mix(S.fur, "#FFFFFF", .5); g.beginPath(); g.ellipse(X(0), Y(f.muzzle[1]), f.muzzle[2]*s, f.muzzle[3]*s, 0, 0, Math.PI*2); g.fill(); }
+  if (S.cheeks && !f.noCheeks){ g.fillStyle = "rgba(236,120,120,.42)"; for (const sx of [-1,1]){ g.beginPath(); g.ellipse(X(sx*f.cheek[0]), Y(f.cheek[1]), .42*s, .27*s, 0, 0, Math.PI*2); g.fill(); } }
+  g.fillStyle = ink; g.strokeStyle = ink; g.lineCap = "round"; g.lineWidth = .13*s;
+  if (!f.noEyes) for (const sx of [-1,1]){
+    const ex = X(sx*f.eye[0]), ey = Y(f.eye[1]);
+    if (S.eyes === "dots"){ g.beginPath(); g.arc(ex, ey, .21*s, 0, Math.PI*2); g.fill(); }
+    if (S.eyes === "shiny"){ g.fillStyle = INK; g.beginPath(); g.arc(ex, ey, .28*s, 0, Math.PI*2); g.fill(); g.fillStyle = "#fff"; g.beginPath(); g.arc(ex-.09*s, ey-.1*s, .085*s, 0, Math.PI*2); g.fill(); g.fillStyle = ink; }
+    if (S.eyes === "happy"){ g.beginPath(); g.arc(ex, ey+.12*s, .26*s, Math.PI+.35, Math.PI*2-.35); g.stroke(); }
+    if (S.eyes === "sleepy"){ g.beginPath(); g.arc(ex, ey-.12*s, .26*s, .35, Math.PI-.35); g.stroke(); }
+  }
+  if (f.noNose && f.noMouth) return;
+  const [nx, ny] = f.nose;
+  if (!f.noNose){ g.fillStyle = f.noseColor || ink; g.beginPath(); g.ellipse(X(nx), Y(ny), f.noseSize[0]*s, f.noseSize[1]*s, 0, 0, Math.PI*2); g.fill(); }
+  if (f.noMouth) return;
+  g.lineWidth = .1*s; g.strokeStyle = ink;
+  const my = ny - .17;
+  if (S.mouth === "w"){ g.beginPath(); g.moveTo(X(0),Y(my)); g.lineTo(X(0),Y(my-.2)); g.stroke();
+    for (const sx of [-1,1]){ g.beginPath(); g.arc(X(sx*.21), Y(my-.23), .21*s, .15, Math.PI-.15); g.stroke(); } }
+  if (S.mouth === "smile"){ g.beginPath(); g.arc(X(0), Y(my+.05), .5*s, .28*Math.PI, .72*Math.PI); g.stroke(); }
+  if (S.mouth === "oh"){ g.fillStyle = "#7A3B35"; g.beginPath(); g.ellipse(X(0), Y(my-.38), .17*s, .21*s, 0, 0, Math.PI*2); g.fill(); }
+}
+
+// ---------- Box shape: tray (character walls at both ends, glue tabs, plain long sides) ----------
+function trayTemplate(cfg){
+  const W = 9, D = 6, H = 4, E = .05, TAB = 1.55;
+  return {
+    ...cfg.meta, ears: cfg.ears, defaults: cfg.defaults, hasBoth: true,
+    accentLabel:"Tray sides", nameLabel:"Name on the sides", namePlaceholder:"e.g. Snacks",
+    steps:[
+      "Cut along the edge, then flip it so the print faces down.",
+      `Fold both ${cfg.animal} walls up.`,
+      "Fold the corner tabs in. Dab a little glue on each.",
+      "Fold the long sides up and press them onto the tabs."
+    ],
+    icon: () => cfg.headPolys(cfg.defaults.ears),
+    build(S){
+      const polys = cfg.headPolys(S.ears), top = Math.max(...polys.flat().map(p => p[1]));
+      const wall = T => Q*springy(seg(T,1)), tab = T => Q*Math.min(1, springy(seg(T,2))), side = T => Q*Math.min(1.02, springy(seg(T,3)));
+      const tabs = [
+        {at:[W/2,0], rot:Q, node:{polys:[[[-.25,0],[-(H-.3),0],[-(H-.7),TAB],[-.6,TAB]]], tex:"tab", uv:[-H,0,0,TAB], dash:true, fold:tab}},
+        {at:[-W/2,0], rot:-Q, node:{polys:[[[.25,0],[H-.3,0],[H-.7,TAB],[.6,TAB]]], tex:"tab", uv:[0,H,0,TAB], dash:true, fold:tab}}
+      ];
+      const head = tex => ({polys, tex, uv:[-W/2,W/2,0,top], dash:true, fold:wall, children:tabs});
+      const sideNode = {polys:[rect(-D/2,0,D/2,H)], tex:"side", uv:[-D/2,D/2,0,H], dash:true, fold:side};
+      const root = {polys:[rect(-W/2-E,-D/2,W/2+E,D/2)], tex:"base", uv:[-W/2-E,W/2+E,-D/2,D/2], children:[
+        {at:[0,D/2], rot:0, node:head("headF")}, {at:[0,-D/2], rot:Math.PI, node:head("headB")},
+        {at:[W/2+E,0], rot:Q, node:sideNode}, {at:[-W/2-E,0], rot:-Q, node:sideNode}]};
+      const drawHead = face => (g,c) => {
+        paper(g, c, S.fur);
+        cfg.paintHead(g, x => (x+W/2)*PX, h => (top-h)*PX, S, face);
+      };
+      return { root, tex: {
+        headF:{w:W, h:top, draw:drawHead(true)},
+        headB:{w:W, h:top, draw:drawHead(S.both)},
+        side:{w:D, h:H, draw:(g,c) => { paper(g, c, accent(S)); nameText(g, c, S.name, 0, 0); }},
+        tab:{w:H, h:TAB, draw:(g,c) => glue(g, c, S.fur)},
+        base:{w:W+2*E, h:D, draw:(g,c) => paper(g, c, accent(S))}
+      }};
+    }
+  };
+}
+
+// ---------- Template: Bubba, the bear tray ----------
+const BUBBA = (() => {
+  const W = 9, H = 4;
+  const EARS = { round:{r:.95,cx:2.45,cy:H+1.65}, tiny:{r:.6,cx:2.55,cy:H+1.55}, big:{r:1.28,cx:2.6,cy:H+1.7}, none:null };
+  const headPolys = ears => { const e = EARS[ears], P = [rect(-W/2,0,W/2,H), ellipse(0,H,3.5,2.3)];
+    if (e) for (const sx of [-1,1]) P.push(ellipse(sx*e.cx, e.cy, e.r, e.r)); return P; };
+  return trayTemplate({
+    meta:{id:"bubba", name:"Bubba", kind:"Bear tray", dims:"Bear tray, 9 × 6 × 4 cm folded"}, animal:"bear",
+    ears:[["round","Round"],["tiny","Tiny"],["big","Big"],["none","None"]],
+    defaults:{fur:"#E2A95B",accent:"match",inside:"#FBFAF7",ears:"round",eyes:"dots",mouth:"w",cheeks:true,muzzle:true,both:false,name:""},
+    headPolys,
+    paintHead(g, X, Y, S, face){
+      const e = EARS[S.ears];
+      if (e){ g.fillStyle = mix(S.fur,"#F7C6B8",.55); for (const sx of [-1,1]){ g.beginPath(); g.arc(X(sx*e.cx), Y(e.cy+.05), e.r*.55*PX, 0, Math.PI*2); g.fill(); } }
+      if (face) paintFace(g, X, Y, PX, S, {eye:[1.15,H+.55], nose:[0,H+.02], noseSize:[.34,.23], muzzle:[0,H-.22,1.2,.82], cheek:[1.95,H-.1]});
+    }
+  });
+})();
+
+// ---------- Template: Kit, the cat tray ----------
+const KIT = (() => {
+  const W = 9, H = 4;
+  const EARS = {
+    pointy:[[.9,H+1.5],[3.1,H+.35],[2.35,H+3.1]],
+    tall:[[.95,H+1.5],[3.05,H+.35],[2.5,H+3.9]],
+    folded:[[.9,H+1.5],[3.1,H+.35],[3.05,H+2.2],[2.15,H+2.6]]
+  };
+  const ear = (ears, sx) => EARS[ears].map(([x,y]) => [sx*x, y]);
+  const headPolys = ears => [rect(-W/2,0,W/2,H), ellipse(0,H,3.5,2.0), ear(ears,1), ear(ears,-1)];
+  return trayTemplate({
+    meta:{id:"kit", name:"Kit", kind:"Cat tray", dims:"Cat tray, 9 × 6 × 4 cm folded"}, animal:"cat",
+    ears:[["pointy","Pointy"],["tall","Tall"],["folded","Folded"]],
+    defaults:{fur:"#E8955A",accent:"#A9C3A0",inside:"#FBFAF7",ears:"pointy",eyes:"shiny",mouth:"w",cheeks:true,muzzle:true,both:false,name:""},
+    headPolys,
+    paintHead(g, X, Y, S, face){
+      g.fillStyle = mix(S.fur,"#F4A9B4",.5);
+      for (const sx of [-1,1]){
+        const P = ear(S.ears, sx), cx = P.reduce((a,p) => a+p[0], 0)/P.length, cy = P.reduce((a,p) => a+p[1], 0)/P.length;
+        g.beginPath(); P.forEach(([x,y],i) => { const px = X(cx+(x-cx)*.55), py = Y(cy+(y-cy)*.55+.1); i ? g.lineTo(px,py) : g.moveTo(px,py); }); g.closePath(); g.fill();
+      }
+      g.strokeStyle = mix(S.fur, INK, .28); g.lineWidth = .14*PX; g.lineCap = "round";
+      for (const [x,y,l] of [[-.5,H+1.55,.4],[0,H+1.75,.5],[.5,H+1.55,.4]]){ g.beginPath(); g.moveTo(X(x),Y(y)); g.lineTo(X(x),Y(y-l)); g.stroke(); }
+      if (!face) return;
+      paintFace(g, X, Y, PX, S, {eye:[1.2,H+.6], nose:[0,H+.05], noseSize:[.22,.15], noseColor:"#E58A95", muzzle:[0,H-.25,1.05,.65], cheek:[2.05,H-.12]});
+      g.strokeStyle = faceInk(S); g.lineWidth = .05*PX;
+      for (const sx of [-1,1]) for (const dy of [.15,-.15,-.45]){ g.beginPath(); g.moveTo(X(sx*1.25), Y(H-.15+dy*.4)); g.lineTo(X(sx*2.75), Y(H-.15+dy)); g.stroke(); }
+    }
+  });
+})();
+
+// ---------- Template: Bao, the panda tray ----------
+const BAO = (() => {
+  const W = 9, H = 4;
+  const EARS = { round:{r:.95,cx:2.45,cy:H+1.7}, tiny:{r:.65,cx:2.5,cy:H+1.6}, big:{r:1.25,cx:2.55,cy:H+1.75} };
+  const headPolys = ears => { const e = EARS[ears]; return [rect(-W/2,0,W/2,H), ellipse(0,H,3.5,2.3), ...[-1,1].map(sx => ellipse(sx*e.cx, e.cy, e.r, e.r))]; };
+  const dark = S => mix(S.fur, "#26221F", .88);
+  return trayTemplate({
+    meta:{id:"bao", name:"Bao", kind:"Panda tray", dims:"Panda tray, 9 × 6 × 4 cm folded"}, animal:"panda",
+    ears:[["round","Round"],["tiny","Tiny"],["big","Big"]],
+    defaults:{fur:"#F1EDE6",accent:"#A9C3A0",inside:"#FBFAF7",ears:"round",eyes:"shiny",mouth:"w",cheeks:true,muzzle:false,both:false,name:""},
+    headPolys,
+    paintHead(g, X, Y, S, face){
+      const e = EARS[S.ears];
+      g.fillStyle = dark(S); for (const sx of [-1,1]){ g.beginPath(); g.arc(X(sx*e.cx), Y(e.cy), (e.r+.05)*PX, 0, Math.PI*2); g.fill(); }
+      g.fillStyle = S.fur; g.beginPath(); g.ellipse(X(0), Y(H), 3.5*PX, 2.3*PX, 0, 0, Math.PI*2); g.fill();
+      g.fillRect(0, Y(H), X(W/2), Y(0) - Y(H));
+      if (!face) return;
+      g.fillStyle = dark(S);
+      for (const sx of [-1,1]){ g.beginPath(); g.ellipse(X(sx*1.2), Y(H+.45), .62*PX, .45*PX, sx*-.55, 0, Math.PI*2); g.fill(); }
+      paintFace(g, X, Y, PX, {...S, fur:"#26221F"}, {eye:[1.2,H+.5], noNose:true, noMouth:true, noMuzzle:true, noCheeks:true});
+      paintFace(g, X, Y, PX, S, {noEyes:true, nose:[0,H-.1], noseSize:[.3,.2], muzzle:[0,H-.3,1.1,.75], cheek:[2.05,H-.25]});
+    }
+  });
+})();
+
+// ---------- Template: Bun, the bunny wrap ----------
+const BUN = (() => {
+  const W = 6, D = 5, H = 4.5, r = 1.1, d = .06, K = 9, HW = W/2 - .06;
+  const EARS = {
+    tall:[[1.15,H+3.05,.72,2.05,-.07]],
+    short:[[1.2,H+2.05,.72,1.25,-.14]],
+    lop:[[1.95,H+1.55,.62,1.85,-.8]]
+  };
+  const earList = ears => EARS[ears][0] && [-1,1].map(sx => { const [x,y,rx,ry,rot] = EARS[ears][0]; return [sx*x, y, rx, ry, sx*rot]; });
+  const headPolys = ears => [rect(-W/2,0,W/2,H), ellipse(0,H,W/2,1.5), ...earList(ears).map(e => ellipse(...e))];
+  // Unrolled lengths
+  const chord = R => 2*R*Math.sin(Math.PI/(4*K));
+  const backStraight = H - r, backLen = backStraight + K*chord(r) + (D - r - .12);
+  const armR = r + d, armTail = W/2 - r + .25;
+  const armStraightR = H - r, armStraightL = H - r + d;
+  const armLen = s => s + K*chord(armR) + armTail;
+  const armMax = armLen(armStraightL);
+  return {
+    id:"bun", name:"Bun", kind:"Bunny wrap", dims:"Bunny wrap, 6 × 5 × 4.5 cm folded",
+    accentLabel:"Arms", nameLabel:"Name on top", namePlaceholder:"e.g. Hops", hasBoth:false,
+    ears:[["tall","Tall"],["short","Short"],["lop","Floppy"]],
+    defaults:{fur:"#F1EDE6",accent:"#9DBFE0",inside:"#F6D3CF",ears:"tall",eyes:"dots",mouth:"w",cheeks:true,muzzle:false,both:false,name:""},
+    steps:[
+      "Cut along the edge and the two arm slots, then flip it so the print faces down.",
+      "Fold the face and the back up.",
+      "Curl the back over the top and tuck it behind the face.",
+      "Wrap both arms up and over, then hook the slots together."
+    ],
+    icon: () => headPolys("tall"),
+    build(S){
+      const polys = headPolys(S.ears), top = Math.max(...polys.flat().map(p => p[1]));
+      const up = T => Q*springy(seg(T,1));
+      const backRoot = curlFlap({ poly: band(backLen, HW, HW, 0, .9), tex:"back", uv:[-HW,HW,0,backLen],
+        straight: backStraight, R: r, k: K, crease: up, curl: T => inOut(seg(T,2)) });
+      const arm = (straight, delay) => curlFlap({ poly: band(armLen(straight), D/2-.15, 1.3, 1.7, 1.3), tex:"arm", uv:[-D/2,D/2,0,armMax],
+        straight, R: armR, k: K,
+        crease: T => Q*Math.min(1, springy(clamp(seg(T,3+delay)/.5))),
+        curl: T => inOut(clamp((seg(T,3+delay)-.32)/.68)) });
+      const root = {polys:[rect(-W/2-d,-D/2,W/2+d,D/2)], tex:"base", uv:[-W/2-d,W/2+d,-D/2,D/2], children:[
+        {at:[0,D/2], rot:0, node:{polys, tex:"face", uv:[-W/2,W/2,0,top], dash:true, fold:up}},
+        {at:[0,-D/2], rot:Math.PI, node:backRoot},
+        {at:[W/2+d,0], rot:Q, node:arm(armStraightR, 0)},
+        {at:[-W/2-d,0], rot:-Q, node:arm(armStraightL, .14)}]};
+      return { root, tex: {
+        face:{w:W, h:top, draw:(g,c) => {
+          const X = x => (x+W/2)*PX, Y = h => (top-h)*PX;
+          paper(g, c, S.fur);
+          g.fillStyle = mix(S.fur,"#F4A9B4",.5);
+          for (const [x,y,rx,ry,rot] of earList(S.ears)){ g.beginPath(); g.ellipse(X(x), Y(y+.15), rx*.48*PX, ry*.74*PX, -rot, 0, Math.PI*2); g.fill(); }
+          paintFace(g, X, Y, PX, S, {eye:[1.2,H-.3], nose:[0,H-.95], noseSize:[.24,.17], noseColor:"#D98290", muzzle:[0,H-1.15,1,.62], cheek:[1.95,H-1.15]});
+        }},
+        back:{w:2*HW, h:backLen, draw:(g,c) => {
+          const X = x => (x+HW)*PX, Y = h => (backLen-h)*PX;
+          paper(g, c, S.fur);
+          g.fillStyle = mix(S.fur,"#FFFFFF",.75); g.strokeStyle = mix(S.fur,INK,.18); g.lineWidth = 3;
+          for (const [dx,dy,rr] of [[0,0,.62],[-.42,.25,.36],[.42,.25,.36],[0,.48,.38],[-.3,-.35,.34],[.32,-.36,.34]]){ g.beginPath(); g.arc(X(dx), Y(1.6+dy), rr*PX, 0, Math.PI*2); g.fill(); }
+          nameText(g, c, S.name, 0, (backLen - (D-r-.12)/2), true, X, Y);
+        }},
+        arm:{w:D, h:armMax, draw:(g,c) => {
+          const X = x => (x+D/2)*PX, Y = h => (armMax-h)*PX;
+          paper(g, c, accent(S));
+          const ph = armMax - 1.6;
+          g.fillStyle = mix(accent(S),"#F4A9B4",.55);
+          g.beginPath(); g.ellipse(X(0), Y(ph-.15), .55*PX, .42*PX, 0, 0, Math.PI*2); g.fill();
+          for (const [dx,dy] of [[-.5,.45],[0,.62],[.5,.45]]){ g.beginPath(); g.arc(X(dx), Y(ph+dy), .2*PX, 0, Math.PI*2); g.fill(); }
+          g.strokeStyle = "rgba(42,33,28,.7)"; g.lineWidth = .07*PX; g.lineCap = "round";
+          g.beginPath(); g.moveTo(X(-.55), Y(armMax-.55)); g.lineTo(X(.55), Y(armMax-.55)); g.stroke();
+        }},
+        base:{w:W+2*d, h:D, draw:(g,c) => paper(g, c, accent(S))}
+      }};
+    }
+  };
+})();
+
+// An open box (cup) with glue tabs on the end walls and the sides folding over them.
+function cup({S, H, wallPolys, uvTop, tex, step}){
+  const E = .05, TAB = 1.5, Ht = H - .3, e = T => seg(T, step);
+  const wA = T => Q*springy(clamp(e(T)/.42));
+  const tb = T => Q*Math.min(1, inOut(clamp((e(T)-.36)/.26)));
+  const wB = T => Q*Math.min(1.02, springy(clamp((e(T)-.6)/.4)));
+  const tabs = [
+    {at:[S/2,0], rot:Q, node:{polys:[[[-.25,0],[-Ht,0],[-(Ht-.4),TAB],[-.6,TAB]]], tex:tex.tab, uv:[-H,0,0,TAB], dash:true, fold:tb}},
+    {at:[-S/2,0], rot:-Q, node:{polys:[[[.25,0],[Ht,0],[Ht-.4,TAB],[.6,TAB]]], tex:tex.tab, uv:[0,H,0,TAB], dash:true, fold:tb}}
+  ];
+  const wall = (t, fold, kids) => ({polys:[wallPolys], tex:t, uv:[-S/2,S/2,0,uvTop], dash:true, fold, children:kids});
+  return {polys:[rect(-S/2-E,-S/2,S/2+E,S/2)], tex:tex.bottom, uv:[-S/2-E,S/2+E,-S/2,S/2], children:[
+    {at:[0,S/2], rot:0, node:wall(tex.front, wA, tabs)}, {at:[0,-S/2], rot:Math.PI, node:wall(tex.back, wA, tabs)},
+    {at:[S/2+E,0], rot:Q, node:wall(tex.side, wB)}, {at:[-S/2-E,0], rot:-Q, node:wall(tex.side, wB)}]};
+}
+
+// ---------- Box shape: two-piece cube (base + a lid that turns over and slides on) ----------
+function cubeTemplate(cfg){
+  const SB = 6, HB = 4.6, SL = 6.35, HL = cfg.HL, AMP = cfg.AMP ?? .5, XB = -8, XL = 7;
+  const HEMS = {
+    wavy: u => HL + AMP*(.5 + .5*Math.cos(2*Math.PI*3*u)),
+    scallop: u => { const t = (u*4) % 1; return HL + AMP*Math.sqrt(Math.max(0, 1 - (2*t-1)**2)); },
+    drippy: u => HL + [[.17,.8,.06],[.4,.4,.055],[.62,.95,.065],[.84,.5,.055]].reduce((s,[c,a,w]) => s + a*Math.exp(-(((u-c)/w)**2)), 0),
+    straight: () => HL
+  };
+  const hemPoly = style => { const P = [[-SL/2,0],[SL/2,0]], n = 120; for (let i=0;i<=n;i++){ const u = 1-i/n; P.push([-SL/2+u*SL, HEMS[style](u)]); } return P; };
+  return {
+    ...cfg.meta, ears: cfg.edges, earsLabel: cfg.edgeLabel, mouths: cfg.mouths, mouthLabel: cfg.mouthLabel,
+    defaults: cfg.defaults, hasBoth: cfg.hasBoth ?? true,
+    steps: [
+      cfg.firstStep || "Cut out both pieces, then flip them so the print faces down.",
+      "Fold up the base: end walls first, then the glue tabs, then the sides.",
+      "Fold up the lid the same way.",
+      "Turn the lid over and slide it down onto the base.",
+      ...(cfg.extraSteps || [])
+    ],
+    icon: () => cfg.icon(hemPoly, SL),
+    build(S){
+      const lidPoly = hemPoly(S.ears), top = Math.max(...lidPoly.map(p => p[1]));
+      const ctx = {S, SB, HB, SL, HL, top};
+      const base = cup({S:SB, H:HB, wallPolys:rect(-SB/2,0,SB/2,HB), uvTop:HB, step:1,
+        tex:{bottom:"bBottom", front:"bFront", back:"bBack", side:"bSide", tab:"bTab"}});
+      const lid = cup({S:SL, H:HL, wallPolys:lidPoly, uvTop:top, step:2,
+        tex:{bottom:"lTop", front:"lFront", back:"lBack", side:"lSide", tab:"lTab"}});
+      if (cfg.lidExtras) lid.children.push(...cfg.lidExtras(ctx));
+      const travel = T => inOut(clamp((seg(T,3,.9)-.05)/.5));
+      const pieces = [
+        {node: base, at:[XB,0], move: T => ({x: XB*(1-travel(T))})},
+        {node: lid, at:[XL,0], move: T => {
+          const e = seg(T,3,.9), a = inOut(clamp(e/.35)), b = inOut(clamp((e-.2)/.4)), c = inOut(clamp((e-.58)/.42));
+          const high = a*(HB+top+1.3);
+          return {x: XL*(1-travel(T)), y: high + (HB+.03-high)*c, rz: Math.PI*b};
+        }}
+      ];
+      // The lid hangs upside down once closed, so its walls are painted rotated 180° (v = height above the hem, as seen).
+      const lidWall = which => (g,c) => {
+        paper(g, c, S.fur);
+        g.save(); g.translate(c.width, c.height); g.rotate(Math.PI);
+        cfg.paintLid(g, x => (x+SL/2)*PX, v => (top-v)*PX, which, ctx);
+        g.restore();
+      };
+      const baseWall = which => (g,c) => { paper(g, c, accent(S)); cfg.paintBase(g, c, x => (x+SB/2)*PX, h => (HB-h)*PX, which, ctx); };
+      return { pieces, tex: {
+        bBottom:{w:SB+.1, h:SB, draw:(g,c) => paper(g, c, accent(S))},
+        bFront:{w:SB, h:HB, draw:baseWall("front")}, bBack:{w:SB, h:HB, draw:baseWall("back")}, bSide:{w:SB, h:HB, draw:baseWall("side")},
+        bTab:{w:HB, h:1.5, draw:(g,c) => glue(g, c, accent(S))},
+        lTop:{w:SL+.1, h:SL, draw:(g,c) => { paper(g, c, S.fur); if (cfg.paintTop) cfg.paintTop(g, c, ctx); }},
+        lFront:{w:SL, h:top, draw:lidWall("front")}, lBack:{w:SL, h:top, draw:lidWall("back")}, lSide:{w:SL, h:top, draw:lidWall("side")},
+        lTab:{w:HL, h:1.5, draw:(g,c) => glue(g, c, S.fur)},
+        ...(cfg.extraTex ? cfg.extraTex(ctx) : {})
+      }};
+    }
+  };
+}
+const spot = (g, x, y, r) => { g.beginPath(); g.arc(x, y, r, 0, Math.PI*2); g.fill(); };
+
+// ---------- Template: Boo, the ghost cube ----------
+const BOO = cubeTemplate({
+  meta:{id:"boo", name:"Boo", kind:"Ghost cube", dims:"Ghost cube, 6.4 × 6.4 × 4.6 cm closed",
+    accentLabel:"Base", nameLabel:"Name on the base", namePlaceholder:"e.g. Treats"},
+  HL:2.6, edgeLabel:"Hem",
+  edges:[["wavy","Wavy"],["scallop","Scallops"],["drippy","Drippy"],["straight","Straight"]],
+  defaults:{fur:"#F1EDE6",accent:"#9DBFE0",inside:"#FBFAF7",ears:"wavy",eyes:"dots",mouth:"oh",cheeks:true,muzzle:false,both:false,name:""},
+  icon: (hemPoly, SL) => { const P = hemPoly("wavy"), top = Math.max(...P.map(p => p[1])); return [P.map(([x,y]) => [x, top-y]), ellipse(0, top, SL/2, 2.4, 0, 48)]; },
+  paintLid(g, X, Y, which, {S, top}){
+    if (which === "front" || (which === "back" && S.both))
+      paintFace(g, X, Y, PX, S, {eye:[1.1, top-1.0], nose:[0, top-1.5], noseSize:[.001,.001], muzzle:[0, top-1.75, .9, .55], cheek:[1.85, top-1.6]});
+  },
+  paintBase(g, c, X, Y, which, {S, SB}){
+    g.fillStyle = mix(accent(S), "#FFFFFF", .45);
+    for (let row=0; row<6; row++) for (let col=0; col<8; col++){
+      const x = -SB/2 + .4 + col*.75 + (row%2)*.375, h = .35 + row*.75;
+      if (S.name.trim() && h < 1.5) continue;
+      spot(g, X(x), Y(h), .1*PX);
+    }
+    nameText(g, c, S.name, 0, .8, false, X, Y, .85);
+  }
+});
+
+// ---------- Template: Ribbit, the frog cube (pop-up eyes on the lid) ----------
+const RIBBIT = cubeTemplate({
+  meta:{id:"ribbit", name:"Ribbit", kind:"Frog cube", dims:"Frog cube, 6.4 × 6.4 × 6.5 cm with eyes up",
+    accentLabel:"Base", nameLabel:"Name on the base", namePlaceholder:"e.g. Flies"},
+  HL:2.4, edgeLabel:"Edge",
+  edges:[["scallop","Scallops"],["wavy","Wavy"],["straight","Straight"]],
+  defaults:{fur:"#A9C3A0",accent:"#F2D98B",inside:"#FBFAF7",ears:"scallop",eyes:"shiny",mouth:"smile",cheeks:true,muzzle:false,both:false,name:""},
+  firstStep:"Cut out both pieces and around the eyes, then flip them so the print faces down.",
+  extraSteps:["Pop the eyes up."],
+  icon: () => [rect(-3,0,3,3), ellipse(-1.6,3.1,1.1,1.1), ellipse(1.6,3.1,1.1,1.1)],
+  lidExtras: ({SL}) => [{at:[0, SL/2-.7, -.015], rot:Math.PI, node:{
+    polys:[rect(-2.1,0,2.1,.9), ellipse(-1.25,1.0,.95,.95), ellipse(1.25,1.0,.95,.95)],
+    tex:"eyes", uv:[-2.2,2.2,0,1.95], dash:true, fold: T => -Q*springy(seg(T,4))}}],
+  extraTex: ({S}) => ({ eyes:{w:4.4, h:1.95, draw:(g,c) => {
+    const X = x => (x+2.2)*PX, Y = h => (1.95-h)*PX;
+    paper(g, c, S.fur);
+    g.fillStyle = "#FFFDF8"; for (const sx of [-1,1]) spot(g, X(sx*1.25), Y(1.05), .66*PX);
+    paintFace(g, X, Y, PX, S, {eye:[1.25,1.05], noNose:true, noMouth:true, noMuzzle:true, noCheeks:true});
+  }}}),
+  paintLid(g, X, Y, which, {S, top}){
+    if (which === "front" || (which === "back" && S.both)){
+      g.fillStyle = faceInk(S); for (const sx of [-1,1]) spot(g, X(sx*.28), Y(top-.55), .07*PX);
+      paintFace(g, X, Y, PX, S, {noEyes:true, nose:[0, top-.95], noseSize:[.001,.001], muzzle:[0, top-1.25, 1.1, .6], cheek:[2.0, top-1.15]});
+    } else {
+      g.fillStyle = mix(S.fur, INK, .14);
+      for (const [x,v,r] of [[-1.8,top-.9,.32],[1.2,top-1.4,.24],[2.3,top-.6,.18],[-.4,top-1.7,.2]]) spot(g, X(x), Y(v), r*PX);
+    }
+  },
+  paintBase(g, c, X, Y, which, {S}){
+    g.strokeStyle = mix(accent(S), "#FFFFFF", .5); g.lineWidth = .08*PX;
+    for (const h of [.35,.6]){ g.beginPath(); for (let x=-3; x<=3; x+=.05) g.lineTo(X(x), Y(h + .08*Math.sin(x*4))); g.stroke(); }
+    if (which === "front") nameText(g, c, S.name, 0, 1.15, false, X, Y, .7);
+  }
+});
+
+// ---------- Template: Shroom, the mushroom house cube ----------
+const SHROOM = cubeTemplate({
+  meta:{id:"shroom", name:"Shroom", kind:"Mushroom house", dims:"Mushroom house, 6.4 × 6.4 × 4.6 cm closed",
+    accentLabel:"House", nameLabel:"Name on the back", namePlaceholder:"e.g. Home"},
+  HL:2.2, AMP:.45, edgeLabel:"Cap edge", hasBoth:false,
+  edges:[["scallop","Scallops"],["wavy","Wavy"],["straight","Straight"]],
+  defaults:{fur:"#D8604F",accent:"#F6F4EF",inside:"#D9BC93",ears:"scallop",eyes:"dots",mouth:"smile",cheeks:true,muzzle:false,both:false,name:""},
+  icon: () => [ellipse(0,3,3.3,2.1), rect(-1.7,0,1.7,3)],
+  paintTop(g, c, {S}){
+    g.fillStyle = mix(S.fur, "#FFFFFF", .85);
+    for (const [u,v,r] of [[.25,.3,.7],[.7,.22,.5],[.5,.6,.85],[.18,.78,.45],[.82,.72,.6]]) spot(g, c.width*u, c.height*v, r*PX);
+  },
+  paintLid(g, X, Y, which, {S, top}){
+    g.fillStyle = mix(S.fur, "#FFFFFF", .85);
+    const spots = which === "front" ? [[-2.55,top-.55,.3],[2.6,top-1.5,.26],[2.3,top-.45,.18]]
+      : [[-1.9,top-.8,.45],[.6,top-.6,.3],[2.1,top-1.5,.38],[-.5,top-1.7,.25],[-2.7,top-1.8,.2]];
+    for (const [x,v,r] of spots) spot(g, X(x), Y(v), r*PX);
+    if (which === "front") paintFace(g, X, Y, PX, S, {eye:[1.0, top-.95], nose:[0, top-1.4], noseSize:[.001,.001], muzzle:[0, top-1.6, .8, .5], cheek:[1.7, top-1.45]});
+  },
+  paintBase(g, c, X, Y, which, {S}){
+    g.fillStyle = "#8DB27A"; g.fillRect(0, Y(.22), c.width, c.height);
+    const wood = "#9A6B4F";
+    if (which === "front"){
+      g.fillStyle = wood; g.beginPath(); g.moveTo(X(-.62), Y(.22)); g.lineTo(X(-.62), Y(1.15)); g.arc(X(0), Y(1.15), .62*PX, Math.PI, 0); g.lineTo(X(.62), Y(.22)); g.closePath(); g.fill();
+      g.fillStyle = "#E8B93A"; spot(g, X(.38), Y(.8), .07*PX);
+    }
+    if (which === "side"){
+      g.fillStyle = "#BFD9EE"; spot(g, X(0), Y(1.1), .42*PX);
+      g.strokeStyle = wood; g.lineWidth = .08*PX; g.beginPath(); g.arc(X(0), Y(1.1), .42*PX, 0, Math.PI*2); g.stroke();
+      g.beginPath(); g.moveTo(X(-.42), Y(1.1)); g.lineTo(X(.42), Y(1.1)); g.moveTo(X(0), Y(.68)); g.lineTo(X(0), Y(1.52)); g.stroke();
+    }
+    if (which === "back") nameText(g, c, S.name, 0, 1.05, false, X, Y, .7);
+  }
+});
+
+// ---------- Box shape + template: Peep, the chick pyramid ----------
+const PEEP = (() => {
+  const s = 6, L = 7, FOLD = Math.PI - Math.acos((s/2)/L);
+  const TUFTS = { curl:[ellipse(0,L+.3,.32,.42)], three:[ellipse(-.38,L+.35,.17,.5,.5), ellipse(0,L+.5,.17,.58), ellipse(.38,L+.35,.17,.5,-.5)], none:[] };
+  const tri = [[-s/2,0],[s/2,0],[0,L]];
+  return {
+    id:"peep", name:"Peep", kind:"Chick pyramid", dims:"Chick pyramid, 6 × 6 × 6.3 cm folded",
+    accentLabel:"Wings", nameLabel:"Name on the back", namePlaceholder:"e.g. Eggs", hasBoth:false,
+    earsLabel:"Tuft", ears:[["curl","Curl"],["three","Feathers"],["none","None"]],
+    mouthLabel:"Beak", mouths:[["closed","Closed"],["open","Open"],["chirp","Chirp"]],
+    defaults:{fur:"#F5D565",accent:"match",inside:"#FBFAF7",ears:"curl",eyes:"shiny",mouth:"closed",cheeks:true,muzzle:false,both:false,name:""},
+    steps:[
+      "Cut along the edge, then flip it so the print faces down.",
+      "Fold the front and back up until they lean in.",
+      "Fold the sides up so all four tips meet. A dab of glue holds the point."
+    ],
+    icon: () => [tri, ...TUFTS.curl],
+    build(S){
+      const front = [tri, ...TUFTS[S.ears]], top = Math.max(...front.flat().map(p => p[1]));
+      const ends = T => FOLD*inOut(seg(T,1)), sides = T => FOLD*inOut(seg(T,2));
+      const face = (polys, tex, fold, h) => ({polys, tex, uv:[-s/2,s/2,0,h], dash:true, fold});
+      const root = {polys:[rect(-s/2,-s/2,s/2,s/2)], tex:"base", uv:[-s/2,s/2,-s/2,s/2], children:[
+        {at:[0,s/2], rot:0, node:face(front, "front", ends, top)}, {at:[0,-s/2], rot:Math.PI, node:face([tri], "back", ends, L)},
+        {at:[s/2,0], rot:Q, node:face([tri], "side", sides, L)}, {at:[-s/2,0], rot:-Q, node:face([tri], "side", sides, L)}]};
+      const wing = () => S.accent === "match" ? mix(S.fur, INK, .1) : S.accent;
+      return { root, tex: {
+        front:{w:s, h:top, draw:(g,c) => {
+          const X = x => (x+s/2)*PX, Y = h => (top-h)*PX;
+          paper(g, c, S.fur);
+          paintFace(g, X, Y, PX, S, {eye:[.8,3.1], noNose:true, noMouth:true, noMuzzle:true, cheek:[1.45,2.05]});
+          const beak = "#F0993B", poly = P => { g.beginPath(); P.forEach(([x,h],i) => i ? g.lineTo(X(x),Y(h)) : g.moveTo(X(x),Y(h))); g.closePath(); g.fill(); };
+          g.fillStyle = beak;
+          if (S.mouth === "open"){ poly([[-.38,2.62],[.38,2.62],[0,2.32]]); g.fillStyle = "#7A3B35"; poly([[-.3,2.26],[.3,2.26],[0,2.12]]); g.fillStyle = beak; poly([[-.3,2.18],[.3,2.18],[0,1.88]]); }
+          else poly([[-.38,2.6],[.38,2.6],[0,2.05]]);
+          if (S.mouth === "chirp"){
+            g.fillStyle = faceInk(S); g.strokeStyle = faceInk(S); g.lineWidth = .06*PX;
+            g.beginPath(); g.ellipse(X(1.25), Y(3.75), .14*PX, .1*PX, -.4, 0, Math.PI*2); g.fill();
+            g.beginPath(); g.moveTo(X(1.38), Y(3.78)); g.lineTo(X(1.38), Y(4.3)); g.lineTo(X(1.6), Y(4.15)); g.stroke();
+          }
+        }},
+        back:{w:s, h:L, draw:(g,c) => {
+          const X = x => (x+s/2)*PX, Y = h => (L-h)*PX;
+          paper(g, c, S.fur);
+          g.fillStyle = wing();
+          for (const [x,r] of [[-.45,.4],[0,.55],[.45,.4]]){ g.beginPath(); g.ellipse(X(x*1.3), Y(.75), .22*PX, r*PX, x*.9, 0, Math.PI*2); g.fill(); }
+          nameText(g, c, S.name, 0, 2.6, false, X, Y, .6);
+        }},
+        side:{w:s, h:L, draw:(g,c) => {
+          const X = x => (x+s/2)*PX, Y = h => (L-h)*PX;
+          paper(g, c, S.fur);
+          g.fillStyle = wing(); g.beginPath(); g.ellipse(X(0), Y(2.0), 1.25*PX, .78*PX, .25, 0, Math.PI*2); g.fill();
+          g.strokeStyle = mix(wing(), INK, .2); g.lineWidth = .06*PX; g.lineCap = "round";
+          for (const dx of [-.4,0,.4]){ g.beginPath(); g.moveTo(X(dx-.1), Y(1.75)); g.lineTo(X(dx+.15), Y(1.45)); g.stroke(); }
+        }},
+        base:{w:s, h:s, draw:(g,c) => paper(g, c, S.fur)}
+      }};
+    }
+  };
+})();
+
+const TEMPLATES = [BUBBA, KIT, BAO, BUN, BOO, RIBBIT, SHROOM, PEEP];
+
+
+// ---------- Painting helpers ----------
+const hex = h => [1,3,5].map(i => parseInt(h.slice(i,i+2),16));
+const mix = (a,b,t) => { const x=hex(a), y=hex(b); return "#"+x.map((v,i)=>Math.round(v+(y[i]-v)*t).toString(16).padStart(2,"0")).join(""); };
+const accent = S => S.accent === "match" ? S.fur : S.accent;
+const grain = (() => {
+  const c = document.createElement("canvas"); c.width = c.height = 160; const g = c.getContext("2d"), im = g.createImageData(160,160);
+  for (let i=0;i<im.data.length;i+=4){ const v = 110 + Math.random()*145; im.data[i]=im.data[i+1]=im.data[i+2]=v; im.data[i+3]=255; }
+  g.putImageData(im,0,0); return c;
+})();
+function paper(g, c, color){
+  g.fillStyle = color; g.fillRect(0,0,c.width,c.height);
+  g.save(); g.globalAlpha = .07; g.globalCompositeOperation = "multiply"; g.fillStyle = g.createPattern(grain,"repeat"); g.fillRect(0,0,c.width,c.height); g.restore();
+}
+function nameText(g, c, text, x, h, flip, X, Y, em = 1.15){
+  if (!text.trim()) return;
+  g.save();
+  g.translate(X ? X(x) : c.width/2, Y ? Y(h) : c.height/2);
+  if (flip) g.rotate(Math.PI);
+  g.fillStyle = "rgba(42,33,28,.85)"; g.textAlign = "center"; g.textBaseline = "middle";
+  let size = em*PX; g.font = `${size}px "Gochi Hand", cursive`;
+  while (g.measureText(text).width > c.width*.82 && size > 20){ size -= 4; g.font = `${size}px "Gochi Hand", cursive`; }
+  g.fillText(text, 0, 0); g.restore();
+}
+function glue(g, c, color){
+  paper(g, c, color);
+  g.save(); g.strokeStyle = "rgba(42,33,28,.16)"; g.lineWidth = 6;
+  for (let i=-c.height;i<c.width+c.height;i+=22){ g.beginPath(); g.moveTo(i,0); g.lineTo(i-c.height,c.height); g.stroke(); }
+  g.fillStyle = "rgba(42,33,28,.55)"; g.font = `${.42*PX}px "Gochi Hand", cursive`; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText("glue", c.width/2, c.height/2); g.restore();
+}
+
+// ---------- Scene ----------
+const stage = $("#stage"), cv = $("#gl");
+const renderer = new THREE.WebGLRenderer({canvas: cv, antialias: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color("#2E5A4E");
+scene.fog = new THREE.Fog("#2E5A4E", 70, 140);
+const camera = new THREE.PerspectiveCamera(30, 1, .5, 400);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x6d8a7f, .62));
+const sun = new THREE.DirectionalLight(0xfff6ea, .7);
+sun.position.set(-8, 18, 11); sun.castShadow = true; sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera, {left:-18,right:18,top:18,bottom:-18,near:1,far:60});
+sun.shadow.bias = -.0006; sun.shadow.normalBias = .02; sun.shadow.radius = 5;
+scene.add(sun);
+const fillLight = new THREE.DirectionalLight(0xe8f2ff, .22); fillLight.position.set(10, 6, -6); scene.add(fillLight);
+const canvasTex = c => { const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8; return t; };
+
+(() => {
+  const n = 40, s = 32, c = document.createElement("canvas"); c.width = c.height = n*s; const g = c.getContext("2d");
+  g.fillStyle = "#2E5A4E"; g.fillRect(0,0,c.width,c.height);
+  for (let i=0;i<=n;i++){
+    g.strokeStyle = i%5===0 ? "rgba(234,241,236,.26)" : "rgba(234,241,236,.1)"; g.lineWidth = i%5===0 ? 2 : 1;
+    g.beginPath(); g.moveTo(i*s,0); g.lineTo(i*s,c.height); g.stroke();
+    g.beginPath(); g.moveTo(0,i*s); g.lineTo(c.width,i*s); g.stroke();
+  }
+  g.strokeStyle = "rgba(242,208,75,.28)"; g.lineWidth = 2; g.beginPath(); g.moveTo(0,c.height); g.lineTo(c.width,0); g.stroke();
+  g.fillStyle = "rgba(242,208,75,.55)"; g.font = "600 14px Figtree, sans-serif";
+  for (let i=5;i<n;i+=5){ g.fillText(String(i), i*s+4, 16); g.fillText(String(i), 4, i*s-4); }
+  const t = canvasTex(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(3,3);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(120,120), new THREE.MeshStandardMaterial({map:t, roughness:1}));
+  m.rotation.x = -Math.PI/2; m.position.y = -.02; m.receiveShadow = true; scene.add(m);
+})();
+
+const turntable = new THREE.Group(), flipper = new THREE.Group();
+scene.add(turntable); turntable.add(flipper);
+const insideCanvas = document.createElement("canvas"); insideCanvas.width = insideCanvas.height = 256;
+const insideTex = canvasTex(insideCanvas);
+const insideMat = new THREE.MeshStandardMaterial({map: insideTex, side: THREE.BackSide, roughness: .95});
+const dashMat = new THREE.LineDashedMaterial({color: 0x2A211C, dashSize: .28, gapSize: .2, transparent: true, opacity: .6});
+
+// ---------- Build a template's panel tree ----------
+let tpl, S, built = null;
+const SS = {};
+function setUV(geo, [x0,x1,y0,y1]){
+  const p = geo.attributes.position, uv = geo.attributes.uv;
+  for (let i=0;i<p.count;i++) uv.setXY(i, (p.getX(i)-x0)/(x1-x0), (p.getY(i)-y0)/(y1-y0));
+  uv.needsUpdate = true;
+}
+function build(){
+  if (built){
+    flipper.clear && flipper.clear();
+    while (flipper.children.length) flipper.remove(flipper.children[0]);
+    built.geos.forEach(g => g.dispose()); Object.values(built.tex).forEach(t => t.tex.dispose()); built.mats.forEach(m => m.dispose());
+  }
+  const spec = tpl.build(S);
+  const tex = {}, mats = {}, geos = [], nodes = [];
+  for (const [k, t] of Object.entries(spec.tex)){
+    const c = document.createElement("canvas"); c.width = Math.round(t.w*PX); c.height = Math.round(t.h*PX);
+    tex[k] = {c, draw: t.draw, tex: canvasTex(c)};
+    mats[k] = new THREE.MeshStandardMaterial({map: tex[k].tex, side: THREE.FrontSide, roughness: .92});
+  }
+  function add(node, parent, at, rot){
+    const holder = new THREE.Group(); holder.position.set(at[0], at[2] || 0, at[1]); holder.rotation.y = rot; parent.add(holder);
+    const g = new THREE.Group(); holder.add(g);
+    for (const poly of node.polys){
+      const geo = new THREE.ShapeGeometry(new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], p[1]))));
+      setUV(geo, node.uv); geo.rotateX(Math.PI/2); geos.push(geo);
+      for (const m of [new THREE.Mesh(geo, mats[node.tex]), new THREE.Mesh(geo, insideMat)]){ m.castShadow = m.receiveShadow = true; g.add(m); }
+    }
+    if (node.dash){
+      const xs = node.polys.flat().filter(p => Math.abs(p[1]) < 1e-4).map(p => p[0]);
+      if (xs.length > 1){
+        const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(Math.min(...xs),-.012,0), new THREE.Vector3(Math.max(...xs),-.012,0)]), dashMat);
+        l.computeLineDistances(); holder.add(l); geos.push(l.geometry);
+      }
+    }
+    if (node.fold) nodes.push({g, fold: node.fold});
+    for (const ch of node.children || []) add(ch.node, g, ch.at, ch.rot);
+  }
+  const pieces = (spec.pieces || [{node: spec.root, at:[0,0]}]).map(p => {
+    const pg = new THREE.Group(); pg.position.set(p.at[0], 0, p.at[1]); flipper.add(pg);
+    add(p.node, pg, [0,0], 0); return {g: pg, at: p.at, move: p.move};
+  });
+  built = {tex, mats: Object.values(mats), geos, nodes, pieces, N: tpl.steps.length};
+  paint();
+  measure();
+}
+function paint(){
+  for (const t of Object.values(built.tex)){ t.draw(t.c.getContext("2d"), t.c); t.tex.needsUpdate = true; }
+  const g = insideCanvas.getContext("2d"); paper(g, insideCanvas, S.inside); insideTex.needsUpdate = true;
+  document.documentElement.style.setProperty("--fur", S.fur);
+}
+// Measure the flat sheet and the folded model once, so the camera and the flip can fit any template.
+function measure(){
+  const keep = [turntable.rotation.y, turntable.scale.clone()];
+  turntable.rotation.y = 0; turntable.scale.set(1,1,1);
+  flipper.rotation.x = 0; flipper.position.y = 0; built.nodes.forEach(n => n.g.rotation.x = 0);
+  built.pieces.forEach(p => { p.g.position.set(p.at[0], 0, p.at[1]); p.g.rotation.z = 0; });
+  const flat = new THREE.Box3().setFromObject(flipper);
+  built.lift = Math.max(-flat.min.z, flat.max.z) + .4;
+  built.flat = {c: new THREE.Vector3((flat.min.x+flat.max.x)/2, 0, -(flat.min.z+flat.max.z)/2), hx:(flat.max.x-flat.min.x)/2, hz:(flat.max.z-flat.min.z)/2};
+  pose(built.N);
+  const box = new THREE.Box3().setFromObject(flipper), sph = box.getBoundingSphere(new THREE.Sphere());
+  built.box = {c: sph.center.clone(), r: sph.radius};
+  turntable.rotation.y = keep[0]; turntable.scale.copy(keep[1]);
+}
+
+function pose(t){
+  const e = inOut(seg(t,0));
+  flipper.rotation.x = Math.PI*(1-e);
+  flipper.position.y = Math.sin(Math.PI*e)*built.lift;
+  for (const n of built.nodes) n.g.rotation.x = -n.fold(t);
+  for (const p of built.pieces) if (p.move){ const m = p.move(t); p.g.position.set(m.x, m.y || 0, p.at[1]); p.g.rotation.z = m.rz || 0; }
+  dashMat.opacity = .6*(1-clamp((t-.55)/.7));
+}
+const vFlat = new THREE.Vector3(0, 1, .1).normalize(), vBox = new THREE.Vector3(.5, .58, .9).normalize();
+const camFit = (hx, hy) => { const tv = Math.tan(THREE.MathUtils.degToRad(camera.fov/2)); return Math.max(hy/tv, hx/(tv*camera.aspect)); };
+function placeCamera(t){
+  const p = inOut(clamp((t-.35)/2.2)), narrow = innerWidth < 820;
+  const f = built.flat, b = built.box;
+  const dFlat = camFit(f.hx+1.4, f.hz+1.4) * (narrow ? 1.22 : 1.3);
+  const dBox = camFit(b.r*1.12, b.r*1.12);
+  const target = f.c.clone().lerp(b.c, p);
+  target.z += f.hz*(narrow ? .2 : .16)*(1-p);
+  camera.position.copy(target).addScaledVector(vFlat.clone().lerp(vBox, p).normalize(), dFlat + (dBox-dFlat)*p);
+  camera.lookAt(target);
+}
+
+// ---------- Playback ----------
+let teaseAmp = 0;
+let T = 0, anim = null, mode = "auto", spin = 0, spinVel = 0, autoSpin = false, bounce = -1;
+function playTo(to, perStep){
+  const dur = Math.abs(to-T) * perStep * (reduce ? .25 : 1);
+  if (dur > 0) anim = {from: T, to, start: performance.now(), dur: dur*1000};
+}
+function onArrive(){
+  if (T >= built.N && !reduce) bounce = performance.now();
+  syncUI();
+}
+const go = $("#go"), hint = $("#hint");
+go.onclick = () => { if (anim) return; if (T >= built.N){ autoSpin = false; playTo(0, .55); } else playTo(built.N, 1.15); syncUI(); };
+$("#next").onclick = () => { autoSpin = false; playTo(Math.min(built.N, Math.floor(T+1e-3)+1), 1.15); };
+$("#back").onclick = () => { autoSpin = false; playTo(Math.max(0, Math.ceil(T-1e-3)-1), .8); };
+$("#scrub").oninput = e => { anim = null; autoSpin = false; T = +e.target.value; syncUI(); };
+function setMode(m){
+  mode = m;
+  $("#autoUI").hidden = m !== "auto"; $("#stepUI").hidden = m !== "steps";
+  if (m === "steps") autoSpin = false;
+  lastKey = ""; syncUI();
+}
+$("#stepsBtn").onclick = () => { anim = null; autoSpin = false; if (T >= built.N - 1e-3) T = 0; setMode("steps"); };
+$("#closeSteps").onclick = () => setMode("auto");
+
+let lastKey = "";
+function syncUI(){
+  const N = built.N, n = clamp(Math.floor(T+1e-3)+1, 1, N), done = T >= N - 1e-3;
+  $("#scrub").value = T;
+  const key = [tpl.id, mode, n, done, !!anim, anim && anim.to].join("|");
+  if (key === lastKey) return; lastKey = key;
+  const PLAY = '<path d="M4 2.5v11l9-5.5z" fill="currentColor"/>', AGAIN = '<path d="M8 2.5a5.5 5.5 0 1 1-5.3 4H1l2.6-3 2.6 3H4.3A4 4 0 1 0 8 4z" fill="currentColor"/>';
+  $("#goIcon").innerHTML = done ? AGAIN : PLAY; $("#goIcon").style.display = anim ? "none" : "";
+  $("#goLabel").textContent = anim ? (anim.to > anim.from ? "Folding…" : "Unfolding…") : done ? "Unfold" : T > 0 ? "Finish folding" : "Watch it fold";
+  go.disabled = !!anim;
+  hint.textContent = anim && !done ? tpl.steps[n-1] : done ? "Drag to turn it around" : "";
+  $("#count").textContent = done ? `All ${N} steps done` : `Step ${n} of ${N}`;
+  $("#stepText").textContent = done ? "Done. Fill it with something sweet." : tpl.steps[n-1];
+  [...$("#pips").children].forEach((p,i) => p.classList.toggle("on", done || i < n-1 || (!!anim && i === n-1)));
+  $("#next").disabled = done; $("#back").disabled = T <= 1e-3;
+}
+
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = {x: e.clientX, x0: e.clientX, y0: e.clientY}; cv.setPointerCapture(e.pointerId); autoSpin = false; spinVel = 0; });
+cv.addEventListener("pointermove", e => { if (!drag) return; const dx = e.clientX - drag.x; drag.x = e.clientX; spin += dx*.009; spinVel = dx*.009; });
+cv.addEventListener("pointerup", e => {
+  const tap = drag && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 6;
+  drag = null;
+  if (tap && mode === "auto" && !anim && T <= 1e-3) go.onclick();
+});
+cv.addEventListener("pointercancel", () => { drag = null; });
+
+function resize(){
+  const r = stage.getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false); camera.aspect = r.width / Math.max(1, r.height); camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+let prev = performance.now();
+function frame(now){
+  const dt = Math.min(.05, (now - prev)/1000); prev = now;
+  if (anim){
+    const k = clamp((now - anim.start)/anim.dur);
+    T = anim.from + (anim.to - anim.from)*k;
+    if (k >= 1){ T = anim.to; anim = null; onArrive(); }
+    syncUI();
+  }
+  if (!drag){ spin += spinVel; spinVel *= .92; }
+  if (autoSpin) spin += dt*.25;
+  if (T < 1 && !drag && !autoSpin){ spin = Math.atan2(Math.sin(spin), Math.cos(spin)); spin += (0 - spin)*Math.min(1, dt*4); }
+  turntable.rotation.y = spin;
+  let sq = 1;
+  if (bounce > 0){ const b = (now - bounce)/1000; if (b > 1.1) bounce = -1; else sq = 1 - .07*Math.sin(b*14)*Math.exp(-b*4.5); }
+  turntable.scale.set(2-sq, sq, 2-sq);
+  pose(T); placeCamera(T);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+// ---------- Options sheet ----------
+function radios(el, list, key, swatch){
+  el.innerHTML = "";
+  for (const [a, b] of list){
+    const [val, label] = swatch ? [b, a] : [a, b];
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.setAttribute("role","radio"); btn.dataset.v = val;
+    if (swatch){ btn.setAttribute("aria-label", label); btn.title = label; if (val === "match") btn.className = "match"; else btn.style.background = val; }
+    else btn.textContent = label;
+    btn.onclick = () => { S[key] = val; refresh(key === "ears"); };
+    el.appendChild(btn);
+  }
+}
+function iconSVG(polys){
+  const pts = polys.flat(), xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y1 = Math.max(...ys);
+  const d = polys.map(p => "M" + p.map(([x,y]) => `${(x-x0).toFixed(2)} ${(y1-y).toFixed(2)}`).join("L") + "Z").join("");
+  return `<svg viewBox="-.3 -.3 ${(x1-x0+.6).toFixed(2)} ${(y1+.6).toFixed(2)}" aria-hidden="true"><path d="${d}" fill="currentColor"/></svg>`;
+}
+const tpls = $("#tpls");
+for (const t of TEMPLATES){
+  const b = document.createElement("button");
+  b.type = "button"; b.setAttribute("role","radio"); b.dataset.v = t.id;
+  b.innerHTML = `${iconSVG(t.icon())}<span><b>${t.name}</b><small>${t.kind}</small></span>`;
+  b.onclick = () => useTemplate(t);
+  tpls.appendChild(b);
+}
+radios($("#fur"), FUR, "fur", true); radios($("#box"), ACCENT, "accent", true); radios($("#inside"), INSIDE, "inside", true);
+radios($("#eyes"), EYES, "eyes");
+for (const k of ["cheeks","muzzle","both"]) $("#"+k).onchange = e => { S[k] = e.target.checked; refresh(); };
+$("#name").oninput = e => { S.name = e.target.value; refresh(); };
+$("#reset").onclick = () => { SS[tpl.id] = S = {...tpl.defaults}; refresh(true); };
+$("#surprise").onclick = () => {
+  const pick = a => a[Math.floor(Math.random()*a.length)];
+  Object.assign(S, {fur: pick(FUR)[1], accent: pick(ACCENT)[1], inside: pick(INSIDE)[1], ears: pick(tpl.ears)[0], eyes: pick(EYES)[0], mouth: pick(tpl.mouths || MOUTH)[0], cheeks: Math.random() > .3, muzzle: Math.random() > .4});
+  refresh(true);
+};
+function refresh(rebuild){
+  if (rebuild) build(); else paint();
+  for (const k of ["fur","box","inside","ears","eyes","mouth"]){
+    const v = S[k === "box" ? "accent" : k];
+    for (const b of $("#"+k).children) b.setAttribute("aria-checked", b.dataset.v === v);
+  }
+  for (const k of ["cheeks","muzzle","both"]) $("#"+k).checked = S[k];
+  if ($("#name").value !== S.name) $("#name").value = S.name;
+}
+function useTemplate(t){
+  tpl = t; S = SS[t.id] = SS[t.id] || {...t.defaults};
+  for (const b of tpls.children) b.setAttribute("aria-checked", b.dataset.v === t.id);
+  $("#tName").textContent = t.name; $("#tDims").textContent = t.dims;
+  $("#l-box").textContent = t.accentLabel; $("#l-name").textContent = t.nameLabel; $("#name").placeholder = t.namePlaceholder;
+  $("#bothRow").hidden = !t.hasBoth;
+  radios($("#ears"), t.ears, "ears"); $("#l-ears").textContent = t.earsLabel || "Ears";
+  radios($("#mouth"), t.mouths || MOUTH, "mouth"); $("#l-mouth").textContent = t.mouthLabel || "Mouth";
+  $("#pips").innerHTML = "<i></i>".repeat(t.steps.length); $("#scrub").max = t.steps.length;
+  T = 0; anim = null; autoSpin = false; spin = 0; spinVel = 0; bounce = -1; lastKey = "";
+  refresh(true); syncUI();
+}
+
+useTemplate(TEMPLATES[location.hash === "#bun" ? 1 : 0]);
+resize();
+requestAnimationFrame(frame);
+document.fonts && document.fonts.load('40px "Gochi Hand"').then(() => paint()).catch(() => {});
+})();
+</script>
+
+</body>
+</html>

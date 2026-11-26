@@ -1,0 +1,10 @@
+node_modules/
+dist/
+output/
+*.log
+monster-qa.png
+.playwright-cli/
+
+.env
+.env.*
+!.env.example

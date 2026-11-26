@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {makeSpec} from './engine.js';
+import {validateSpec} from './validation.js';
+const config={shape:'hexagon',width:85,depth:75,height:65,thickness:.35,window:false};
+const visit=(n,fn)=>{fn(n);for(const c of n.children||[])visit(c.node,fn);};
+const good=makeSpec(config);assert.equal(validateSpec(good,config).printable,true);
+const wrongAngles=makeSpec(config);visit(wrongAngles.pieces[0].node,n=>{if(n.tex.endsWith('Tab'))n.fold=()=>Math.PI/2;});assert.ok(validateSpec(wrongAngles,config).checks.badTabs>0,'Must reject the original fixed-90-degree tab bug');
+const distorted=makeSpec(config);distorted.pieces[0].node.polys[0][1][0]+=3;assert.ok(validateSpec(distorted,config).checks.maxTargetErrorMM>2,'Must detect artwork geometry that cannot refold to its target');
+const missing=makeSpec(config);visit(missing.pieces[0].node,n=>{n.children=(n.children||[]).filter(c=>!c.node.tex.endsWith('Tab'));});assert.ok(validateSpec(missing,config).checks.missingSeams>0,'Must reject a net with missing adhesive seams');
+const collisionConfig={...config,shape:'petal',width:75,depth:65,height:80};assert.ok(validateSpec(makeSpec(collisionConfig),collisionConfig).checks.intersections>0,'Must detect intersecting petal closure');
+console.log('4 negative controls detected: wrong tab angle, distorted panel, missing tabs, intersecting closure.');

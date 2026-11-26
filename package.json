@@ -1,0 +1,22 @@
+{
+  "name": "fold-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node start.mjs",
+    "dev": "vite --host 127.0.0.1 --port 4188",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4188",
+    "audit": "node audit-regressions.mjs && node audit-constructions.mjs",
+    "audit:opening": "node audit-opening.mjs"
+  },
+  "dependencies": {
+    "jspdf": "^3.0.0",
+    "polygon-clipping": "^0.15.7",
+    "three": "0.128.0"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
