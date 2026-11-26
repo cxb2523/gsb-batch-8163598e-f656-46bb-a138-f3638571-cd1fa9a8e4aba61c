@@ -106,6 +106,11 @@ are skipped). WebGL runs on SwiftShader, Chrome's software GPU, so they need no 
 - `tests/sound.mjs` renders the chorus of songs of every style through the real engine into an
   `OfflineAudioContext` and measures the mix: no clipping, headroom, a sensible loudness, every
   style within a few decibels of the others.
+- `tests/engine.mjs` holds the engine's lifecycle to its promises on a real `AudioContext`:
+  skipping songs fades each old bus out and disconnects it whole (no node piles up), a new song's
+  cues start on its own timeline, a song ending by itself gives its bus back, pause stops the
+  audio clock where it is and resume carries on from there, and a skip and a pause crossing
+  leave the last one asked for in charge.
 
 ## Versions and releases
 
@@ -168,7 +173,7 @@ src/app/               the page
   instruments.ts       synthesised pads, keys, plucks, leads, basses and drums
   update.ts            the installed app's updates: finds a waiting worker, Update lets it in
 src/pwa/sw.js          the PWA's service worker: offline from its own cache, waits to take over
-tests/                 unit tests (rng, music, palette, scene, settings) and the two browser tests
+tests/                 unit tests (rng, music, palette, scene, settings) and the three browser tests
 tools/                 load.mjs (src/ for Node), chrome.mjs (DevTools protocol), shots.mjs, icons.mjs
 ```
 

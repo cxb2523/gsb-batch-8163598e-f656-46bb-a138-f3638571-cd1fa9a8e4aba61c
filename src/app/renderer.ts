@@ -296,6 +296,8 @@ export class Renderer {
 
   /** Smaller render when frames run long, bigger when there is room. */
   private adapt(dt: number): void {
+    // A frame drawn with no time passing (paused) says nothing about speed.
+    if (dt <= 0) return;
     this.frameTimes.push(dt);
     if (this.frameTimes.length < 40) return;
     const sorted = [...this.frameTimes].sort((x, y) => x - y);
@@ -308,5 +310,10 @@ export class Renderer {
   /** The share of the canvas the render covers, for the info panel. */
   get quality(): number {
     return this.scale;
+  }
+
+  /** The picture's own clock, which only moves on the frames it draws. */
+  get time(): number {
+    return this.clock;
   }
 }

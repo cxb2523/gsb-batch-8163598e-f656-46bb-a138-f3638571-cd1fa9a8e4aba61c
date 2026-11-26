@@ -165,12 +165,40 @@ try {
   // Pause and play
   await click('#play');
   check('paused', await until(`document.body.dataset.state === 'paused'`, 3000), true);
+  check('the audio clock is suspended', await until(`window.__colorMusic.engine.ctx.state === 'suspended'`, 3000), true);
   check('button says play', await evaluate(`document.querySelector('#play').getAttribute('aria-label')`), 'Play');
   const frozen = await text('#f-part');
+  // The picture and the audio clock are held at the same point of the song.
+  const held = await evaluate(`(() => { const w = window.__colorMusic; return { clock: w.renderer.time, audio: w.engine.now() }; })()`);
   await sleep(1500);
   check('paused: the song stands still', await text('#f-part'), frozen);
+  const still = await evaluate(`(() => { const w = window.__colorMusic; return { clock: w.renderer.time, audio: w.engine.now() }; })()`);
+  check('paused: the picture clock stands still', Math.abs(still.clock - held.clock) < 0.001, true);
+  check('paused: the audio clock stands still', Math.abs(still.audio - held.audio) < 0.05, true);
   await click('#play');
   check('playing again', await until(`document.body.dataset.state === 'playing'`, 3000), true);
+  await sleep(700);
+  const moved = await evaluate(`(() => { const w = window.__colorMusic; return { clock: w.renderer.time, audio: w.engine.now() }; })()`);
+  check('resumed: the picture goes on', moved.clock > still.clock + 0.1, true);
+  check('resumed: the music goes on from where it stopped', moved.audio > still.audio + 0.2, true);
+  check('resumed: without a jump in the picture', moved.clock - still.clock < 3, true);
+
+  // Skips: each old song's bus is let go; the graph does not grow
+  for (let i = 0; i < 5; i++) {
+    await click('#next');
+    await sleep(120);
+  }
+  await sleep(2200);
+  const buses = await evaluate(`window.__colorMusic.engine.stats()`);
+  check('after skips: one bus live', buses.live, 1);
+  check('after skips: none left fading', buses.retiring, 0);
+  check('after skips: only the playing song holds a bus', buses.created - buses.released, 1);
+  const nextBefore = await text('#f-part');
+  await sleep(1500);
+  check('after skips: the new song plays on', await until(`document.querySelector('#f-part').textContent.includes('bar')`, 6000), true);
+  // Only the look-ahead's few bars are ever waiting: cues of skipped songs are gone.
+  check('after skips: no cue left waiting from the old songs', await evaluate(`window.__colorMusic.engine.stats().cues < 200`), true);
+  check('after skips: the part is named', nextBefore !== null, true);
 
   // Mute, remembered
   await press('m');

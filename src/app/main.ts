@@ -132,6 +132,25 @@ function showSong(): void {
   updateMediaSession();
 }
 
+/**
+ * For the browser test: the engine's buses and the picture's clock, which are
+ * not on screen. The page itself never reads this.
+ */
+interface TestWindow extends Window {
+  __colorMusic?: { engine: Engine | null; renderer: Renderer | null };
+}
+function publish(): void {
+  (window as TestWindow).__colorMusic = {
+    get engine() {
+      return engine;
+    },
+    get renderer() {
+      return renderer;
+    },
+  };
+}
+publish();
+
 /** Starts a new song: now (a skip) or at `at`, where the last one ends. */
 function nextSong(at?: number, newSeedText?: string): void {
   seed = newSeedText ?? newSeed(cryptoRandom);
@@ -141,7 +160,10 @@ function nextSong(at?: number, newSeedText?: string): void {
   showSong();
   if (engine) {
     engine.play(song, at, at === undefined ? 0.3 : 3);
-    if (!engine.playing) void engine.resume().then(() => setState('playing'));
+    // A skip while paused starts the new song; if a pause is still on its way,
+    // this resume is queued behind it in the engine, so it has the last word.
+    setState('playing');
+    void engine.resume().then(() => setState('playing'));
   } else {
     newScene(0.8);
   }
@@ -188,6 +210,20 @@ let last = performance.now();
 function frame(now: number): void {
   const dt = Math.max(0, (now - last) / 1000);
   last = now;
+  // Paused, the audio clock stands still: the picture waits with it, at the
+  // same point of the song, and no cue is taken for it to jump ahead on. The
+  // frame is still drawn — with no time passing — so the canvas keeps its
+  // picture rather than being cleared.
+  if (document.body.dataset.state === 'paused') {
+    try {
+      renderer?.frame(0, pulse);
+    } catch (error) {
+      console.error(error);
+      renderer = null;
+    }
+    requestAnimationFrame(frame);
+    return;
+  }
   if (engine) {
     engine.tick();
     const heard = engine.now();
@@ -239,12 +275,15 @@ async function start(): Promise<void> {
 
 async function togglePlay(): Promise<void> {
   if (!engine) return start();
-  if (engine.playing) {
-    await engine.pause();
+  // What the last press asked for, not what the context is still doing: a
+  // pause or resume may be on its way, and two quick presses must not both
+  // see the old state and do the same thing twice.
+  if (document.body.dataset.state === 'playing') {
     setState('paused');
+    await engine.pause();
   } else {
-    await engine.resume();
     setState('playing');
+    await engine.resume();
   }
   wake();
 }

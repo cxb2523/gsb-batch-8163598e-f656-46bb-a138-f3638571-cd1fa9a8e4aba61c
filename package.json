@@ -13,7 +13,7 @@
     "watch": "node build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "node tests/rng.mjs && node tests/music.mjs && node tests/palette.mjs && node tests/scene.mjs && node tests/settings.mjs",
-    "test:browser": "node tests/app.mjs && node tests/sound.mjs",
+    "test:browser": "node tests/app.mjs && node tests/sound.mjs && node tests/engine.mjs",
     "shots": "node tools/shots.mjs",
     "icons": "node tools/icons.mjs",
     "check": "npm run typecheck && npm test && npm run build && npm run test:browser"
