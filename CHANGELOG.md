@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.42.4
+
+**A WebGPU cart's canvas can be reconfigured under it: the ring, the blitter and an in-flight read all follow the
+new configuration.** The host canvas behind `#canvas` is a ring of textures the host reads and draws from; a cart
+that reconfigures its surface (a new size or format) at run time, or a host that resizes the canvas, left the old ring
+and the pipeline and bind groups `presentWgpuTo(context)` caches in place. A read taken before the reconfigure then
+could copy from a texture the reconfigure flushed, and a draw could sample a destroyed one. A generation counter now
+marks every change of the canvas's configuration (a reconfigure, a resize, an unconfigure, destroy). A draw rebuilds
+its blitter pipeline for the target format and its bind group for the source texture of that generation; a frame read
+captures the texture, its size and its format at the call, so `readGpuFrame()` returns the frame it started on even if
+several frames ran (or a reconfigure happened) before it resolved.
+
+**The release tracker and the canvas rebuild together.** A texture the ring drops is no longer destroyed by the canvas
+on the spot: it is `retire()`d into the release tracker, so a texture the cart still uses through a kept view or bind
+group survives the reconfigure, and one nothing holds is destroyed at the frame end, exactly once — a texture the
+tracker had queued to destroy is never handed back out by a rebuilt ring. A frame read pins its source texture until
+the copy's map returns, so a reconfigure (or destroy) before the map neither destroys it mid-copy nor leaves it to be
+destroyed twice. `readGpuFrame()` and `presentWgpuTo()` after `destroy()` return null and false; a read in flight at
+destroy still resolves null.
+
+`test/wgpu-canvas.test.js` covers the ring and dropper against a fake device, the tracker's retire/pin, a normal
+reconfigure, a reconfigure concurrent with a frame read, and a read/draw after destroy. `test/fixtures/wgpuedges.wasc`
+is the reconfigure fixture. No ABI or SPEC change; the test cart carries 0.42.4.
+
 ## 0.42.3
 
 **A large threaded cart starts in the browser.** A 1 GB threaded .wasc failed to start in CartHostWeb with

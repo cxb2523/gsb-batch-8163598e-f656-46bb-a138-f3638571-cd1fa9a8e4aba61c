@@ -137,6 +137,15 @@ export function gpuImportTrap(name, selected) {
  * presented texture comes back two presents later, so the next frame never
  * gets the one just presented; the ring is dropped on resize and reconfigure.
  *
+ * A dropped texture is not necessarily dead: the cart may have released it
+ * but still use it through a view a bind group holds. So the host can take
+ * over what is done with each dropped texture (`setDropper`): the WebGPU
+ * session routes them through its release tracker (release.js retire()), so
+ * one is destroyed once nothing live uses it and never twice — the canvas
+ * itself would otherwise destroy a texture the cart still holds, and a ring
+ * rebuilt over a texture the tracker is about to destroy would hand the cart
+ * a dead one.
+ *
  * A host presenting into a window the cart's size can have the cart draw
  * straight into the window's texture: setDirect(() => texture) makes
  * getCurrentTexture() return what the function gives (null: the ring's), so
@@ -145,19 +154,36 @@ export function gpuImportTrap(name, selected) {
 export function createTextureCanvas(width, height) {
   let w = width, h = height, config = null, texture = null, direct = null, fromDirect = false;
   let spare = [];
+  // Told each time the canvas's configuration, size or lifetime changes, so
+  // the host's WebGPU session can drop what it cached for the old one.
+  let onChange = null;
+  const changed = () => { onChange?.(); };
+  // What becomes of a texture the canvas drops (a resize or reconfigure
+  // flushes the ring, and ending a frame without recycling drops one), unless
+  // the host installs its own handler (setDropper): the release tracker, so
+  // a texture still held survives and one nothing holds is destroyed once.
+  const destroyNow = t => { try { t.destroy(); } catch { /* already gone */ } };
+  let dropTexture = destroyNow;
   const drop = (recycle = false) => {
     const t = texture;
     texture = null;
+    // A setDirect texture belongs to the window, not this canvas's ring.
     if (!t || fromDirect) { fromDirect = false; return; }
-    if (recycle && spare.length < 3) spare.push(t); else t.destroy();
+    if (recycle && spare.length < 3) spare.push(t); else dropTexture(t);
   };
-  const flush = () => { drop(); for (const t of spare) t.destroy(); spare = []; };
+  const flush = () => { drop(); for (const t of spare) dropTexture(t); spare = []; };
   const canvas = {
     get width() { return w; },
-    set width(v) { if (v !== w) { w = v; flush(); direct = null; } },
+    set width(v) { if (v !== w) { w = v; flush(); direct = null; changed(); } },
     get height() { return h; },
-    set height(v) { if (v !== h) { h = v; flush(); direct = null; } },
+    set height(v) { if (v !== h) { h = v; flush(); direct = null; changed(); } },
     getContext: type => (type === 'webgpu' ? context : null),
+    /** (host) told each time the canvas's configuration, size or lifetime
+     *  changes; null to stop. */
+    setOnChange(fn) { onChange = fn; },
+    /** (host) take over what happens to a texture this canvas drops (flush()
+     *  or a frame that does not recycle it); null restores destroy(). */
+    setDropper(fn) { dropTexture = fn || destroyNow; },
     /** (host) draw straight into another texture of the canvas's size and
      *  configuration: fn() gives it, or null. Cleared when the canvas is
      *  resized or reconfigured. */
@@ -169,8 +195,8 @@ export function createTextureCanvas(width, height) {
   };
   const context = {
     canvas,
-    configure(c) { flush(); direct = null; config = { ...c, viewFormats: [...(c.viewFormats || [])] }; },
-    unconfigure() { flush(); direct = null; config = null; },
+    configure(c) { flush(); direct = null; config = { ...c, viewFormats: [...(c.viewFormats || [])] }; changed(); },
+    unconfigure() { flush(); direct = null; config = null; changed(); },
     getConfiguration() { return config ? { ...config } : null; },
     getCurrentTexture() {
       if (!config) throw new Error('the cart canvas is not configured');
@@ -184,7 +210,7 @@ export function createTextureCanvas(width, height) {
       return texture;
     },
     present() { drop(true); },
-    destroy() { flush(); config = null; },
+    destroy() { flush(); config = null; changed(); },
   };
   return canvas;
 }
@@ -291,6 +317,23 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
   // The device the cart configured its canvas with: the host's, or one it
   // requested with more features or limits. Reads and draws use it.
   let canvasDevice = null;
+  // What the canvas hands out can change behind the session's back: the cart
+  // reconfigures its surface (a new size or format), resizes the canvas, or
+  // unconfigures or destroys it. Everything the session cached or started
+  // against the old configuration is then stale: the blitter pipelines (built
+  // per target format), their bind groups (built for textures the old ring
+  // handed out, which the reconfigure flushes), and any frame read still in
+  // flight (its captured texture is retired into the tracker, which the read
+  // pins, so it survives its copy). A generation counts those changes; every
+  // draw builds what it uses in the generation it starts in. The canvas's own
+  // changes reach the session two ways: the context proxy below bumps it for a
+  // configure or unconfigure, and canvas.setOnChange for a resize, on the
+  // canvases (the built-in one) that report it.
+  let generation = 0;
+  const bumpGeneration = () => { generation++; };
+  // The context the cart talks to: the host's handling for configure and
+  // unconfigure (COPY_SRC forced, the canvas/device recorded, a change
+  // counted), and every other property straight through.
   const context = new Proxy(realContext, {
     get(target, prop) {
       if (prop === 'configure') {
@@ -302,9 +345,10 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
           });
           configured = true;
           canvasDevice = cfg.device;
+          bumpGeneration();
         };
       }
-      if (prop === 'unconfigure') return () => { configured = false; target.unconfigure(); };
+      if (prop === 'unconfigure') return () => { configured = false; target.unconfigure(); bumpGeneration(); };
       const value = Reflect.get(target, prop, target);
       return typeof value === 'function' ? value.bind(target) : value;
     },
@@ -317,6 +361,11 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     },
     set(target, prop, value) { target[prop] = value; return true; },
   });
+  // A resize of the built-in canvas drops its ring too, and is as much a
+  // change of configuration as a reconfigure: the session hears it and drops
+  // what it cached. (An embedder's canvas resizes its own way; a draw or read
+  // still settles what it uses at the generation it starts in.)
+  canvas.setOnChange?.(bumpGeneration);
 
   // The cart's view of navigator.gpu and its adapter. A request the host's
   // device already satisfies returns that device. One asking for features or
@@ -436,6 +485,16 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     fn => { Module.WebGPU.wcRecord = fn; });
   Module.wcGpuMade = (obj, ptr) => { tracker.made(obj); native?.register(ptr >>> 0, obj); onObject?.(ptr >>> 0, obj); };
   Module.wcGpuRelease = (obj, ptr) => { onRelease?.(ptr >>> 0, obj); native?.forget(ptr >>> 0); tracker.released(obj); };
+  // A texture the canvas drops (a reconfigure or resize flushed its ring) is
+  // handed to the tracker, so a texture the cart still uses through a view or
+  // bind group survives and one nothing holds is destroyed once — not by the
+  // canvas (which would destroy a texture still in use, and could destroy a
+  // ring texture the tracker is about to) and not twice. A texture the host
+  // itself took from the canvas (a read's source, a draw's) is noted so it is
+  // the canvas's too and has the same rule when the ring drops it; a texture
+  // made outside the canvas (a setDirect window's) is not the cart's and
+  // destroyNow disposes of it as before.
+  if (typeof canvas.setDropper === 'function') canvas.setDropper(t => { if (!tracker.retire(t)) { try { t.destroy(); } catch {} } });
 
   // The cart's imports: each glue function behind a wrapper of its own arity
   // (a rest-args wrapper allocated an array per call), refreshing the memory
@@ -501,9 +560,16 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
 
   // One full-screen-triangle pipeline per target format, for drawTo(), and
   // its bind group per source texture (the canvas's ring of up to three).
+  // Both are only valid for the canvas configuration they were made against:
+  // a reconfigure or resize (a new generation) clears them, so the next draw
+  // builds pipelines for the target format the window has now and bind groups
+  // for the textures its ring hands out now, never for a texture the flush
+  // destroyed.
   const blitters = new Map();
-  const blitGroups = new WeakMap();
-  function blitter(dev, format) {
+  let blitGroups = new WeakMap();
+  let blitGeneration = -1;
+  function blitter(dev, format, gen) {
+    if (gen !== blitGeneration) { blitters.clear(); blitGroups = new WeakMap(); blitGeneration = gen; }
     const key = format + (dev === device ? '' : ':extra');
     let b = blitters.get(key);
     if (b) return b;
@@ -534,8 +600,15 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     adapterInfo: describeAdapter(adapter, adapterOpts),
     /** The device the cart renders with: present windows on THIS one. */
     get device() { return canvasDevice || device; },
-    context: realContext,
+    /** The cart's canvas context as the cart sees it: COPY_SRC and
+     *  TEXTURE_BINDING forced into every configuration, a change counted in
+     *  the generation. */
+    context,
     canvas,
+    /** The generation of the canvas's configuration: it changes on a
+     *  reconfigure, a resize or an unconfigure. Textures getCurrentTexture()
+     *  hands out, and pipelines built for them, belong to a generation. */
+    get generation() { return generation; },
 
     /** Give the instantiated cart to the glue. memory: the cart's memory
      *  (exported, or the shared one a threaded cart imports). cartAllocator:
@@ -572,14 +645,26 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     },
 
     /** The last rendered frame as top-down RGBA, or null if the cart has not
-     *  configured its canvas. Asynchronous: GPU readback always is. */
+     *  configured its canvas (or the host was destroyed). Asynchronous: GPU
+     *  readback always is. */
     //
     // The copy is encoded and submitted synchronously, at the call: the frame
     // read is the one current NOW, even if the caller runs more frames before
     // awaiting. Each call has its own buffer, so reads may overlap.
+    //
+    // The texture and the geometry the caller gets are settled at this call
+    // too: width, height and format are read here and returned with the data
+    // the copy produced, whatever frames ran, whatever the ring did, and
+    // whatever the cart reconfigured in between. A reconfigure or resize
+    // before the map returns retires the captured texture (the ring dropped
+    // it), so the tracker owns it and the in-flight read pins it: it survives
+    // until the copy has run and is destroyed exactly once after that.
     readFrame() {
       if (closed || !configured) return Promise.resolve(null);
-      const texture = realContext.getCurrentTexture();
+      let texture;
+      try { texture = realContext.getCurrentTexture(); } catch { return Promise.resolve(null); }
+      if (!texture) return Promise.resolve(null);
+      tracker.note(texture);
       const w = texture.width, h = texture.height, format = texture.format;
       const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
       const dev = canvasDevice || device;
@@ -587,21 +672,38 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
       const encoder = dev.createCommandEncoder();
       encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow, rowsPerImage: h }, [w, h, 1]);
       dev.queue.submit([encoder.finish()]);
-      return readMapped(buffer, w, h, bytesPerRow, format);
+      // A surface texture is the canvas's, and a reconfigure drops what the
+      // ring held; keep this one alive until its copy is on the GPU and the
+      // map has returned, whatever happens to the ring in between. Its size
+      // and format were read here, for the copy above: they are what the
+      // returned frame says, however many frames ran before the map came.
+      tracker.pin(texture);
+      return readMapped(buffer, w, h, bytesPerRow, format, () => { tracker.unpin(texture); });
     },
 
     /** Draw the cart's current frame into `target` (another configured
      *  canvas context on this device, e.g. a window), scaled into `dst`
      *  ({x,y,w,h}, top-down target pixels; the whole target if omitted) on a
      *  black background. The caller presents the target. */
+    //
+    // The source is the texture getCurrentTexture() hands out NOW, and the
+    // blitter pipeline and bind group are those of the canvas's configuration
+    // NOW: a reconfigure or resize since the last draw (a new generation)
+    // drops the cached pipelines (built for the old target format) and the
+    // bind groups (built for textures the old ring handed out, which may be
+    // destroyed).
     drawTo(target, dst) {
       if (closed || !configured) return false;
-      const source = realContext.getCurrentTexture();
-      const out = target.getCurrentTexture();
+      const gen = generation;
+      let source, out;
+      try { source = realContext.getCurrentTexture(); out = target.getCurrentTexture(); } catch { return false; }
+      if (!source || !out) return false;
+      tracker.note(source);
       const dev = canvasDevice || device;
-      const blit = blitter(dev, out.format);
+      const blit = blitter(dev, out.format, gen);
       let cached = blitGroups.get(source);
       if (cached?.blit !== blit) {
+        blitGroups.delete(source);
         cached = { blit, group: dev.createBindGroup({
           layout: blit.pipeline.getBindGroupLayout(0),
           entries: [{ binding: 0, resource: blit.sampler }, { binding: 1, resource: source.createView() }],
@@ -646,6 +748,8 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     destroy() {
       if (closed) return device.lost.then(() => {});
       closed = true;
+      // A read or draw still in flight is of a configuration that is gone;
+      // the glue's async callbacks settle below, after this.
       // The glue's async callbacks (a mapAsync, onSubmittedWorkDone, an error
       // scope, device loss) settle after this, some because of it: none may
       // reach a cart whose host is letting go of its memory
@@ -674,7 +778,7 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
     },
   };
 
-  async function readMapped(buffer, w, h, bytesPerRow, format) {
+  async function readMapped(buffer, w, h, bytesPerRow, format, unpin) {
     try {
       try {
         await buffer.mapAsync(0x0001 /* READ */);
@@ -693,6 +797,7 @@ export async function createWgpuSession({ moduleImports, gpu, adapter: givenAdap
       }
       return { width: w, height: h, data: out, format };
     } finally {
+      unpin();
       buffer.destroy();
     }
   }

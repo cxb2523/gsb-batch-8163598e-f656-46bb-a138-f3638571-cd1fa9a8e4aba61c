@@ -24,7 +24,11 @@
 //     frames), they wait for those too.
 // Every other WebGPU call runs untracked: bookkeeping every object every call
 // looked up cost about 14% of a WebGPU cart's main-thread CPU. Surface
-// textures belong to the canvas and are never destroyed.
+// textures belong to the canvas while the canvas owns them, and are never
+// destroyed by release alone; when the canvas drops one (a reconfigure or a
+// resize replaces its ring) the host retires it (retire() below), and from
+// then on the ordinary rule applies: it is destroyed once nothing the cart
+// still holds (a kept view, a bind group) uses it, and exactly once.
 
 /**
  * @param {object} globals - where the WebGPU classes live (window, or webgpu-node's globals)
@@ -41,7 +45,7 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
   if (classes.some(c => typeof globals[c] !== 'function')) {
     const nop = () => {};
     const run = (...a) => a[a.length - 1]();
-    return { made: nop, released: nop, frameEnd: nop, finish: nop, submit: nop,
+    return { made: nop, released: nop, note: nop, retire: () => false, pin: nop, unpin: nop, frameEnd: nop, finish: nop, submit: nop,
       view: run, bindGroup: run, bundle: run, surfaceTexture: run, stats: () => null, dispose: nop };
   }
   // Each object's kind by its constructor (one Map lookup per object made);
@@ -59,6 +63,8 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
 
   /** @type {WeakMap<object, Node>} */
   let nodes = new WeakMap();
+  // objects held by an in-flight frame read (pin/unpin)
+  let pinned = new WeakMap();
   // command encoders not yet finished, command buffers not yet submitted
   const openEncoders = new Set();
   const unsubmitted = new Set();
@@ -76,6 +82,7 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
       this.kind = kind;
       this.refs = 0;          // glue handles (pointers) naming this object
       this.external = false;  // a surface texture: the canvas owns it
+      this.pins = 0;          // an in-flight frame read: keep it until the map returns
       this.queued = false;    // waiting in doomed
       this.holds = null;      // Set<Node>: what this holder keeps in use
       this.heldBy = null;     // Set<Node>: the holders keeping this
@@ -111,7 +118,7 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
     const work = [start];
     while (work.length) {
       const n = work.pop();
-      if (n.refs > 0 || isHeld(n)) continue;
+      if (n.refs > 0 || n.pins > 0 || isHeld(n)) continue;
       if (n.heldBy) { for (const h of n.heldBy) h.holds?.delete(n); n.heldBy = null; }
       if (n.holds) { for (const c of n.holds) { c.heldBy?.delete(n); work.push(c); } n.holds = null; }
       if (isResource(n.kind) && !n.external && !n.queued) {
@@ -143,6 +150,7 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
     // setRecorder) they kept the cart's whole glue Module alive.
     dispose() {
       nodes = new WeakMap();
+      pinned = new WeakMap();
       openEncoders.clear();
       unsubmitted.clear();
       doomed = [];
@@ -194,6 +202,49 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
     surfaceTexture(call) {
       return tracked(call, false, m => { for (const t of m) t.external = true; });
     },
+    // The host took a texture from the canvas itself (a frame read's source,
+    // or a draw's), never through the glue's handle table: it is the canvas's
+    // too, while it is in the ring. A retire() below then hands it to the
+    // ordinary rule like any other the canvas handed out.
+    note(obj) {
+      if (!obj) return;
+      const kind = kindOf(obj);
+      if (kind !== 'GPUTexture') return;
+      let n = nodes.get(obj);
+      if (!n) { n = new Node(obj, kind); nodes.set(obj, n); }
+      n.external = true;
+    },
+    // The canvas dropped a texture it handed out (a reconfigure or resize
+    // replaced its ring): it is no longer the canvas's to destroy. From here
+    // the ordinary rule applies — destroyed once no live holder (a view, a
+    // bind group) reaches it, and exactly once. Returns true when the tracker
+    // owns it now; false means it was never the cart's (a texture the host
+    // made for a read or a draw), and the canvas destroys it itself.
+    retire(obj) {
+      if (!obj) return false;
+      const n = nodes.get(obj);
+      if (!n || !n.external) return false;
+      n.external = false;
+      settle(n);
+      return true;
+    },
+    // An in-flight frame read captured a texture: keep it (even one the
+    // canvas retired, or whose views the cart has released) until the map
+    // returns and the copy has been submitted. pin/unpin pair; the node is
+    // kept here only while pinned (a WeakMap, so nothing else leaks).
+    pin(obj) {
+      const n = obj && nodes.get(obj);
+      if (!n) return;
+      n.pins++;
+      pinned.set(obj, n);
+    },
+    unpin(obj) {
+      const n = obj && pinned.get(obj);
+      if (!n) return;
+      pinned.delete(obj);
+      n.pins = Math.max(0, n.pins - 1);
+      if (n.pins === 0) settle(n);
+    },
     // wgpuCommandEncoderFinish(encoder, ...): no longer encoding
     finish(encPtr) { openEncoders.delete(lookup(encPtr)); },
     // wgpuQueueSubmit(queue, count, commands): those command buffers are submitted
@@ -210,7 +261,7 @@ export function createReleaseTracker(globals, lookup, setRecorder) {
       doomed = [];
       for (const n of list) {
         n.queued = false;
-        if (n.refs > 0 || isHeld(n)) continue;
+        if (n.refs > 0 || n.pins > 0 || isHeld(n)) continue;
         destroyed++;
         try { n.obj.destroy(); } catch {}
       }

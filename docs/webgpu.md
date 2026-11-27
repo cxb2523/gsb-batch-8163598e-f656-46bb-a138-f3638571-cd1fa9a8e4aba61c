@@ -280,6 +280,16 @@ letterbox. [`test/fixtures/wgpuedges.c`](../test/fixtures/wgpuedges.c) does this
 mid-run, and the Node, browser and wasmcart-native hosts show and read back
 the new size from that frame on.
 
+A host treats a reconfigure as a new canvas configuration: the texture ring
+it reads and draws from (built for the old size and format) is dropped, and
+so are the pipeline and bind groups `presentWgpuTo(context)` caches for its
+target — the next read or draw is of the configuration in place now. A
+`readGpuFrame()` already in flight when the cart reconfigures still resolves
+to the frame it captured (the size and format it read at the call), not a
+frame of the new configuration and not a partial one: the host keeps that
+texture alive until its copy is on the GPU, so a reconfigure that drops the
+ring cannot destroy it under the read.
+
 ## Errors and device loss
 
 What a cart can see today:
@@ -377,7 +387,11 @@ into a window with `presentWgpuTo(context, rect)` on `getGpuDevice()`.
 `destroy()` may come at any time, with GPU work still pending (a mapAsync,
 an error scope, a `readGpuFrame()`). From that call on no WebGPU callback
 reaches the cart: its pending results are dropped, and a `readGpuFrame()` in
-flight resolves to null.
+flight resolves to null. So do a `readGpuFrame()` and a `presentWgpuTo()`
+called after destroy: null and false, never a throw. If the cart reconfigured
+or resized its canvas (or the host did) while the read was in flight, the
+read's captured texture is destroyed once, after the copy that uses it, not
+by the reconfigure.
 
 Which GPU: on a machine with two, `powerPreference` picks one (`'low-power'`
 is the integrated GPU). Embedders pass it in `adapterOptions`; the Node hosts
